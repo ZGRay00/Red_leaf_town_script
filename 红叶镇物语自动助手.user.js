@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手 0824修复版
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
-// @description  红叶镇物语自动收菜/种菜、采集、采矿、加工循环脚本（基于游戏自身 API）
+// @version      1.8.1
+// @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @grant        none
@@ -48,6 +48,12 @@
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴
         },
 
+        commissions: {
+            enabled: true,            // 每日委托
+            autoSubmit: true,         // 库存够时自动交付今日委托（奖励枫火）
+            autoTake: true,           // 自动从转发池接单（只动超出传送门/自委托需求的富余物资）
+        },
+
         rosterScanOnStart: true,      // 启动时自动扫描并打印角色库
     };
     /****************** 配置区结束 ******************/
@@ -86,6 +92,9 @@
         api(`${siteUrl(industry, siteId)}/partner`, { method: 'PUT', payload: { partner_id: partnerId || '' } });
     const assignPlotPartner = (slot, partnerId) =>
         api(`/plots/${slot}/partners`, { method: 'PUT', payload: { partner_id: partnerId || '' } });
+    const submitCommission = () => api('/commissions/submit', { method: 'POST' });
+    const getCommissionBoard = () => api('/commissions/board');
+    const takeCommission = (commissionId) => api(`/commissions/${commissionId}/take`, { method: 'POST' });
 
     // ---------- 小面板 ----------
     const panel = document.createElement('div');
@@ -93,7 +102,7 @@
         'position:fixed', 'right:12px', 'bottom:12px', 'z-index:99999',
         'background:rgba(23,33,27,.92)', 'color:#e8e0cf', 'font:12px/1.6 monospace',
         'border:1px solid #8ead71', 'border-radius:8px', 'padding:8px 10px',
-        'max-width:320px', 'max-height:40vh', 'overflow-y:auto',
+        'max-width:320px',
     ].join(';');
     const toggleBtn = document.createElement('button');
     toggleBtn.style.cssText = 'margin-right:8px;padding:2px 10px;cursor:pointer;background:#8ead71;border:none;border-radius:4px;color:#17211b;font-weight:bold';
@@ -109,7 +118,8 @@
     statusLine.style.cursor = 'move'; // 按住状态行可拖动面板
     statusLine.title = '按住可拖动面板';
     const logBox = document.createElement('div');
-    logBox.style.cssText = 'margin-top:6px;white-space:pre-wrap;opacity:.85';
+    // 只有日志区滚动，按钮行始终固定在面板顶部
+    logBox.style.cssText = 'margin-top:6px;white-space:pre-wrap;opacity:.85;max-height:32vh;overflow-y:auto';
     panel.appendChild(toggleBtn);
     panel.appendChild(rosterBtn);
     panel.appendChild(collapseBtn);
@@ -317,6 +327,20 @@
         return null;
     }
 
+    // 今日委托仍缺的物品对应的作物（委托每日限时，优先级高于传送门）
+    function commissionNeededCrop(state) {
+        const cm = state.commissions?.commission;
+        if (!commissionActive(cm)) return null;
+        const itemId = cm.item_id ?? cm.item?.item_id;
+        const shortage = (cm.quantity || 0) - (cm.owned || 0);
+        if (itemId == null || shortage <= 0) return null;
+        const crops = state.crops || [];
+        const crop = crops.find(c =>
+            c.produce_item_id === itemId || c.item_id === itemId || c.produce?.item_id === itemId) ||
+            (cm.item?.name ? crops.find(c => c.name === cm.item.name || c.produce?.name === cm.item.name) : null);
+        return crop ? { crop, shortage, commission: cm } : null;
+    }
+
     // 选作物：返回 { crop, reason } 或 null（null = 有缺口但没种子，或完全没有种子）
     function pickCrop(state) {
         const withSeeds = (state.crops || []).filter(c => seedQty(state, c) > 0);
@@ -325,7 +349,18 @@
             const chosen = withSeeds.find(c => c.id === CONFIG.farming.cropId);
             if (chosen) return { crop: chosen, reason: '指定作物' };
         }
-        // 2. 传送门缺口优先（库存已足够或已交齐时跳过）
+        // 2. 今日委托缺口（每日限时，优先级高于传送门）
+        if (CONFIG.commissions.enabled) {
+            const needC = commissionNeededCrop(state);
+            if (needC) {
+                const owned = withSeeds.find(c => c.id === needC.crop.id);
+                if (owned) return { crop: owned, reason: `今日委托缺 ${needC.commission.item?.name || ''} ×${needC.shortage}` };
+                const buyableC = CONFIG.farming.autoBuySeeds &&
+                    seedShopEntries(state).some(e => e.item.item_id === needC.crop.seed_item_id);
+                if (buyableC) return null; // 停下等购买
+            }
+        }
+        // 3. 传送门缺口（库存已足够或已交齐时跳过）
         if (CONFIG.farming.seedStrategy !== 'profit') {
             const need = portalNeededCrop(state);
             if (need) {
@@ -339,7 +374,7 @@
                 if (buyable) return null;
             }
         }
-        // 3. 经济价值最高
+        // 4. 经济价值最高
         if (!withSeeds.length) return null;
         const crop = bestCrop(state, withSeeds);
         return crop ? { crop, reason: '经济价值最高' } : null;
@@ -378,10 +413,16 @@
         return computeSellables(state).reduce((sum, s) => sum + s.surplus * s.item.sell_price, 0);
     }
 
-    // ---------- 自动售卖凑金币 ----------
+    // ---------- 需求汇总（传送门贡品 + 今日委托） ----------
 
-    // 计算可售卖的物资：传送门完全不需要的（全额可卖）+ 贡品已足额后的超额部分
-    function computeSellables(state) {
+    // 委托是否仍在进行中（未交付且未转发出去）
+    function commissionActive(cm) {
+        return !!cm && !cm.settled &&
+            cm.status !== 'forwarded' && cm.status !== 'forward_completed' && cm.status !== 'completed';
+    }
+
+    // 所有需要保护的物资需求：传送门贡品缺口 + 今日委托所需
+    function gatherNeeds(state) {
         const needs = [];
         for (const portal of state.portals || []) {
             if (!portal.unlocked || portal.completed) continue;
@@ -391,6 +432,23 @@
                 needs.push({ itemId: tr.item_id ?? null, name: tr.name || '', minQuality: tr.min_quality || 0, need });
             }
         }
+        const cm = state.commissions?.commission;
+        if (commissionActive(cm)) {
+            needs.push({
+                itemId: cm.item_id ?? cm.item?.item_id ?? null,
+                name: cm.item?.name || '',
+                minQuality: 0,
+                need: cm.quantity || 0, // 委托要多少就保护多少，直到交付
+            });
+        }
+        return needs;
+    }
+
+    // ---------- 自动售卖凑金币 ----------
+
+    // 计算可售卖的物资：完全不被需要的（全额可卖）+ 需求已足额后的超额部分
+    function computeSellables(state) {
+        const needs = gatherNeeds(state);
         const sellables = [];
         for (const item of state.inventory || []) {
             if (!item.sell_price || !(item.quantity > 0)) continue; // 种子等无售价物品自然排除
@@ -458,7 +516,15 @@
             entry = (state.shop || []).find(e => e.id === cfg.seedShopId) || null;
             reason = '指定条目';
         }
-        // 传送门缺口优先：缺口作物没种子时买它的种子
+        // 今日委托缺口最优先：缺什么买什么种子
+        if (!entry && CONFIG.commissions.enabled) {
+            const needC = commissionNeededCrop(state);
+            if (needC) {
+                entry = seedShopEntries(state).find(e => e.item.item_id === needC.crop.seed_item_id) || null;
+                if (entry) reason = `今日委托缺 ${needC.commission.item?.name || ''} ×${needC.shortage}`;
+            }
+        }
+        // 传送门缺口其次：缺口作物没种子时买它的种子
         if (!entry && cfg.seedStrategy !== 'profit') {
             const need = portalNeededCrop(state);
             if (need) {
@@ -512,6 +578,78 @@
         } catch (e) {
             logSkip('fail:buy', `购买种子失败：${e.message}`);
             return false;
+        }
+    }
+
+    // ---------- 每日委托 ----------
+
+    // 某物品扣除所有保护需求（传送门贡品 + 今日自委托）后的富余数量
+    function surplusQty(state, itemId, name) {
+        const needs = gatherNeeds(state).filter(n =>
+            (n.itemId != null && n.itemId === itemId) ||
+            (n.itemId == null && n.name && n.name === name));
+        let reserved = 0;
+        for (const n of needs) reserved += n.need;
+        const qty = (state.inventory || [])
+            .filter(i => (itemId != null ? i.item_id === itemId : i.name === name))
+            .reduce((s, i) => s + (i.quantity || 0), 0);
+        return qty - reserved;
+    }
+
+    // 转发池接单：只动富余物资，报酬最高的优先
+    async function tryTakeCommission(state) {
+        let board;
+        try {
+            board = await getCommissionBoard();
+        } catch (e) {
+            logSkip('fail:commission:board', `读取委托转发池失败：${e.message}`);
+            return;
+        }
+        clearSkip('fail:commission:board');
+        const list = Array.isArray(board) ? board : (board?.commissions || board?.list || board?.items || []);
+        const candidates = list
+            .filter(x => x.can_take)
+            .sort((a, b) => (b.taker_reward || 0) - (a.taker_reward || 0));
+        for (const x of candidates) {
+            const itemId = x.item_id ?? x.item?.item_id ?? null;
+            const qty = x.quantity ?? x.required ?? 1;
+            if (itemId == null) continue; // 字段不明，没法验证富余，跳过
+            if (surplusQty(state, itemId, x.item?.name || x.name || '') < qty) continue; // 会动到保护物资，不接
+            try {
+                await takeCommission(x.commission_id);
+                markDirty();
+                log(`已接单：替 ${x.owner_name || x.npc_name || '镇民'} 跑一趟，交出 ${x.item?.name || x.name || itemId} ×${qty}（+${x.taker_reward ?? '?'} 枫火）`);
+                if (state.commissions) state.commissions.remaining_takes = Math.max(0, (state.commissions.remaining_takes || 1) - 1);
+                const inv = (state.inventory || []).find(i => i.item_id === itemId);
+                if (inv) inv.quantity = Math.max(0, (inv.quantity || 0) - qty);
+                return;
+            } catch (e) {
+                logSkip(`fail:commission:take:${x.commission_id}`, `接单失败：${e.message}`);
+            }
+        }
+    }
+
+    async function doCommissions(state) {
+        const cfg = CONFIG.commissions;
+        if (!cfg.enabled) return;
+        const c = state.commissions;
+        if (!c || !c.unlocked) return;
+        const cm = c.commission;
+        // 1. 自动交付今日委托
+        if (cm && cfg.autoSubmit && !cm.settled && cm.can_submit) {
+            try {
+                await submitCommission();
+                markDirty();
+                clearSkip('fail:commission:submit');
+                cm.settled = true;
+                log(`已交付今日委托：${cm.npc_name || 'NPC'} 的 ${cm.item?.name || cm.item_id} ×${cm.quantity}（+${cm.reward_maple_flame ?? '?'} 枫火${cm.lucky ? '，幸运日加成' : ''}）`);
+            } catch (e) {
+                logSkip('fail:commission:submit', `交付委托失败：${e.message}`);
+            }
+        }
+        // 2. 自动从转发池接单
+        if (cfg.autoTake && (c.remaining_takes ?? 0) > 0 && c.board_available) {
+            await tryTakeCommission(state);
         }
     }
 
@@ -831,6 +969,7 @@
                 rosterScanned = true;
                 scanRoster(state);
             }
+            await doCommissions(state);
             await doFarming(state);
             await doIndustry(state, 'gathering', state.gathering_sites, CONFIG.gathering, 'task_id', '采集');
             await doIndustry(state, 'mining', state.mining_sites, CONFIG.mining, 'task_id', '矿');
