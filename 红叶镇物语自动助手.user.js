@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手 0824修复版
 // @namespace    http://tampermonkey.net/
-// @version      1.9.0
+// @version      1.9.1
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -707,8 +707,8 @@
         const cfg = CONFIG.farming;
         if (!cfg.enabled) return;
         for (const plot of state.plots || []) {
-            // 0. 驻场伙伴：没有就派最强的，有更优的空闲伙伴就换人（锁定时不动）
-            if (cfg.autoAssignPartner) {
+            // 0. 驻场伙伴：只在空地/已成熟时调整（作物生长期间服务器不允许换伙伴）
+            if (cfg.autoAssignPartner && (plot.empty || plot.ready)) {
                 await ensureBestPartner(state, 'farming', plot, `土地 ${plot.slot + 1}`,
                     (pid) => assignPlotPartner(plot.slot, pid));
             }
@@ -951,6 +951,13 @@
             // 3. 开工：在体力够得着的任务里按每小时期望价值选最优
             const allTasks = site.available_tasks || [];
             if (!allTasks.length) continue;
+            // 手动锁定了采矿目标：不提供该任务的矿点直接跳过，绝不改挖别的
+            if (industry === 'mining' && miningTaskOverride != null &&
+                !allTasks.some(t => String(t.id) === String(miningTaskOverride))) {
+                logSkip(`lockskip:${id}`, `矿点 ${id}：不提供锁定的采矿目标，跳过`);
+                continue;
+            }
+            clearSkip(`lockskip:${id}`);
             const task = pickTask(state, industry, site, cfg);
             if (!task) {
                 logSkip(`stamina:${industry}:${id}`, `${verb}点 ${id}：体力不足（当前约 ${liveStamina(state)}/${state.player?.stamina_cap ?? '?'}），等体力恢复`);
