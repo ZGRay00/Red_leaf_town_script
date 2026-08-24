@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手 0824修复版
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.9.0
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -124,13 +124,63 @@
     panel.appendChild(rosterBtn);
     panel.appendChild(collapseBtn);
     panel.appendChild(statusLine);
+
+    // 采矿任务手动选择器（应对体力限制：锁定只挖某个矿）
+    const mineRow = document.createElement('div');
+    mineRow.style.cssText = 'margin-top:6px;display:flex;align-items:center;gap:6px';
+    const mineLabel = document.createElement('span');
+    mineLabel.textContent = '采矿:';
+    mineLabel.style.opacity = '.8';
+    const mineSelect = document.createElement('select');
+    mineSelect.style.cssText = 'flex:1;max-width:230px;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
+    mineSelect.title = '选择要挖的矿；选「自动」则按每小时期望价值选择';
+    mineRow.appendChild(mineLabel);
+    mineRow.appendChild(mineSelect);
+    panel.appendChild(mineRow);
     panel.appendChild(logBox);
     document.body.appendChild(panel);
+
+    // 手动选矿：null = 自动；否则为任务 id（记忆在 localStorage）
+    let miningTaskOverride = (() => {
+        const v = localStorage.getItem('rlt-mining-task');
+        return v === null || v === '' ? null : v;
+    })();
+    mineSelect.onchange = () => {
+        miningTaskOverride = mineSelect.value || null;
+        localStorage.setItem('rlt-mining-task', miningTaskOverride || '');
+        log(miningTaskOverride ? '已锁定采矿目标' : '采矿恢复为自动选择');
+    };
+
+    // 每轮用最新 state 刷新采矿下拉选项（保留当前选择）
+    function refreshMineOptions(state) {
+        const keep = miningTaskOverride != null ? String(miningTaskOverride) : mineSelect.value;
+        mineSelect.innerHTML = '';
+        const auto = document.createElement('option');
+        auto.value = '';
+        auto.textContent = '自动（按价值选）';
+        mineSelect.appendChild(auto);
+        for (const site of state.mining_sites || []) {
+            const siteName = site.definition?.name || site.site_id;
+            for (const t of site.available_tasks || []) {
+                const opt = document.createElement('option');
+                opt.value = String(t.id);
+                opt.textContent = `${siteName} · ${t.name || '任务#' + t.id}${t.stamina_cost ? `（体力${t.stamina_cost}）` : ''}`;
+                mineSelect.appendChild(opt);
+            }
+        }
+        mineSelect.value = keep;
+        if (mineSelect.value !== keep) { // 选项已不存在（比如矿点换班）
+            mineSelect.value = '';
+            miningTaskOverride = null;
+            localStorage.setItem('rlt-mining-task', '');
+        }
+    }
 
     // 收起/展开（记住选择）
     let collapsed = localStorage.getItem('rlt-helper-collapsed') === '1';
     function applyCollapsed() {
         logBox.style.display = collapsed ? 'none' : '';
+        mineRow.style.display = collapsed ? 'none' : '';
         statusLine.style.display = collapsed ? 'none' : '';
         collapseBtn.textContent = collapsed ? '+' : '—';
     }
@@ -826,13 +876,22 @@
         return perDraw * draws / Math.max(1e-6, seconds / 3600);
     }
 
-    // 选任务：指定 taskId 优先，否则在体力够得着的任务里选每小时期望价值最高的
+    // 选任务：手动锁定的采矿目标 > 指定 taskId > 体力够得着的任务里每小时期望价值最高
     function pickTask(state, industry, site, cfg) {
         const tasks = site.available_tasks || [];
         if (!tasks.length) return null;
-        if (cfg.taskId != null) {
-            const t = tasks.find(x => x.id === cfg.taskId);
-            if (t) return t;
+        const wantId = (industry === 'mining' && miningTaskOverride != null) ? miningTaskOverride : cfg.taskId;
+        if (wantId != null) {
+            const t = tasks.find(x => String(x.id) === String(wantId));
+            if (t) {
+                // 锁定任务也要过体力检查：不够就等恢复，不去挖别的
+                const cost = t.stamina_cost || 0;
+                if (cost > liveStamina(state)) {
+                    pendingStaminaCost = pendingStaminaCost == null ? cost : Math.min(pendingStaminaCost, cost);
+                    return null;
+                }
+                return t;
+            }
         }
         // 体力检查：过滤掉当前体力不够开工的任务
         const stamina = liveStamina(state);
@@ -971,6 +1030,7 @@
             }
             await doCommissions(state);
             await doFarming(state);
+            refreshMineOptions(state);
             await doIndustry(state, 'gathering', state.gathering_sites, CONFIG.gathering, 'task_id', '采集');
             await doIndustry(state, 'mining', state.mining_sites, CONFIG.mining, 'task_id', '矿');
             await doIndustry(state, 'crafting', state.crafting_stations, { ...CONFIG.crafting, taskId: CONFIG.crafting.recipeId }, 'recipe_id', '加工');
