@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.3.1
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -1245,6 +1245,17 @@
     }
 
     function playerCoins(state) { return Number(state.player?.coins || 0); }
+
+    // 库存按售价估算的总价值：每个品质堆叠自带 sell_price（游戏本体也按 sell_price×数量 逐堆叠计算），
+    // 缺失时回退物品元数据的基础价；查不到价的物品不计入
+    function inventoryTotalValue(state) {
+        let total = 0;
+        for (const item of state?.inventory || []) {
+            const price = itemSellPrice(state, item.item_id, item?.name || '', item?.sell_price);
+            if (price) total += price * Number(item.quantity || 0);
+        }
+        return total;
+    }
 
     function inferredSellItemIds(state) {
         const ids = new Set();
@@ -2574,7 +2585,7 @@
             refreshConfigRows(runtime.state);
             const st = runtime.state;
             const staminaText = st?.player ? `体力${Math.floor(liveStamina(st))}/${st.player.stamina_cap ?? '?'}` : '';
-            statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${staminaText} · 金币${playerCoins(st)} · ${summarize(st)}`;
+            statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${staminaText} · 金币${playerCoins(st)} · 库存≈${inventoryTotalValue(st)} · ${summarize(st)}`;
             // 有实际操作时，触发游戏自带的 state 刷新，让页面 UI 立即同步（不刷新网页）
             if (dirty && await refreshGameUI()) dirty = false;
             // 自适应：对齐最近任务的完成时刻，无事可做时拉长间隔
