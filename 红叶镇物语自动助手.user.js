@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
-// @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托循环脚本（基于游戏自身 API）
+// @version      2.2.0
+// @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @grant        none
@@ -14,7 +14,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    window[INSTANCE_KEY] = { version: '2.1.0' };
+    window[INSTANCE_KEY] = { version: '2.2.0' };
 
     /******************** 配置区 ********************/
     const CONFIG = {
@@ -29,10 +29,12 @@
         // 同一浏览器只允许一个标签页执行自动化
         singleTab: true,
         // 官网前端构建变化时暂停写操作，避免接口结构变化后误操作
-        expectedBuild: 'index-Cb6HilJh.js',
+        expectedBuild: 'index-BM2xd7G-.js',
         pauseOnBuildChange: true,
         // 剧情结束后给 /story/:id/seen 留出回写奖励 state 的时间
         storySyncGrace: 1200,
+        // aquatic.bigCatch 为 'manual' 时：垂钓出现“大物”则保留体力并暂停自动写操作，等待玩家选择挑战或放生
+        pauseOnPendingBigCatch: true,
 
         farming: {
             enabled: true,            // 自动收获 + 种菜
@@ -43,7 +45,6 @@
             autoSellForSeeds: true,   // 买种子金币不足时，自动售卖多余物资凑钱（配合 autoBuySeeds）
             seedStrategy: 'portal',   // 种植/购买策略: 'portal' 传送门需求优先，满足后按经济价值 | 'profit' 始终按经济价值最高
             seedShopId: null,         // 可选：强制指定商店条目 id，优先级最高
-            taskItemId: null,         // 可选：开工时使用的 start 型任务道具 id；null = 不使用
             autoAssignPartner: true,  // 自动派驻/优化驻场伙伴（有更强的空闲伙伴时自动更换）
         },
 
@@ -51,7 +52,6 @@
             enabled: true,            // 林野采集：自动领取 + 重新开工
             taskId: null,             // 指定任务 id；null = 用该点第一个可接任务
             strictTaskId: true,       // 指定任务不存在时等待，不回退到其他任务
-            taskItemId: null,         // 可选：开工时使用的 start 型任务道具 id
             autoAssignPartner: true,  // 采集必须派驻伙伴：自动安排/优化驻场伙伴
         },
 
@@ -59,7 +59,6 @@
             enabled: true,            // 矿山采矿：自动收取 + 重新开工
             taskId: null,             // 指定任务 id；null = 用该点第一个可接任务
             strictTaskId: true,
-            taskItemId: null,
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴（不设则会独自采矿）
         },
 
@@ -67,8 +66,23 @@
             enabled: false,           // 加工：会消耗背包材料，默认关闭，需要时打开
             recipeId: null,           // 指定配方 id；null = 用第一个配方
             strictRecipeId: true,
-            taskItemId: null,
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴
+        },
+
+        aquatic: {
+            enabled: true,            // 水产：自动垂钓 + 鱼塘管理
+            fishing: true,            // 自动垂钓（消耗体力，当场结算，不占生产格）
+            spotId: null,             // 指定钓点 id；null = 沿用聚鱼度所在钓点，否则第一个已解锁钓点
+            staminaReserve: 0,        // 垂钓体力下限：实时体力低于该值时不再抛竿（同时挖矿时建议设为挖矿单次的体力消耗）
+            chainCasts: 5,            // 连钓次数：攒够 N 竿的体力后一次性连钓 N 次（体力恢复比聚鱼度衰退慢，滴钓保不住连击）
+            reserveBigCatch: true,    // 每次连钓为大物搏斗预留一竿体力（大物消耗 = 当前钓点单竿消耗；仅 bigCatch 为 'fight' 时生效）
+            bigCatch: 'fight',        // 大物处理: 'fight' 搏一把 | 'release' 放线 | 'manual' 暂停等人工
+            fightMinChance: 0,        // 大物成功率（0~1）低于该值时直接放线
+            ponds: true,              // 鱼塘：自动投苗补到稳态线、捞走超出稳态线的成鱼
+            autoBuildPonds: false,    // 自动挖塘（一次性投入红叶币，默认关闭）
+            autoFeed: true,           // 饲料槽余量不足时自动投料（优先单位品质分最低的饲料，受保留量保护）
+            feedKeepHours: 24,        // 饲料槽补到约 N 小时用量
+            autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑空闲最强的）
         },
 
         commissions: {
@@ -79,16 +93,17 @@
         },
 
         selling: {
-            // 显式正向白名单；默认空数组表示不允许自动售卖任何物品。
+            // 额外加入自动售卖范围的物品 id；仍受需求、保留量和永不售卖名单保护。
             allowedItemIds: [],
-            // 可选：把当前 state 中可识别的农作/采集/采矿产物并入白名单。稀有产物也可能被识别，默认关闭。
-            inferredOutputWhitelist: false,
+            // 默认把当前 state 中可识别的农作/采集/采矿产物并入白名单，否则空 allowedItemIds 会让自动售卖永远无候选。
+            inferredOutputWhitelist: true,
+            includeRareTaskOutputs: false, // 是否把采集/采矿任务中低权重的稀有随机产物也加入自动售卖范围
             neverSellItemIds: [],     // 永不售卖的物品 id
             keepByItemId: {},         // 每种物品最低保留量，例如 { 123: 20 }
             defaultKeep: 5,           // 白名单物品默认至少保留数量
             maxUnitsPerTick: 20,      // 单轮最多卖出数量
             protectLockedPortals: true,
-            protectCraftingInputs: true,
+            protectCraftingInputs: true, // 每个加工站为已解锁配方保留至少一批原料
         },
 
         partnerMinImprovement: 0.05, // 非必需岗位换人至少提升 5%，避免频繁抖动
@@ -158,8 +173,9 @@
 
     function validateClientEnvironment() {
         const build = detectedGameBuild();
-        if (CONFIG.pauseOnBuildChange && build && build !== CONFIG.expectedBuild) {
-            throw new ApiError(`检测到游戏官网已更新（${build}），助手预期 ${CONFIG.expectedBuild}，已安全暂停`, {
+        if (CONFIG.pauseOnBuildChange && build !== CONFIG.expectedBuild) {
+            const actual = build || '无法识别';
+            throw new ApiError(`检测到游戏官网构建为 ${actual}，助手预期 ${CONFIG.expectedBuild}，已安全暂停`, {
                 code: 'unknown_build',
             });
         }
@@ -183,17 +199,25 @@
         requireArray('shop', CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds);
         requireArray('gathering_sites', CONFIG.gathering.enabled);
         requireArray('mining_sites', CONFIG.mining.enabled);
-        const needsSafeInventory = CONFIG.commissions.autoTake ||
-            (CONFIG.farming.autoBuySeeds && CONFIG.farming.autoSellForSeeds);
+        const needsSafeInventory = (CONFIG.commissions.enabled && CONFIG.commissions.autoTake) ||
+            (CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds && CONFIG.farming.autoSellForSeeds);
         requireArray('crafting_stations', CONFIG.crafting.enabled ||
             (needsSafeInventory && CONFIG.selling.protectCraftingInputs));
-        requireArray('portals', needsSafeInventory || CONFIG.farming.seedStrategy === 'portal');
+        requireArray('portals', needsSafeInventory ||
+            (CONFIG.farming.enabled && CONFIG.farming.seedStrategy === 'portal'));
         if (CONFIG.commissions.enabled && (!state.commissions || typeof state.commissions !== 'object')) {
             errors.push('commissions');
         }
-        const needsPartners = CONFIG.farming.autoAssignPartner || CONFIG.gathering.autoAssignPartner ||
-            CONFIG.mining.autoAssignPartner || CONFIG.crafting.autoAssignPartner;
+        const needsPartners = (CONFIG.farming.enabled && CONFIG.farming.autoAssignPartner) ||
+            (CONFIG.gathering.enabled && CONFIG.gathering.autoAssignPartner) ||
+            (CONFIG.mining.enabled && CONFIG.mining.autoAssignPartner) ||
+            (CONFIG.crafting.enabled && CONFIG.crafting.autoAssignPartner) ||
+            (CONFIG.aquatic.enabled && CONFIG.aquatic.autoAssignPartner);
         requireArray('partners', needsPartners);
+        // 面板道具下拉和槽位级道具选择都依赖 task_items，任一产业启用即要求该字段
+        const needsTaskItems = CONFIG.farming.enabled || CONFIG.gathering.enabled ||
+            CONFIG.mining.enabled || CONFIG.crafting.enabled;
+        requireArray('task_items', needsTaskItems);
 
         if (Array.isArray(state.plots) && state.plots.some(plot => plot.slot == null)) errors.push('plots[].slot');
         if (Array.isArray(state.gathering_sites) &&
@@ -249,6 +273,16 @@
 
     function isControlFlowError(error) {
         return error?.code === 'aborted' || error?.code === 'story_active';
+    }
+
+    function isFatalTickError(error) {
+        return ['network_error', 'request_timeout', 'invalid_response', 'invalid_state',
+            'invalid_story_bridge', 'unknown_build', 'action_limit'].includes(error?.code) ||
+            [401, 403, 408, 429].includes(Number(error?.status || 0)) || Number(error?.status || 0) >= 500;
+    }
+
+    function shouldAbortTick(error) {
+        return isControlFlowError(error) || isFatalTickError(error);
     }
 
     function requestController(parentSignal) {
@@ -320,6 +354,7 @@
             throw new ApiError('操作已停止', { code: 'aborted' });
         }
         if (runtime.stateUncertain) await getState();
+        validateClientEnvironment(); // 每次写入前复检，消除 tick 预检后的桥接/构建竞态窗口
         ensureStoryIdle();
         runtime.actionCount += 1;
         if (runtime.actionCount > CONFIG.maxActionsPerTick) {
@@ -330,7 +365,8 @@
             data = await api(path, { method, payload });
         } catch (e) {
             // 网络失败/超时后写入结果可能不确定：绝不重发，必须先重新同步状态。
-            if (['network_error', 'request_timeout', 'invalid_response'].includes(e.code)) {
+            if (['network_error', 'request_timeout', 'invalid_response'].includes(e.code) ||
+                e.status === 408 || e.status >= 500) {
                 runtime.stateUncertain = true;
             }
             if (runtime.stateUncertain && runtime.controller && !runtime.controller.signal.aborted) {
@@ -338,10 +374,21 @@
             }
             throw e;
         }
-        if (data?.state) acceptState(data.state);
-        else await getState();
-        markDirty();
-        await emitOfficialStoryCue(cue);
+        markDirty(); // 请求已成功返回；即使随后协议校验失败，也必须在恢复后同步游戏官网 UI
+        if (data?.state) {
+            try {
+                acceptState(data.state);
+            } catch (responseError) {
+                runtime.stateUncertain = true;
+                // 写响应 state 异常时只做一次权威 GET；GET 自身失败则直接交由顶层退避。
+                if (runtime.controller && !runtime.controller.signal.aborted) await getState();
+                throw responseError;
+            }
+        } else {
+            runtime.stateUncertain = true;
+            await getState();
+        }
+        if (await emitOfficialStoryCue(cue)) runtime.storyWasBusy = true;
         return data?.result;
     }
 
@@ -368,7 +415,34 @@
         mutate(`/plots/${slot}/partners`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
     const submitCommission = () => mutate('/commissions/submit', { cue: 'action:submit_commission' });
     const getCommissionBoard = () => api('/commissions/board');
-    const takeCommission = (commissionId) => mutate(`/commissions/${commissionId}/take`);
+    const takeCommission = (commissionId) => mutate(`/commissions/${commissionId}/take`, {
+        cue: 'action:submit_commission',
+    });
+    const useTaskItem = (industry, slotId, taskItemId) => mutate('/tasks/use-item', {
+        payload: { industry, slot_id: String(slotId), task_item_id: taskItemId },
+    });
+
+    // 水产接口（与官网前端一致；抛竿带幂等 request_id）
+    const castLine = (spotId) => mutate(`/fishing/spots/${spotId}/cast`, {
+        payload: { request_id: crypto.randomUUID() }, cue: 'action:cast_line',
+    });
+    const resolveBigCatch = (action) => mutate('/fishing/big-catch', {
+        payload: { action }, cue: 'action:big_catch',
+    });
+    const assignFishingCompanion = (partnerId) =>
+        mutate('/fishing/companion', { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
+    const buildPond = (siteId) => mutate(`/ponds/${siteId}/build`);
+    const assignPondPartner = (pondId, partnerId) =>
+        mutate(`/ponds/${pondId}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
+    const stockPond = (pondId, speciesId, qty) => mutate(`/ponds/${pondId}/stock`, {
+        payload: { species_id: speciesId, quantity: qty }, cue: 'action:stock_pond',
+    });
+    const harvestPond = (pondId, qty) => mutate(`/ponds/${pondId}/harvest`, {
+        payload: { quantity: qty }, cue: 'action:harvest_pond',
+    });
+    const depositFeed = (itemId, quality, count) => mutate('/feed-slot/deposit', {
+        payload: { item_id: itemId, quality, count },
+    });
 
     // ---------- 小面板 ----------
     const panel = document.createElement('div');
@@ -402,7 +476,7 @@
 
     // 槽位配置区：每块土地/采集点/矿点/加工站各一行下拉，选择记忆在 localStorage
     const configBox = document.createElement('div');
-    configBox.style.cssText = 'margin-top:6px;border-top:1px solid #555f52;padding-top:2px';
+    configBox.style.cssText = 'margin-top:6px;border-top:1px solid #555f52;padding-top:2px;max-height:42vh;overflow-y:auto;padding-right:4px;scrollbar-width:thin';
     panel.appendChild(configBox);
     panel.appendChild(logBox);
     document.body.appendChild(panel);
@@ -415,8 +489,30 @@
     function setOverride(key, value) { localStorage.setItem(key, value || ''); }
     const plotCropKey = slot => `rlt-plot-crop:${slot}`;
     const nodeJobKey = (industry, id) => `rlt-node-job:${industry}:${id}`;
+    const AQUATIC_SPOT_KEY = 'rlt-aquatic-spot';
+    const FISHING_TOGGLE_KEY = 'rlt-aquatic-fishing';
+    const nodeTaskItemKey = (industry, id) => `rlt-node-task-item:${industry}:${id}`;
+    const nodeTaskItemKeepKey = (industry, id) => `rlt-node-task-item-keep:${industry}:${id}`;
     const plotCropOverride = slot => getOverride(plotCropKey(slot));
     const nodeJobOverride = (industry, id) => getOverride(nodeJobKey(industry, id));
+
+    // 自动垂钓总开关：配置允许 + 面板未手动关闭（面板开关优先，记忆在 localStorage）
+    function fishingEnabled() {
+        return CONFIG.aquatic.enabled && CONFIG.aquatic.fishing && getOverride(FISHING_TOGGLE_KEY) !== 'off';
+    }
+
+    const AQUATIC_CHAIN_KEY = 'rlt-aquatic-chain';
+    // 连钓次数：面板输入优先，其次配置文件；至少 1
+    function fishingChainCasts() {
+        return Math.max(1, Math.floor(Number(getOverride(AQUATIC_CHAIN_KEY) ?? CONFIG.aquatic.chainCasts) || 1));
+    }
+
+    const AQUATIC_RESERVE_BIG_KEY = 'rlt-aquatic-reserve-big';
+    // 是否为每次连钓预留一竿大物体力：面板开关优先，其次配置文件
+    function bigCatchReserveEnabled() {
+        const v = getOverride(AQUATIC_RESERVE_BIG_KEY);
+        return v === null ? !!CONFIG.aquatic.reserveBigCatch : v !== 'off';
+    }
 
     function makeSelectRow(labelText, title) {
         const row = document.createElement('div');
@@ -458,11 +554,116 @@
         }
     }
 
+    // ---------- 面板分组折叠（记忆在 localStorage） ----------
+    const groupCollapseKey = name => `rlt-group-collapsed:${name}`;
+
+    // 分组容器：标题点击折叠/展开
+    function makeGroup(title) {
+        const group = document.createElement('div');
+        const header = document.createElement('div');
+        header.style.cssText = 'margin-top:5px;cursor:pointer;user-select:none;font-weight:bold;opacity:.85;transition:opacity .15s';
+        header.title = '点击折叠/展开';
+        header.onmouseenter = () => { header.style.opacity = '1'; };
+        header.onmouseleave = () => { header.style.opacity = '.85'; };
+        const body = document.createElement('div');
+        body.style.cssText = 'margin-left:4px;padding-left:7px;border-left:1px solid #3a4636';
+        const isCollapsed = () => localStorage.getItem(groupCollapseKey(title)) === '1';
+        const render = () => {
+            header.textContent = `${isCollapsed() ? '▸' : '▾'} ${title}`;
+            body.style.display = isCollapsed() ? 'none' : '';
+        };
+        header.onclick = () => {
+            localStorage.setItem(groupCollapseKey(title), isCollapsed() ? '0' : '1');
+            render();
+        };
+        render();
+        group.appendChild(header);
+        group.appendChild(body);
+        return { group, body };
+    }
+
+    // 开关行：点击即切换并立即重建面板
+    function makeToggleRow(state, labelText, title, on, onToggle) {
+        const row = document.createElement('div');
+        row.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px';
+        const label = document.createElement('span');
+        label.textContent = labelText;
+        label.style.cssText = 'opacity:.8;white-space:nowrap';
+        const btn = document.createElement('button');
+        btn.textContent = on ? '开启中' : '已关闭';
+        btn.title = title;
+        btn.style.cssText = `padding:1px 10px;cursor:pointer;border:none;border-radius:4px;font:11px monospace;background:${on ? '#8ead71' : '#555f52'};color:${on ? '#17211b' : '#e8e0cf'}`;
+        btn.onclick = () => {
+            onToggle();
+            btn.blur(); // 焦点离开面板，避免刷新守卫挡住本次重建
+            refreshConfigRows(state);
+        };
+        row.appendChild(label);
+        row.appendChild(btn);
+        return row;
+    }
+
+    function makeFishingToggleRow(state) {
+        const on = fishingEnabled();
+        return makeToggleRow(state, '自动垂钓:', '点击切换自动垂钓（关闭后仍会自动处理已咬钩的大物）', on, () => {
+            setOverride(FISHING_TOGGLE_KEY, on ? 'off' : '');
+            log(`自动垂钓：${on ? '已关闭' : '已开启'}`);
+        });
+    }
+
+    function makeBigCatchReserveRow(state) {
+        const on = bigCatchReserveEnabled();
+        return makeToggleRow(state, '大物预留:', '每次连钓为大物搏斗预留一竿体力（仅大物处理为搏一把时生效）', on, () => {
+            setOverride(AQUATIC_RESERVE_BIG_KEY, on ? 'off' : 'on');
+            log(`大物体力预留：${on ? '已关闭' : '已开启'}`);
+        });
+    }
+
+    // 槽位级特殊道具行：下拉列出当前拥有且适用于该产业的道具（时机 + 效果描述 + 数量），可设保留数量
+    function makeTaskItemRow(state, industry, id) {
+        const items = (state.task_items || []).filter(it => {
+            const eligible = it?.eligible_industries;
+            return !Array.isArray(eligible) || eligible.length === 0 || eligible.includes(industry);
+        });
+        if (!items.length) return null;
+        const itemKey = nodeTaskItemKey(industry, id);
+        const keepKey = nodeTaskItemKeepKey(industry, id);
+        const stored = getOverride(itemKey);
+        const current = stored === '__off' ? null : stored; // 旧版“停用”值归入默认的“不使用”
+        const labelPrefix = industry === 'farming' ? `土地 ${id + 1}` : `${INDUSTRY_NAMES[industry] || industry}点 ${id}`;
+        const { row, select } = makeSelectRow('└ 道具:', '选择该点位使用的特殊道具；默认不使用');
+        fillSelect(select, items.map(it => ({
+            value: taskItemRecordId(it),
+            text: `${it.timing === 'active' ? '【途中】' : '【开工】'}${it.name || '道具#' + taskItemRecordId(it)} ×${it.quantity || 0}${it.description ? ` · ${it.description}` : ''}`,
+            disabled: Number(it.quantity || 0) <= 0,
+        })), current, '不使用特殊道具');
+        const keep = document.createElement('input');
+        keep.type = 'number';
+        keep.min = '0';
+        keep.value = getOverride(keepKey) || '0';
+        keep.placeholder = '留0';
+        keep.title = '保留数量：该道具至少留下多少个不使用';
+        keep.style.cssText = 'width:44px;flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
+        select.onchange = () => {
+            setOverride(itemKey, select.value);
+            log(`${labelPrefix}：${select.value ? '已锁定道具' : '不使用道具'}`);
+        };
+        keep.onchange = () => {
+            const n = Math.max(0, Math.floor(Number(keep.value) || 0));
+            keep.value = String(n);
+            setOverride(keepKey, n ? String(n) : '');
+            log(`${labelPrefix}：道具保留数量设为 ${n}`);
+        };
+        row.appendChild(keep);
+        return row;
+    }
+
     // 每轮用最新 state 重建槽位配置行（选项来自实时 state，选择从 localStorage 恢复）
     function refreshConfigRows(state) {
         if (configBox.contains(document.activeElement)) return; // 用户正在操作下拉时不动它
         configBox.innerHTML = '';
-        if (CONFIG.farming.enabled) {
+        if (CONFIG.farming.enabled && (state.plots || []).length) {
+            const { group, body } = makeGroup('农场');
             // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
             const slots = (state.plots || []).map(p => p.slot);
             if (slots.length) slots.push(Math.max(...slots) + 1);
@@ -476,18 +677,23 @@
                     setOverride(key, select.value);
                     log(`土地 ${slot + 1}：${select.value ? '已锁定作物' : '恢复自动选种'}`);
                 };
-                configBox.appendChild(row);
+                body.appendChild(row);
+                const itemRow = makeTaskItemRow(state, 'farming', slot);
+                if (itemRow) body.appendChild(itemRow);
             }
+            configBox.appendChild(group);
         }
-        for (const industry of ['mining', 'crafting']) {
+        for (const industry of ['gathering', 'mining', 'crafting']) {
             const adapter = INDUSTRY_ADAPTERS[industry];
             if (!adapter.config().enabled) continue;
-            for (const node of industryNodes(state, industry)) {
+            const nodes = industryNodes(state, industry).filter(node => adapter.id(node) != null);
+            if (!nodes.length) continue;
+            const { group, body } = makeGroup(INDUSTRY_NAMES[industry] || industry);
+            for (const node of nodes) {
                 const id = adapter.id(node);
-                if (id == null) continue;
                 const key = nodeJobKey(industry, id);
                 const nodeName = node.definition?.name || id;
-                const label = `${INDUSTRY_NAMES[industry] || industry}·${nodeName}:`;
+                const label = `${nodeName}:`;
                 const { row, select } = makeSelectRow(label,
                     industry === 'crafting' ? '选择这个加工站的配方；「自动」按需求/价值选择' : '选择这个点位的任务；「自动」按需求/价值选择');
                 fillSelect(select, [
@@ -503,8 +709,50 @@
                     const what = select.value === '__off' ? '已关闭' : (select.value ? '已锁定目标' : '恢复自动选择');
                     log(`${INDUSTRY_NAMES[industry] || industry}点 ${nodeName}：${what}`);
                 };
-                configBox.appendChild(row);
+                body.appendChild(row);
+                const itemRow = makeTaskItemRow(state, industry, id);
+                if (itemRow) body.appendChild(itemRow);
             }
+            configBox.appendChild(group);
+        }
+        if (CONFIG.aquatic.enabled && state.aquatic?.unlocked) {
+            const { group, body } = makeGroup('垂钓');
+            body.appendChild(makeFishingToggleRow(state));
+            if (fishingEnabled()) {
+                // 连钓次数：攒够 N 竿体力后一次性连钓 N 次
+                const chainRow = document.createElement('div');
+                chainRow.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px';
+                const chainLabel = document.createElement('span');
+                chainLabel.textContent = '连钓次数:';
+                chainLabel.style.cssText = 'opacity:.8;white-space:nowrap';
+                const chainInput = document.createElement('input');
+                chainInput.type = 'number';
+                chainInput.min = '1';
+                chainInput.value = String(fishingChainCasts());
+                chainInput.title = '体力恢复比聚鱼度衰退慢：攒够 N 竿的体力后一次性连钓 N 次';
+                chainInput.style.cssText = 'width:56px;flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
+                chainInput.onchange = () => {
+                    const n = Math.max(1, Math.floor(Number(chainInput.value) || 1));
+                    chainInput.value = String(n);
+                    setOverride(AQUATIC_CHAIN_KEY, String(n));
+                    log(`连钓次数设为 ${n}（攒够 ${n} 竿体力后开钓）`);
+                };
+                chainRow.appendChild(chainLabel);
+                chainRow.appendChild(chainInput);
+                body.appendChild(chainRow);
+                body.appendChild(makeBigCatchReserveRow(state));
+                const { row, select } = makeSelectRow('垂钓钓点:',
+                    '选择自动垂钓的钓点；「自动」优先留在聚鱼度所在钓点（换钓点会清零聚鱼度）');
+                fillSelect(select, (state.aquatic.spots || []).filter(s => s.unlocked).map(s => ({
+                    value: s.id, text: `${s.name || `钓点#${s.id}`}${s.stamina_cost ? `（体力${s.stamina_cost}）` : ''}`,
+                })), getOverride(AQUATIC_SPOT_KEY), '自动');
+                select.onchange = () => {
+                    setOverride(AQUATIC_SPOT_KEY, select.value);
+                    log(`垂钓钓点：${select.value ? '已锁定' : '恢复自动选择'}`);
+                };
+                body.appendChild(row);
+            }
+            configBox.appendChild(group);
         }
     }
 
@@ -544,7 +792,9 @@
     });
     rosterBtn.onclick = async () => {
         try {
-            scanRoster(await getState());
+            const snapshot = await api('/state');
+            validateStateSchema(snapshot);
+            scanRoster(snapshot); // 仅用于显示，避免并发 GET 用旧快照覆盖 runtime.state
         } catch (e) {
             log(`扫描失败：${e.message}`);
         }
@@ -619,15 +869,27 @@
     function nextDelay(state) {
         const now = serverNowSeconds();
         let wait = Infinity;
-        const consider = (readyAt) => {
+        let activeWait = Infinity;
+        const consider = (readyAt, industry, id) => {
             if (readyAt && readyAt > now) wait = Math.min(wait, readyAt - now);
+            const item = slotTaskItem(state, industry, id, 'active', { notify: false });
+            const threshold = Number(item?.value || 0);
+            if (readyAt && readyAt > now && threshold > 0) {
+                activeWait = Math.min(activeWait, Math.max(0, readyAt - threshold - now));
+            }
         };
         for (const p of state.plots || []) {
-            if (!p.empty && !p.ready) consider(p.ready_at ?? p.task_snapshot?.ready_at);
+            if (!p.empty && !p.ready) consider(p.ready_at ?? p.task_snapshot?.ready_at, 'farming', p.slot);
         }
-        for (const group of [state.gathering_sites, state.mining_sites, state.crafting_stations]) {
+        for (const [industry, group] of [
+            ['gathering', state.gathering_sites],
+            ['mining', state.mining_sites],
+            ['crafting', state.crafting_stations],
+        ]) {
             for (const s of group || []) {
-                if (!s.empty && !s.ready) consider(s.task_snapshot?.ready_at ?? s.ready_at);
+                if (!s.empty && !s.ready) {
+                    consider(s.task_snapshot?.ready_at ?? s.ready_at, industry, INDUSTRY_ADAPTERS[industry]?.id(s));
+                }
             }
         }
         // 有因体力不足停工的点：对齐体力恢复时间
@@ -635,13 +897,53 @@
             const sw = staminaWaitSeconds(state, pendingStaminaCost);
             if (sw != null && isFinite(sw)) wait = Math.min(wait, sw);
         }
-        if (!isFinite(wait)) return CONFIG.maxPollInterval;
-        // +2s 缓冲，且不低于 pollInterval、不超过 maxPollInterval
-        return Math.min(CONFIG.maxPollInterval, Math.max(CONFIG.pollInterval, Math.ceil(wait * 1000) + 2000));
+        // 鱼塘周期：对齐最近的繁殖/投喂结算时刻，及时补料和处理
+        if (CONFIG.aquatic.enabled) {
+            for (const pond of state.aquatic?.ponds || []) {
+                const readyAt = Number(pond.last_settled_at || 0) + Number(pond.next_cycle_seconds || 0);
+                if (readyAt > now) wait = Math.min(wait, readyAt - now);
+            }
+        }
+        const normalDelay = !isFinite(wait) ? CONFIG.maxPollInterval :
+            Math.min(CONFIG.maxPollInterval, Math.max(CONFIG.pollInterval, Math.ceil(wait * 1000) + 2000));
+        // 尚未进入 active 窗口时精确唤醒，不套用 15 秒下限；窗口内已经尝试过则按普通轮询退避。
+        const activeDelay = !isFinite(activeWait) ? CONFIG.maxPollInterval : activeWait > 0
+            ? Math.min(CONFIG.maxPollInterval, Math.max(500, Math.ceil(activeWait * 1000) + 300))
+            : CONFIG.pollInterval;
+        return Math.min(normalDelay, activeDelay);
     }
 
     function sameId(a, b) {
         return a != null && b != null && String(a) === String(b);
+    }
+
+    function taskItemRecordId(item) {
+        return item?.id ?? item?.task_item_id ?? null;
+    }
+
+    function taskItemDurationMultiplier(item) {
+        if (item?.effect !== 'duration_multiplier') return 1;
+        const value = Number(item.value);
+        return Number.isFinite(value) ? value : 1;
+    }
+
+    // 槽位级任务道具：只认面板锁定的道具（支持保留数量），未锁定即不使用
+    function slotTaskItem(state, industry, slotId, timing, { notify = true } = {}) {
+        const override = getOverride(nodeTaskItemKey(industry, slotId));
+        if (override == null || override === '__off') return null; // '__off' 兼容旧版存储
+        const keep = Math.max(0, Number(getOverride(nodeTaskItemKeepKey(industry, slotId)) || 0));
+        const item = (state.task_items || []).find(candidate => {
+            const eligible = candidate?.eligible_industries;
+            return sameId(taskItemRecordId(candidate), override) && candidate.timing === timing &&
+                Number(candidate.quantity || 0) - keep > 0 &&
+                (!Array.isArray(eligible) || eligible.length === 0 || eligible.includes(industry));
+        }) || null;
+        const key = `task-item:${timing}:${industry}:${slotId}:${override}`;
+        if (item) clearSkip(key);
+        else if (notify) {
+            logSkip(key, `${INDUSTRY_NAMES[industry] || industry}点 ${slotId}：道具 #${override} 库存不足（保留 ${keep} 个）、类型不符或不适用于该产业，已跳过`);
+        }
+        return item;
     }
 
     function seedQty(state, crop) {
@@ -667,15 +969,19 @@
 
     // ---------- 经济价值评估 ----------
 
-    // 官网同款时长公式，包含任务的 minimum_duration_seconds。
-    function calcSeconds(base, difficulty, ability, minimum = 1) {
+    // 官网同款时长公式：先应用能力与 minimum，再应用 start 道具的 duration_multiplier。
+    function calcSeconds(base, difficulty, ability, minimum = 1, durationMultiplier = 1) {
         const b = Number(base);
         const d = Number(difficulty || 0);
         const a = Math.max(0, Number(ability || 0));
         if (!Number.isFinite(b) || b <= 0) return null;
         const sum = a + d;
         const factor = sum > 0 ? 1 + 2 * a / sum : 1;
-        return Math.max(Number(minimum || 1), Math.ceil(b / factor));
+        const seconds = Math.max(Number(minimum || 1), Math.ceil(b / factor));
+        const multiplier = Number(durationMultiplier);
+        return Number.isFinite(multiplier) && multiplier !== 1
+            ? Math.max(1, Math.ceil(seconds * multiplier))
+            : seconds;
     }
 
     function calcDraws(draws, ability) {
@@ -725,7 +1031,7 @@
         return base + (partner ? partnerAbility(partner, 'farming') : 0);
     }
 
-    function cropHourlyProfit(state, crop, ability = 0) {
+    function cropHourlyProfit(state, crop, ability = 0, plot = null) {
         const produceId = cropProduceItemId(crop);
         const producePrice = itemSellPrice(state, produceId, cropProduceName(crop), crop.produce_sell_price ?? crop.produce?.sell_price ?? crop.item?.sell_price);
         const shopEntry = (state.shop || []).find(e => sameId(shopEntryItemId(e), crop.seed_item_id));
@@ -735,7 +1041,9 @@
         if (!Number.isFinite(seedPrice)) return null;
         const minYield = Number(crop.yield_min ?? 1);
         const maxYield = Number(crop.yield_max ?? minYield);
-        const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability);
+        const startItem = plot ? slotTaskItem(state, 'farming', plot.slot, 'start', { notify: false }) : null;
+        const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability, 1,
+            taskItemDurationMultiplier(startItem));
         if (!seconds) return null;
         return (((minYield + maxYield) / 2) * producePrice - seedPrice) / (seconds / 3600);
     }
@@ -743,7 +1051,7 @@
     function bestCrop(state, crops, plot = null) {
         const ability = farmingAbility(state, plot);
         const scored = crops
-            .map(crop => ({ crop, value: cropHourlyProfit(state, crop, ability) }))
+            .map(crop => ({ crop, value: cropHourlyProfit(state, crop, ability, plot) }))
             .filter(x => x.value != null)
             .sort((a, b) => b.value - a.value);
         if (scored.length) return scored[0].crop;
@@ -774,7 +1082,7 @@
             }
         }
         const cm = state.commissions?.commission;
-        if (commissionActive(cm)) {
+        if (CONFIG.commissions.enabled && commissionActive(cm)) {
             needs.unshift({
                 source: 'commission', itemId: cm.item_id ?? cm.item?.item_id ?? null,
                 name: cm.item?.name || '', minQuality: 0, need: Number(cm.quantity || 0), commission: cm,
@@ -856,7 +1164,7 @@
             // 记录本次估值表，便于核对“为什么选它”
             const ability = farmingAbility(state, plot);
             const table = candidates.map(c => {
-                const v = cropHourlyProfit(state, c, ability);
+                const v = cropHourlyProfit(state, c, ability, plot);
                 return `${c.name || '作物#' + cropId(c)}=${v == null ? '缺价' : v.toFixed(2)}`;
             }).join(' ');
             log(`作物估值（土地 ${plot.slot + 1}，能力 ${ability}）：${table} → 选 ${crop.name || cropId(crop)}`);
@@ -895,9 +1203,16 @@
         }
         for (const site of [...(state.gathering_sites || []), ...(state.mining_sites || [])]) {
             for (const task of site.available_tasks || []) {
+                const outputs = task.outputs || [];
                 const direct = task.item_id ?? task.item?.item_id;
-                if (direct != null) ids.add(String(direct));
-                for (const out of task.outputs || []) {
+                if (!outputs.length && direct != null) ids.add(String(direct));
+                const weights = outputs.map(out => Number(out.weight));
+                const weightsValid = weights.every(weight => Number.isFinite(weight) && weight > 0);
+                const commonWeight = weightsValid ? Math.max(...weights) : 0;
+                for (const [index, out] of outputs.entries()) {
+                    const isUnclassifiedRandomDrop = outputs.length > 1 && !weightsValid;
+                    const isRareRandomDrop = outputs.length > 1 && weightsValid && weights[index] < commonWeight;
+                    if (!CONFIG.selling.includeRareTaskOutputs && (isUnclassifiedRandomDrop || isRareRandomDrop)) continue;
                     const id = out.item_id ?? out.item?.item_id;
                     if (id != null) ids.add(String(id));
                 }
@@ -906,26 +1221,43 @@
         return ids;
     }
 
-    function craftingInputIds(state) {
-        const ids = new Set();
+    // 每个加工站按“任一已解锁配方的一批最大用量”保留原料；同一物品跨站点累加。
+    // 这样既不会像整类禁售那样让售卖候选清空，也不会卖掉各站下一次开工所需的原料。
+    function craftingInputReserves(state) {
+        const reserves = new Map();
+        if (!CONFIG.selling.protectCraftingInputs) return reserves;
         for (const station of state.crafting_stations || []) {
+            const stationReserves = new Map();
             for (const recipe of station.recipes || []) {
+                if (recipe.unlocked === false) continue;
+                const recipeTotals = new Map();
                 for (const input of recipe.inputs || []) {
                     const id = input.item_id ?? input.item?.item_id;
-                    if (id != null) ids.add(String(id));
+                    const quantity = Math.max(0, Number(input.quantity || 0));
+                    if (id == null || quantity <= 0) continue;
+                    const key = String(id);
+                    recipeTotals.set(key, (recipeTotals.get(key) || 0) + quantity);
+                }
+                for (const [key, quantity] of recipeTotals) {
+                    stationReserves.set(key, Math.max(stationReserves.get(key) || 0, quantity));
                 }
             }
+            for (const [key, quantity] of stationReserves) {
+                reserves.set(key, (reserves.get(key) || 0) + quantity);
+            }
         }
-        return ids;
+        return reserves;
     }
 
-    function configuredKeep(itemId) {
+    function configuredKeep(itemId, craftingReserves = null) {
         const explicit = CONFIG.selling.keepByItemId?.[String(itemId)];
-        return Math.max(0, Number(explicit ?? CONFIG.selling.defaultKeep ?? 0));
+        const inventoryKeep = Math.max(0, Number(explicit ?? CONFIG.selling.defaultKeep ?? 0));
+        const craftingKeep = Math.max(0, Number(craftingReserves?.get(String(itemId)) || 0));
+        return Math.max(inventoryKeep, craftingKeep);
     }
 
     // 为一个物品的全部品质栈统一分配需求：高门槛需求优先，使用最低可满足品质。
-    function reservedStacksForItem(state, stacks) {
+    function reservedStacksForItem(state, stacks, craftingReserves = null) {
         const needs = gatherNeeds(state).filter(n => stacks.some(item => needMatchesItem(n, item)))
             .sort((a, b) => b.minQuality - a.minQuality);
         const rows = stacks.map(item => ({ item, free: Number(item.quantity || 0), reserved: 0 }))
@@ -941,7 +1273,7 @@
                 remaining -= take;
             }
         }
-        let keep = configuredKeep(stacks[0]?.item_id);
+        let keep = configuredKeep(stacks[0]?.item_id, craftingReserves);
         for (const row of rows) {
             if (keep <= 0) break;
             const take = Math.min(row.free, keep);
@@ -956,7 +1288,7 @@
         const whitelist = new Set((CONFIG.selling.allowedItemIds || []).map(String));
         for (const id of inferredSellItemIds(state)) whitelist.add(id);
         const never = new Set((CONFIG.selling.neverSellItemIds || []).map(String));
-        const craftingInputs = CONFIG.selling.protectCraftingInputs ? craftingInputIds(state) : new Set();
+        const craftingReserves = craftingInputReserves(state);
         const groups = new Map();
         for (const item of state.inventory || []) {
             const key = String(item.item_id);
@@ -965,9 +1297,10 @@
         }
         const sellables = [];
         for (const [key, stacks] of groups) {
-            if (!whitelist.has(key) || never.has(key) || craftingInputs.has(key)) continue;
-            for (const row of reservedStacksForItem(state, stacks)) {
-                const price = Number(row.item.sell_price || 0);
+            if (!whitelist.has(key) || never.has(key)) continue;
+            for (const row of reservedStacksForItem(state, stacks, craftingReserves)) {
+                // 背包条目不一定带 sell_price：回退到物品元数据查价，否则该物品永远进不了可卖列表
+                const price = Number(itemSellPrice(state, row.item.item_id, row.item?.name || '', row.item?.sell_price) ?? 0);
                 if (price > 0 && row.free > 0) sellables.push({ item: row.item, surplus: row.free, price });
             }
         }
@@ -976,26 +1309,29 @@
     }
 
     // 接单/加工接口不指定品质：按“服务器优先扣最高品质”的最坏情况计算仍可安全消耗多少。
-    function safeUnspecifiedConsumeQty(state, itemId, name = '') {
+    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true } = {}) {
         const stacks = (state.inventory || []).filter(i => itemId != null ? sameId(i.item_id, itemId) : i.name === name);
         if (!stacks.length) return 0;
         const needs = gatherNeeds(state).filter(n => stacks.some(item => needMatchesItem(n, item)));
         const thresholds = new Set([0, ...needs.map(n => Number(n.minQuality || 0))]);
+        const craftingReserves = reserveCraftingInputs ? craftingInputReserves(state) : null;
+        const keep = configuredKeep(itemId, craftingReserves);
         let safe = Infinity;
         for (const q of thresholds) {
             const eligible = stacks.filter(i => Number(i.quality || 0) >= q)
                 .reduce((sum, i) => sum + Number(i.quantity || 0), 0);
             const required = needs.filter(n => Number(n.minQuality || 0) >= q)
-                .reduce((sum, n) => sum + n.need, 0);
+                .reduce((sum, n) => sum + n.need, 0) + (q === 0 ? keep : 0);
             safe = Math.min(safe, eligible - required);
         }
-        safe = Math.min(safe, inventoryQty(state, itemId, name) - configuredKeep(itemId));
         return Math.max(0, Math.floor(safe));
     }
 
     async function autoSellForCoins(target) {
+        const failedStacks = new Set();
         while (playerCoins(runtime.state) < target && runtime.soldUnits < CONFIG.selling.maxUnitsPerTick) {
-            const candidate = computeSellables(runtime.state)[0];
+            const candidate = computeSellables(runtime.state).find(({ item }) =>
+                !failedStacks.has(`${item.item_id}:${Number(item.quality || 0)}`));
             if (!candidate) break;
             const needCoins = target - playerCoins(runtime.state);
             const qty = Math.min(
@@ -1005,10 +1341,18 @@
             );
             if (qty <= 0) break;
             const item = candidate.item;
-            await sellItem(item.item_id, qty, Number(item.quality || 0));
-            runtime.soldUnits += qty;
-            clearSkip(`fail:sell:${item.item_id}:${item.quality || 0}`);
-            log(`已安全卖出 ${item.quality_name || ''}${item.name} ×${qty}，目标金币 ${target}`);
+            const quality = Number(item.quality || 0);
+            const stackKey = `${item.item_id}:${quality}`;
+            try {
+                await sellItem(item.item_id, qty, quality);
+                runtime.soldUnits += qty;
+                clearSkip(`fail:sell:${stackKey}`);
+                log(`已安全卖出 ${item.quality_name || ''}${item.name} ×${qty}（+${candidate.price * qty} 金币）`);
+            } catch (e) {
+                if (shouldAbortTick(e)) throw e;
+                failedStacks.add(stackKey);
+                logSkip(`fail:sell:${stackKey}`, `售卖 ${item.name || item.item_id} 失败：${e.message}`);
+            }
         }
         const ok = playerCoins(runtime.state) >= target;
         if (!ok) logSkip('seed:poor', `金币仍不足（${playerCoins(runtime.state)}/${target}），安全售卖额度或白名单物资不足`);
@@ -1058,7 +1402,7 @@
             try {
                 board = await getCommissionBoard();
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip('fail:commission:board', `读取委托转发池失败：${e.message}`);
                 return;
             }
@@ -1084,7 +1428,7 @@
                     success = true;
                     break;
                 } catch (e) {
-                    if (isControlFlowError(e)) throw e;
+                    if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:commission:take:${x.commission_id}`, `接单失败：${e.message}`);
                 }
             }
@@ -1105,7 +1449,7 @@
                 clearSkip('fail:commission:submit');
                 log(`已交付今日委托：${cm.npc_name || 'NPC'} 的 ${cm.item?.name || cm.item_id} ×${cm.quantity}（+${cm.reward_maple_flame ?? '?'} 枫火${c.lucky_today ? '，幸运日加成' : ''}）`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip('fail:commission:submit', `交付委托失败：${e.message}`);
             }
         }
@@ -1127,6 +1471,66 @@
         return true;
     }
 
+    function taskReadyAt(node) {
+        const value = Number(node?.task_snapshot?.ready_at ?? node?.ready_at ?? 0);
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    // active 型任务道具只在官网允许的窗口（剩余时间 <= value）使用；未配置且未做槽位锁定时完全不动作。
+    async function useConfiguredActiveTaskItems() {
+        const targets = [];
+        let used = 0;
+        const hasActiveItem = (industry, id) => {
+            const override = getOverride(nodeTaskItemKey(industry, id));
+            return override != null && override !== '__off';
+        };
+        if (CONFIG.farming.enabled) {
+            for (const plot of runtime.state.plots || []) {
+                if (!plot.empty && !plot.ready && hasActiveItem('farming', plot.slot)) {
+                    targets.push({
+                        industry: 'farming', id: plot.slot, label: `土地 ${plot.slot + 1}`,
+                        current: () => (runtime.state.plots || []).find(p => p.slot === plot.slot),
+                    });
+                }
+            }
+        }
+        for (const industry of Object.keys(INDUSTRY_ADAPTERS)) {
+            const adapter = INDUSTRY_ADAPTERS[industry];
+            if (!adapter.config().enabled) continue;
+            for (const node of industryNodes(runtime.state, industry)) {
+                const id = adapter.id(node);
+                if (id != null && !node.empty && !node.ready && hasActiveItem(industry, id)) {
+                    targets.push({
+                        industry, id, label: `${INDUSTRY_NAMES[industry] || industry}点 ${id}`,
+                        current: () => nodeById(runtime.state, industry, id),
+                    });
+                }
+            }
+        }
+
+        for (const target of targets) {
+            const node = target.current();
+            if (!node || node.empty || node.ready) continue;
+            const item = slotTaskItem(runtime.state, target.industry, target.id, 'active');
+            const readyAt = taskReadyAt(node);
+            const remaining = readyAt - serverNowSeconds();
+            const threshold = Number(item?.value || 0);
+            if (!item || readyAt <= 0 || remaining <= 0 || threshold <= 0 || remaining > threshold) continue;
+            const itemId = taskItemRecordId(item);
+            try {
+                await useTaskItem(target.industry, target.id, itemId);
+                used += 1;
+                clearSkip(`fail:active-item:${target.industry}:${target.id}:${itemId}`);
+                log(`${target.label}：已使用 ${item.name || '任务道具#' + itemId}（原剩余约 ${Math.ceil(remaining)} 秒）`);
+            } catch (e) {
+                if (shouldAbortTick(e)) throw e;
+                logSkip(`fail:active-item:${target.industry}:${target.id}:${itemId}`,
+                    `${target.label} 使用任务道具失败：${e.message}`);
+            }
+        }
+        return used;
+    }
+
     async function collectReadyPlots() {
         if (!CONFIG.farming.enabled) return;
         const slots = (runtime.state.plots || []).filter(p => p.ready && !p.empty).map(p => p.slot);
@@ -1138,7 +1542,7 @@
                 clearSkip(`fail:harvest:${slot}`);
                 log(`土地 ${slot + 1}：已收获`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:harvest:${slot}`, `土地 ${slot + 1} 收获失败：${e.message}`);
             }
         }
@@ -1183,12 +1587,14 @@
             }
 
             try {
-                await plantPlot(slot, cropId(crop));
+                const startItem = slotTaskItem(runtime.state, 'farming', slot, 'start');
+                await plantPlot(slot, cropId(crop), taskItemRecordId(startItem) ?? '');
                 clearSkip(`fail:plant:${slot}`);
                 clearSkip(`seed:disabled:${cropId(crop)}`);
-                log(`土地 ${slot + 1}：种下 ${crop.name || '作物#' + cropId(crop)}（${reason}）`);
+                const itemText = startItem ? `，使用 ${startItem.name || '任务道具#' + taskItemRecordId(startItem)}` : '';
+                log(`土地 ${slot + 1}：种下 ${crop.name || '作物#' + cropId(crop)}（${reason}${itemText}）`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:plant:${slot}`, `土地 ${slot + 1} 种植失败：${e.message}`);
             }
         }
@@ -1200,6 +1606,19 @@
             p.assigned_gathering_site_id == null &&
             p.assigned_mining_site_id == null &&
             p.assigned_crafting_station_id == null;
+    }
+
+    function aquaticAssignedPartnerIds(state) {
+        const ids = new Set();
+        const companionId = state.aquatic?.companion?.partner_id ?? state.aquatic?.companion?.id;
+        if (companionId != null) ids.add(String(companionId));
+        for (const pond of state.aquatic?.ponds || []) {
+            for (const partner of pond.assigned_partners || []) {
+                const id = partner?.partner_id ?? partner?.id;
+                if (id != null) ids.add(String(id));
+            }
+        }
+        return ids;
     }
 
     // 伙伴必须具有对应产业的倾向（tendencies）才能派驻
@@ -1253,8 +1672,10 @@
     }
 
     function nodeDifficulty(industry, node) {
-        return Math.max(0, ...nodeJobs(industry, node)
-            .map(job => Number(job.difficulty ?? job.time_difficulty ?? job.yield_difficulty ?? 0)));
+        const values = nodeJobs(industry, node)
+            .map(job => Number(job.difficulty ?? job.time_difficulty ?? job.yield_difficulty ?? 0))
+            .filter(Number.isFinite);
+        return Math.max(0, ...values);
     }
 
     function currentPartnerId(node) {
@@ -1269,7 +1690,8 @@
                 slots.push({
                     key: `farming:${plot.slot}`, industry: 'farming', id: plot.slot,
                     label: `土地 ${plot.slot + 1}`, node: plot, mandatory: false,
-                    difficulty: Math.max(0, ...(state.crops || []).map(c => Number(c.time_difficulty || 0))),
+                    difficulty: Math.max(0, ...(state.crops || [])
+                        .map(c => Number(c.time_difficulty || 0)).filter(Number.isFinite)),
                     assign: pid => assignPlotPartner(plot.slot, pid),
                 });
             }
@@ -1285,16 +1707,113 @@
                     logSkip(`schema:id:${industry}`, `${industry} 节点缺少 id，已跳过派驻`);
                     continue;
                 }
-                if (nodeJobOverride(industry, id) === '__off') continue; // 手动关闭的点位不占用伙伴编制
+                const disabled = nodeJobOverride(industry, id) === '__off';
                 slots.push({
                     key: `${industry}:${id}`, industry, id,
                     label: `${INDUSTRY_NAMES[industry] || industry}点 ${id}`, node,
-                    mandatory: adapter.requiresPartner, difficulty: nodeDifficulty(industry, node),
+                    mandatory: adapter.requiresPartner, disabled, difficulty: nodeDifficulty(industry, node),
                     assign: pid => assignSitePartner(industry, id, pid),
                 });
             }
         }
         return slots;
+    }
+
+    // 匈牙利算法求全局最大权匹配；每个岗位额外配一个虚拟列，允许合法地保持空缺。
+    function maximumWeightPartnerMatching(slots, partners) {
+        if (!slots.length || !partners.length) return new Map();
+        const priorities = { gathering: 4, mining: 3, crafting: 2, farming: 1 };
+        const edgeAbilities = slots.map(slot => partners.map(partner => {
+            if (!hasTendency(partner, slot.industry)) return null;
+            const pid = partner.partner_id ?? partner.id;
+            const same = sameId(pid, currentPartnerId(slot.node));
+            const rawAbility = Number(partnerAbility(partner, slot.industry) || 0);
+            const rawDifficulty = Number(slot.difficulty || 0);
+            const ability = Number.isFinite(rawAbility) ? Math.max(0, rawAbility) : 0;
+            const difficulty = Number.isFinite(rawDifficulty) ? Math.max(0, rawDifficulty) : 0;
+            let weightedAbility = ability * (1000 + difficulty);
+            // 同岗位伙伴获得恰好约等于最低换人门槛的能力加成；覆盖更多岗位时仍允许调动。
+            if (!slot.mandatory && same) {
+                weightedAbility *= 1 + Math.max(0, Number(CONFIG.partnerMinImprovement || 0));
+            }
+            return { pid, same, weightedAbility };
+        }));
+        const abilityBound = edgeAbilities.reduce((sum, row) =>
+            sum + Math.max(0, ...row.filter(Boolean).map(edge => edge.weightedAbility)), 0) || 1;
+        const stabilityUnit = 1e-6;
+        const lowerScoreBound = abilityBound + slots.length * stabilityUnit + 1;
+        const maxIndustryTotal = slots.reduce((sum, slot) => sum + (priorities[slot.industry] || 0), 0);
+        const coverageUnit = maxIndustryTotal + 2;
+        const mandatoryUnit = slots.length * coverageUnit + maxIndustryTotal + 2;
+        const forbidden = -1e12;
+        const weights = slots.map((slot, rowIndex) => [
+            ...partners.map((_, partnerIndex) => {
+                const edge = edgeAbilities[rowIndex][partnerIndex];
+                if (!edge) return forbidden;
+                return coverageUnit + (slot.mandatory ? mandatoryUnit : 0) +
+                    (priorities[slot.industry] || 0) +
+                    (edge.weightedAbility + (edge.same ? stabilityUnit : 0)) / lowerScoreBound;
+            }),
+            ...Array(slots.length).fill(0),
+        ]);
+
+        const n = weights.length;
+        const m = weights[0].length;
+        const u = Array(n + 1).fill(0);
+        const v = Array(m + 1).fill(0);
+        const p = Array(m + 1).fill(0);
+        const way = Array(m + 1).fill(0);
+        for (let i = 1; i <= n; i += 1) {
+            p[0] = i;
+            let j0 = 0;
+            const minv = Array(m + 1).fill(Infinity);
+            const used = Array(m + 1).fill(false);
+            do {
+                used[j0] = true;
+                const i0 = p[j0];
+                let delta = Infinity;
+                let j1 = 0;
+                for (let j = 1; j <= m; j += 1) {
+                    if (used[j]) continue;
+                    const cur = -weights[i0 - 1][j - 1] - u[i0] - v[j];
+                    if (cur < minv[j]) {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta) {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+                for (let j = 0; j <= m; j += 1) {
+                    if (used[j]) {
+                        u[p[j]] += delta;
+                        v[j] -= delta;
+                    } else {
+                        minv[j] -= delta;
+                    }
+                }
+                j0 = j1;
+            } while (p[j0] !== 0);
+            do {
+                const j1 = way[j0];
+                p[j0] = p[j1];
+                j0 = j1;
+            } while (j0 !== 0);
+        }
+
+        const rowToColumn = Array(n).fill(-1);
+        for (let j = 1; j <= m; j += 1) {
+            if (p[j] > 0) rowToColumn[p[j] - 1] = j - 1;
+        }
+        const desired = new Map();
+        for (let row = 0; row < n; row += 1) {
+            const column = rowToColumn[row];
+            if (column >= 0 && column < partners.length && weights[row][column] > forbidden / 2) {
+                desired.set(slots[row].key, partners[column].partner_id ?? partners[column].id);
+            }
+        }
+        return desired;
     }
 
     // 全产业统一规划，采集硬约束优先；允许空闲节点之间换岗，避免农田抢走唯一采集伙伴。
@@ -1305,46 +1824,24 @@
         const mutableCurrentIds = new Set(allSlots.map(s => currentPartnerId(s.node)).filter(x => x != null).map(String));
         const selectedSlots = [];
         for (const industry of ['gathering', 'mining', 'crafting', 'farming']) {
-            const industrySlots = allSlots.filter(s => s.industry === industry)
+            const mutableIndustrySlots = allSlots.filter(s => s.industry === industry);
+            const industrySlots = mutableIndustrySlots.filter(s => !s.disabled)
                 .sort((a, b) => Number(b.mandatory) - Number(a.mandatory) || b.difficulty - a.difficulty);
-            const mutableAssigned = new Set(industrySlots.map(s => currentPartnerId(s.node)).filter(x => x != null).map(String)).size;
+            const mutableAssigned = new Set(mutableIndustrySlots.map(s => currentPartnerId(s.node))
+                .filter(x => x != null).map(String)).size;
             const fixed = Math.max(0, assignedCount(state, industry) - mutableAssigned);
             const cap = industryCapacity(state, industry);
             const available = cap === Infinity ? industrySlots.length : Math.max(0, cap - fixed);
             selectedSlots.push(...industrySlots.slice(0, available));
         }
 
+        const aquaticPartnerIds = aquaticAssignedPartnerIds(state);
         const partners = (state.partners || []).filter(p => {
-            const pid = String(p.partner_id ?? p.id);
-            return !p.missing && (isPartnerIdle(p) || mutableCurrentIds.has(pid));
+            const rawId = p.partner_id ?? p.id;
+            return rawId != null && !p.missing && !aquaticPartnerIds.has(String(rawId)) &&
+                (isPartnerIdle(p) || mutableCurrentIds.has(String(rawId)));
         });
-        const edges = [];
-        for (const slot of selectedSlots) {
-            const current = assignedPartner(state, slot.node);
-            const currentAbility = current ? partnerAbility(current, slot.industry) : 0;
-            for (const partner of partners) {
-                if (!hasTendency(partner, slot.industry)) continue;
-                const pid = partner.partner_id ?? partner.id;
-                const ability = partnerAbility(partner, slot.industry);
-                const same = sameId(pid, currentPartnerId(slot.node));
-                if (!slot.mandatory && current && !same &&
-                    ability < currentAbility * (1 + CONFIG.partnerMinImprovement)) continue;
-                const hardPriority = slot.mandatory ? 1e9 :
-                    ({ mining: 3e6, crafting: 2e6, farming: 1e6 }[slot.industry] || 0);
-                const stability = same ? 1e5 : 0;
-                const weight = hardPriority + stability + ability * (1000 + slot.difficulty);
-                edges.push({ slot, partner, pid, weight });
-            }
-        }
-        edges.sort((a, b) => b.weight - a.weight);
-        const desired = new Map();
-        const usedPartners = new Set();
-        for (const edge of edges) {
-            const pid = String(edge.pid);
-            if (desired.has(edge.slot.key) || usedPartners.has(pid)) continue;
-            desired.set(edge.slot.key, edge.pid);
-            usedPartners.add(pid);
-        }
+        const desired = maximumWeightPartnerMatching(selectedSlots, partners);
 
         // 先释放所有需要移动的可调整岗位，响应 state 会逐次确认真实编制。
         for (const slot of allSlots) {
@@ -1355,7 +1852,7 @@
                 await slot.assign(null);
                 clearSkip(`fail:unassign:${slot.key}`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:unassign:${slot.key}`, `${slot.label} 释放伙伴失败：${e.message}`);
             }
         }
@@ -1378,7 +1875,7 @@
                 const partner = (runtime.state.partners || []).find(p => sameId(p.partner_id ?? p.id, target));
                 log(`${slot.label}：派驻 ${partner?.name || '伙伴#' + target}（${INDUSTRY_NAMES[slot.industry] || slot.industry} ${partner ? partnerAbility(partner, slot.industry) : '?'}）`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:assign:${slot.key}`, `${slot.label} 派驻伙伴失败：${e.message}`);
             }
         }
@@ -1407,17 +1904,19 @@
     const skipNotices = new Set();
     function logSkip(key, msg) {
         if (skipNotices.has(key)) return;
+        if (skipNotices.size >= 300) skipNotices.delete(skipNotices.values().next().value);
         skipNotices.add(key);
         log(msg);
     }
     function clearSkip(key) { skipNotices.delete(key); }
 
-    function jobDurationSeconds(job, ability) {
+    function jobDurationSeconds(job, ability, durationMultiplier = 1) {
         if (Object.prototype.hasOwnProperty.call(job, 'yield_difficulty')) {
             const fixed = Number(job.duration_seconds || 1);
             return Number.isFinite(fixed) ? Math.max(1, fixed) : null;
         }
-        return calcSeconds(job.duration_seconds, job.time_difficulty, ability, job.minimum_duration_seconds ?? 1);
+        return calcSeconds(job.duration_seconds, job.time_difficulty, ability,
+            job.minimum_duration_seconds ?? 1, durationMultiplier);
     }
 
     function jobExpectedOutputs(job, ability, { conservative = false } = {}) {
@@ -1451,8 +1950,8 @@
         return total;
     }
 
-    function jobHourlyValue(state, industry, job, ability) {
-        const seconds = jobDurationSeconds(job, ability);
+    function jobHourlyValue(state, industry, job, ability, durationMultiplier = 1) {
+        const seconds = jobDurationSeconds(job, ability, durationMultiplier);
         if (!seconds) return null;
         let outputValue = 0;
         let known = false;
@@ -1495,7 +1994,7 @@
             totals.set(key, row);
         }
         return [...totals.values()].every(row =>
-            safeUnspecifiedConsumeQty(state, row.itemId, row.name) >= row.quantity);
+            safeUnspecifiedConsumeQty(state, row.itemId, row.name, { reserveCraftingInputs: false }) >= row.quantity);
     }
 
     function jobAvailable(state, industry, job) {
@@ -1540,13 +2039,19 @@
         const partner = assignedPartner(state, node);
         const ability = Number(state.industry_rules?.[industry]?.character_base_ability || 0) +
             (partner ? partnerAbility(partner, industry) : 0);
+        const startItem = slotTaskItem(state, industry, INDUSTRY_ADAPTERS[industry]?.id(node), 'start');
+        const durationMultiplier = taskItemDurationMultiplier(startItem);
         const scored = affordable.map((job, index) => {
-            const hourly = jobHourlyValue(state, industry, job, ability);
-            const seconds = jobDurationSeconds(job, ability) || 1;
+            const hourly = jobHourlyValue(state, industry, job, ability, durationMultiplier);
+            const seconds = jobDurationSeconds(job, ability, durationMultiplier) || 1;
             const value = hourly == null ? null : hourly * seconds / 3600;
             const cost = Number(job.stamina_cost || 0);
             const efficiency = value == null ? -Infinity : (cost > 0 ? value / cost : hourly);
-            return { job, index, ability, hourly: hourly ?? -Infinity, efficiency, demand: jobDemandScore(state, job, ability) };
+            return {
+                job, index, ability, hourly: hourly ?? -Infinity, efficiency,
+                demand: jobDemandScore(state, job, ability),
+                taskItemId: taskItemRecordId(startItem), taskItem: startItem,
+            };
         }).sort((a, b) => b.demand - a.demand || b.efficiency - a.efficiency || b.hourly - a.hourly || a.index - b.index);
         return scored[0] || { blocked: '没有可执行任务' };
     }
@@ -1557,7 +2062,8 @@
             const base = Number(state.industry_rules?.[industry]?.character_base_ability || 0);
             for (const node of industryNodes(state, industry)) {
                 if (node.empty || node.ready) continue;
-                const active = node.task || node.recipe;
+                const snapshot = node.task_snapshot;
+                const active = node.task || node.recipe || snapshot?.task || snapshot?.recipe || snapshot;
                 if (!active) continue;
                 const partner = assignedPartner(state, node);
                 const ability = base + (partner ? partnerAbility(partner, industry) : 0);
@@ -1582,7 +2088,7 @@
                     clearSkip(`fail:collect:${industry}:${id}`);
                     log(`${INDUSTRY_NAMES[industry] || industry}点 ${id}：已领取`);
                 } catch (e) {
-                    if (isControlFlowError(e)) throw e;
+                    if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:collect:${industry}:${id}`, `${INDUSTRY_NAMES[industry] || industry}点 ${id} 领取失败：${e.message}`);
                 }
             }
@@ -1591,6 +2097,7 @@
 
     // 每次只规划全产业中最优的一个开工动作，执行后用新 state 重新排名，避免固定顺序抢体力。
     async function startEmptyIndustries() {
+        const failedNodes = new Set();
         while (true) {
             const state = runtime.state;
             const plans = [];
@@ -1604,6 +2111,7 @@
                         logSkip(`schema:start-id:${industry}`, `${industry} 节点缺少 id，已禁止请求 undefined`);
                         continue;
                     }
+                    if (failedNodes.has(`${industry}:${id}`)) continue;
                     if (nodeJobOverride(industry, id) === '__off') continue; // 面板手动关闭的点位不开工
                     if (adapter.requiresPartner && !siteHasPartner(node)) {
                         logSkip(`nopartner:${industry}:${id}`, `${INDUSTRY_NAMES[industry]}点 ${id}：必须派驻伙伴才能开工`);
@@ -1621,15 +2129,278 @@
             plans.sort((a, b) => b.demand - a.demand || b.efficiency - a.efficiency || b.hourly - a.hourly);
             const plan = plans[0];
             try {
-                await startSite(plan.industry, plan.id, plan.adapter.payloadKey, jobId(plan.job));
+                await startSite(plan.industry, plan.id, plan.adapter.payloadKey, jobId(plan.job), plan.taskItemId ?? '');
                 clearSkip(`fail:start:${plan.industry}:${plan.id}`);
-                log(`${INDUSTRY_NAMES[plan.industry]}点 ${plan.id}：开工「${plan.job.name || '任务#' + jobId(plan.job)}」`);
+                const itemText = plan.taskItem
+                    ? `，使用 ${plan.taskItem.name || '任务道具#' + plan.taskItemId}` : '';
+                log(`${INDUSTRY_NAMES[plan.industry]}点 ${plan.id}：开工「${plan.job.name || '任务#' + jobId(plan.job)}」${itemText}`);
             } catch (e) {
-                if (isControlFlowError(e)) throw e;
+                if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:start:${plan.industry}:${plan.id}`, `${INDUSTRY_NAMES[plan.industry]}点 ${plan.id} 开工失败：${e.message}`);
-                return; // 状态可能发生竞争，结束本阶段，下一轮重新规划
+                failedNodes.add(`${plan.industry}:${plan.id}`); // 本轮跳过该点，继续尝试其余合法计划
             }
         }
+    }
+
+    // ---------- 水产：垂钓 + 鱼塘 ----------
+
+    // 钓点选择：面板锁定/配置指定 > 聚鱼度所在钓点（换钓点会清零聚鱼度）> 第一个已解锁钓点
+    function pickFishingSpot(aq) {
+        const spots = (aq?.spots || []).filter(s => s && s.unlocked && s.id != null);
+        if (!spots.length) return null;
+        const wanted = getOverride(AQUATIC_SPOT_KEY) ?? CONFIG.aquatic.spotId;
+        if (wanted != null && wanted !== '') {
+            const forced = spots.find(s => sameId(s.id, wanted));
+            if (forced) {
+                clearSkip('aquatic:bad-spot');
+                return forced;
+            }
+            logSkip('aquatic:bad-spot', `指定钓点 #${wanted} 未解锁或不存在，回退到自动选择`);
+        }
+        const comboSpot = Number(aq.combo?.layers || 0) > 0
+            ? spots.find(s => sameId(s.id, aq.combo.spot_id)) : null;
+        return comboSpot || spots[0];
+    }
+
+    // 大物咬钩：按配置自动搏一把/放线；'manual' 由 tick 入口暂停等人工，不走这里
+    // 返回实际动作（'fight'/'release'），失败或无大物返回 null
+    async function doBigCatch(state) {
+        const pending = state.aquatic?.pending_big_catch;
+        if (!pending) return null;
+        const cfg = CONFIG.aquatic;
+        const chance = Number(pending.chance ?? 0);
+        // 大物消耗 = 钓点单竿消耗（已与开发者确认）；服务器字段缺失时按钓点消耗兜底
+        const spotCost = Number(pickFishingSpot(state.aquatic)?.stamina_cost || 0);
+        const cost = Number(pending.stamina_cost ?? spotCost) || 0;
+        const stamina = liveStamina(state);
+        const fight = cfg.bigCatch === 'fight' && chance >= Number(cfg.fightMinChance || 0) && stamina >= cost;
+        const action = fight ? 'fight' : 'release';
+        try {
+            const result = await resolveBigCatch(action);
+            clearSkip('aquatic:big-catch');
+            if (fight) {
+                log(`大物「${pending.name || '?'}」搏斗${result?.success ? `成功${result.size ? `，${result.size} 厘米` : ''}` : '失败'}（成功率 ${Math.round(chance * 100)}%）`);
+            } else {
+                const reason = stamina < cost ? '，体力不足' : '';
+                log(`大物「${pending.name || '?'}」已放线（成功率 ${Math.round(chance * 100)}%${reason}），改收寻常渔获`);
+            }
+            return action;
+        } catch (e) {
+            if (shouldAbortTick(e)) throw e;
+            logSkip('fail:big-catch', `大物处理失败：${e.message}`);
+            return null;
+        }
+    }
+
+    // 垂钓：体力恢复比聚鱼度衰退慢，滴钓保不住连击——攒够「连钓次数」竿的体力后一次性连钓，
+    // 让聚鱼度在这一连内叠上去；钓完等体力重新攒满再钓下一连。
+    async function doFishing(state) {
+        const cfg = CONFIG.aquatic;
+        if (!fishingEnabled() || !state.aquatic?.unlocked) return;
+        const chain = fishingChainCasts();
+        const reserve = Number(cfg.staminaReserve || 0);
+        // 先处理挂着的大物（可能来自手动垂钓）
+        if (runtime.state.aquatic?.pending_big_catch) {
+            if (cfg.bigCatch === 'manual') return;
+            await doBigCatch(runtime.state);
+            if (runtime.state.aquatic?.pending_big_catch) return; // 处理失败：本轮不再抛竿
+        }
+        const spot = pickFishingSpot(runtime.state.aquatic);
+        if (!spot) {
+            logSkip('aquatic:no-spot', '水产：没有已解锁的钓点');
+            return;
+        }
+        clearSkip('aquatic:no-spot');
+        const cost = Number(spot.stamina_cost || 0);
+        // 大物预留：只有打算搏斗时才预留；大物消耗 = 当前钓点单竿消耗（已与开发者确认）
+        const bigReserve = bigCatchReserveEnabled() && cfg.bigCatch === 'fight' ? cost : 0;
+        const need = cost * chain + reserve + bigReserve;
+        if (liveStamina(runtime.state) < need) {
+            // 攒不够一连就不下竿；登记缺口，下一轮在体力刚攒够时醒来
+            rememberStaminaNeed(runtime.state, need, `垂钓连钓×${chain}`);
+            return;
+        }
+        log(`体力已攒够（${liveStamina(runtime.state)}/${need}），在「${spot.name || spot.id}」连钓 ×${chain}${bigReserve ? '（含大物预留 1 竿）' : ''}`);
+        let bigCatchSpent = !bigReserve; // 本连的大物预留是否已消耗（不预留视为已消耗）
+        for (let i = 0; i < chain && running; i++) {
+            const hold = reserve + (bigCatchSpent ? 0 : bigReserve);
+            if (liveStamina(runtime.state) - cost < hold) break;
+            try {
+                const result = await castLine(spot.id);
+                clearSkip(`fail:cast:${spot.id}`);
+                if (result && !result.duplicate) {
+                    const drops = (result.drops || []).map(d => `${d.quality_name || ''}${d.name}×${d.quantity}`).join('、');
+                    log(`第 ${i + 1}/${chain} 竿：${result.big_catch ? '有大家伙咬钩！' : (drops || '一无所获')}`);
+                }
+                if (runtime.state.aquatic?.pending_big_catch) {
+                    if (cfg.bigCatch === 'manual') break;
+                    const acted = await doBigCatch(runtime.state);
+                    if (acted === 'fight') bigCatchSpent = true; // 预留已用掉，后续竿不再压体力
+                    if (runtime.state.aquatic?.pending_big_catch) break; // 处理失败：中止本连
+                }
+            } catch (e) {
+                if (shouldAbortTick(e)) throw e;
+                logSkip(`fail:cast:${spot.id}`, `垂钓「${spot.name || spot.id}」失败：${e.message}`);
+                break;
+            }
+        }
+    }
+
+    // 鱼塘：投苗补到稳态线、捞走超出稳态线的成鱼（保持世代加值）
+    async function doPonds(state) {
+        const cfg = CONFIG.aquatic;
+        const aq = state.aquatic;
+        if (!cfg.enabled || !cfg.ponds || !aq?.unlocked) return;
+        if (cfg.autoBuildPonds) {
+            for (const site of aq.buildable_ponds || []) {
+                if (!site.unlocked || !site.affordable) continue;
+                try {
+                    await buildPond(site.id);
+                    clearSkip(`fail:build-pond:${site.id}`);
+                    log(`已挖好新鱼塘「${site.name || site.id}」（${site.build_cost} 红叶币）`);
+                } catch (e) {
+                    if (shouldAbortTick(e)) throw e;
+                    logSkip(`fail:build-pond:${site.id}`, `挖塘「${site.name || site.id}」失败：${e.message}`);
+                }
+            }
+        }
+        for (const pond of runtime.state.aquatic?.ponds || []) {
+            if (pond.pond_id == null) continue;
+            const label = `鱼塘「${pond.definition?.name || pond.pond_id}」`;
+            const stock = Math.max(0, Number(pond.stock || 0));
+            const steady = Math.max(0, Number(pond.steady_stock || 0));
+            const fryCount = (pond.fry || []).reduce((sum, f) => sum + Number(f.count || 0), 0);
+            // 投苗：成鱼 + 在养鱼苗低于稳态线时补足（沿用官方选种：塘里已有品种优先，否则第一个已解锁品种）
+            const species = pond.species_id != null
+                ? (runtime.state.aquatic.species || []).find(s => sameId(s.id, pond.species_id))
+                : (runtime.state.aquatic.species || []).find(s => s.unlocked);
+            if (species && species.id != null && Number(species.owned_fry || 0) > 0) {
+                const room = Math.max(0, Number(pond.capacity || 0) - Number(pond.population ?? (stock + fryCount)));
+                const needed = Math.max(steady - stock - fryCount, pond.empty ? 1 : 0);
+                const qty = Math.min(needed, room, Number(species.owned_fry || 0));
+                if (qty > 0) {
+                    try {
+                        await stockPond(pond.pond_id, species.id, qty);
+                        clearSkip(`fail:stock:${pond.pond_id}`);
+                        log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${qty}`);
+                    } catch (e) {
+                        if (shouldAbortTick(e)) throw e;
+                        logSkip(`fail:stock:${pond.pond_id}`, `${label} 投苗失败：${e.message}`);
+                    }
+                }
+            }
+            // 捞鱼：只捞超出稳态线的部分，捞鱼不消耗体力
+            const surplus = stock - steady;
+            if (surplus > 0) {
+                try {
+                    await harvestPond(pond.pond_id, surplus);
+                    clearSkip(`fail:harvest-pond:${pond.pond_id}`);
+                    log(`${label}：捞鱼 ×${surplus}（保留稳态线 ${steady} 尾）`);
+                } catch (e) {
+                    if (shouldAbortTick(e)) throw e;
+                    logSkip(`fail:harvest-pond:${pond.pond_id}`, `${label} 捞鱼失败：${e.message}`);
+                }
+            }
+        }
+    }
+
+    // 饲料槽：余量不足 feedKeepHours 时投料补足；优先单位品质分最低的饲料，保留量受 selling 配置保护
+    async function doAquaticFeed(state) {
+        const cfg = CONFIG.aquatic;
+        const aq = state.aquatic;
+        if (!cfg.enabled || !cfg.autoFeed || !aq?.unlocked) return;
+        const slot = aq.feed_slot;
+        if (!slot || !Number(slot.hourly_rate)) return; // 没有消耗饲料的设施
+        let deficit = Number(slot.hourly_rate) * Number(cfg.feedKeepHours || 0) - Number(slot.units || 0);
+        if (deficit <= 0) return;
+        const inputs = [...(slot.inputs || [])]
+            .filter(i => i.item_id != null && Number(i.units) > 0)
+            .sort((a, b) => Number(a.unit_score || 0) - Number(b.unit_score || 0));
+        if (!inputs.length) {
+            logSkip('aquatic:no-feed', '饲料槽余量不足，但仓库中没有可投入的饲料');
+            return;
+        }
+        clearSkip('aquatic:no-feed');
+        for (const input of inputs) {
+            if (deficit <= 0) break;
+            const keep = configuredKeep(input.item_id);
+            const available = Math.max(0, Number(input.quantity || 0) - keep);
+            const roomUnits = Number(slot.capacity || 0) - Number(runtime.state.aquatic?.feed_slot?.units || 0);
+            const count = Math.min(available, Math.floor(roomUnits / Number(input.units)),
+                Math.ceil(deficit / Number(input.units)));
+            if (count <= 0) continue;
+            try {
+                await depositFeed(input.item_id, Number(input.quality || 0), count);
+                clearSkip(`fail:feed:${input.item_id}:${input.quality || 0}`);
+                log(`饲料槽：投入 ${input.item?.name || input.item_id} ×${count}（约 ${Number(input.units) * count} 份）`);
+                deficit -= Number(input.units) * count;
+            } catch (e) {
+                if (shouldAbortTick(e)) throw e;
+                logSkip(`fail:feed:${input.item_id}:${input.quality || 0}`, `饲料投入失败：${e.message}`);
+                break;
+            }
+        }
+    }
+
+    // 水产伙伴：陪钓 1 名 + 每口塘 1 名，从有水产倾向的空闲伙伴中挑能力最强的
+    async function doAquaticPartners(state) {
+        const cfg = CONFIG.aquatic;
+        const aq = state.aquatic;
+        if (!cfg.enabled || !cfg.autoAssignPartner || !aq?.unlocked) return;
+        const capacity = Number(state.industry_rules?.aquatic?.partner_capacity || 0);
+        const aquaticIds = aquaticAssignedPartnerIds(state);
+        if (capacity > 0 && aquaticIds.size >= capacity) return;
+        const idle = (state.partners || [])
+            .filter(p => isPartnerIdle(p) && hasTendency(p, 'aquatic') &&
+                !aquaticIds.has(String(p.partner_id ?? p.id)))
+            .sort((a, b) => partnerAbility(b, 'aquatic') - partnerAbility(a, 'aquatic'));
+        if (!idle.length) return;
+        const takeNext = () => idle.shift();
+        if (fishingEnabled() && aq.companion == null) {
+            const partner = takeNext();
+            if (partner) {
+                const pid = partner.partner_id ?? partner.id;
+                try {
+                    await assignFishingCompanion(pid);
+                    clearSkip('fail:assign-companion');
+                    aquaticIds.add(String(pid));
+                    log(`已安排 ${partner.name || '伙伴#' + pid} 陪钓（水产 ${partnerAbility(partner, 'aquatic')}）`);
+                } catch (e) {
+                    if (shouldAbortTick(e)) throw e;
+                    logSkip('fail:assign-companion', `安排陪钓伙伴失败：${e.message}`);
+                }
+            }
+        }
+        for (const pond of runtime.state.aquatic?.ponds || []) {
+            if (pond.pond_id == null || (pond.assigned_partners || []).length > 0) continue;
+            if (capacity > 0 && aquaticIds.size >= capacity) break;
+            const partner = takeNext();
+            if (!partner) break;
+            const pid = partner.partner_id ?? partner.id;
+            try {
+                await assignPondPartner(pond.pond_id, pid);
+                clearSkip(`fail:assign-pond:${pond.pond_id}`);
+                aquaticIds.add(String(pid));
+                log(`已安排 ${partner.name || '伙伴#' + pid} 看塘「${pond.definition?.name || pond.pond_id}」（水产 ${partnerAbility(partner, 'aquatic')}）`);
+            } catch (e) {
+                if (shouldAbortTick(e)) throw e;
+                logSkip(`fail:assign-pond:${pond.pond_id}`, `安排看塘伙伴失败：${e.message}`);
+            }
+        }
+    }
+
+    async function doAquatic(state) {
+        if (!CONFIG.aquatic.enabled) return;
+        if (!state.aquatic || typeof state.aquatic !== 'object') {
+            logSkip('aquatic:no-state', 'state 中没有 aquatic 字段，水产自动化跳过');
+            return;
+        }
+        clearSkip('aquatic:no-state');
+        if (!state.aquatic.unlocked) return;
+        await doAquaticPartners(state);
+        await doAquaticFeed(runtime.state);
+        await doPonds(runtime.state);
+        await doFishing(runtime.state); // 垂钓放最后：只花各产业开工后剩下的体力
     }
 
     // ---------- 角色库扫描 ----------
@@ -1638,11 +2409,12 @@
         aquatic: '水产', livestock: '畜牧', crafting: '加工',
     };
 
-    function partnerPost(p) {
+    function partnerPost(p, state = null) {
         if (p.locked) return '任务中·已锁定';
         for (const [industry, field] of Object.entries(ASSIGN_FIELD)) {
             if (p[field] != null) return `派驻于${INDUSTRY_NAMES[industry] || industry}`;
         }
+        if (state && aquaticAssignedPartnerIds(state).has(String(p.partner_id ?? p.id))) return '派驻于水产';
         return '空闲';
     }
 
@@ -1654,7 +2426,7 @@
             const tend = (p.tendencies || [])
                 .map(t => `${INDUSTRY_NAMES[t.industry] || t.industry}${t.effective_ability ?? t.current_ability ?? 0}`)
                 .join(' / ');
-            log(`· ${p.name || p.partner_id}｜${tend || '无产业倾向'}｜${partnerPost(p)}`);
+            log(`· ${p.name || p.partner_id}｜${tend || '无产业倾向'}｜${partnerPost(p, state)}`);
         }
     }
 
@@ -1688,28 +2460,50 @@
             pendingStaminaCost = null; // 每轮重新统计体力缺口
             runtime.actionCount = 0;   // 单轮写操作计数归零
             runtime.soldUnits = 0;     // 单轮售卖计数归零
+            validateClientEnvironment();
+            ensureStoryIdle(); // 剧情与奖励回写完成前，连本轮 state 基线都不提前接受
             const state = await getState();
             clearSkip('story:active');
+            clearSkip('environment:paused');
+            if (state.aquatic?.pending_big_catch) {
+                const manualBigCatch = !CONFIG.aquatic.enabled || CONFIG.aquatic.bigCatch === 'manual';
+                if (manualBigCatch && CONFIG.pauseOnPendingBigCatch) {
+                    statusLine.textContent = '已暂停 · 请处理垂钓大物';
+                    logSkip('aquatic:big-catch', '垂钓出现大物：已保留体力并暂停自动操作，请先挑战或放生');
+                    refreshConfigRows(state);
+                    delay = CONFIG.pollInterval;
+                    return;
+                }
+                if (!manualBigCatch) await doBigCatch(state); // 自动搏一把/放线后继续本轮
+            }
+            clearSkip('aquatic:big-catch');
             if (CONFIG.rosterScanOnStart && !rosterScanned) {
                 rosterScanned = true;
                 scanRoster(state);
             }
-            await doCommissions();
+            await useConfiguredActiveTaskItems();
             await collectReadyPlots();
             await collectReadyIndustries();
+            // 先把本轮新产物收入背包，再提交/承接委托，避免平白多等一轮。
+            await doCommissions();
             // 伙伴只能在生产前派驻/调整（开工后即锁定），所以先收取腾点位，再派伙伴，最后种植/开工
             await optimizePartnerAssignments();
             await plantEmptyPlots();
             await startEmptyIndustries();
+            // 本轮刚开工的短任务可能已落入 active 道具窗口，立即补查，避免被最短轮询间隔跨过。
+            const postStartActiveUses = await useConfiguredActiveTaskItems();
+            if (postStartActiveUses > 0) {
+                await collectReadyPlots();
+                await collectReadyIndustries();
+            }
+            // 水产排在各产业之后：伙伴先满足生产岗位，垂钓只花剩余的体力
+            await doAquatic(runtime.state);
             refreshConfigRows(runtime.state);
             statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${summarize(runtime.state)}`;
             // 有实际操作时，触发游戏自带的 state 刷新，让页面 UI 立即同步（不刷新网页）
-            if (dirty) {
-                dirty = false;
-                refreshGameUI();
-            }
+            if (dirty && await refreshGameUI()) dirty = false;
             // 自适应：对齐最近任务的完成时刻，无事可做时拉长间隔
-            delay = nextDelay(runtime.state);
+            delay = postStartActiveUses > 0 ? CONFIG.pollInterval : nextDelay(runtime.state);
         } catch (e) {
             if (e.code === 'aborted') return; // 用户停止，不记为失败
             if (e.code === 'story_active') { // 剧情播放/奖励同步中：按提示时间等待，不算失败
@@ -1717,12 +2511,24 @@
                 logSkip('story:active', '剧情播放或奖励同步中，写操作暂停');
                 return;
             }
-            if (/401|403|登录/.test(e.message)) {
+            if ([401, 403].includes(Number(e.status || 0)) || /401|403|登录/.test(e.message)) {
                 log('未登录或会话失效，请先登录水鱼账号');
                 stop();
                 return;
             }
-            log(`状态刷新失败：${e.message}`);
+            if (e.code === 'unknown_build' || e.code === 'invalid_story_bridge') {
+                statusLine.textContent = '安全暂停 · 等待兼容性确认';
+                delay = CONFIG.maxPollInterval;
+                logSkip('environment:paused', e.message);
+                return;
+            }
+            if (e.status === 429 || e.retryAfter != null) {
+                delay = Math.max(CONFIG.pollInterval, Number(e.retryAfter || 60000));
+            } else if (e.status === 408 || e.status >= 500 ||
+                       ['network_error', 'request_timeout'].includes(e.code)) {
+                delay = Math.max(CONFIG.pollInterval, 60000);
+            }
+            log(`本轮已中止：${e.message}`);
         } finally {
             busy = false;
             if (running) {
@@ -1735,35 +2541,50 @@
     // 单标签页主节点：持有 Web Lock 的标签页才能运行，避免多页同时写操作
     const TAB_LOCK_NAME = 'rlt-auto-helper-leader';
     let releaseTabLock = null;
+    let starting = false;
 
     async function start() {
-        if (running) return;
-        if (CONFIG.singleTab) {
-            if (!navigator.locks) {
-                log('当前环境不支持 Web Locks，无法保证单标签页运行');
-            } else {
+        if (running || starting) return;
+        starting = true;
+        try {
+            if (CONFIG.singleTab) {
+                if (!navigator.locks) {
+                    statusLine.textContent = '未启动 · 缺少单标签锁';
+                    log('当前环境不支持 Web Locks；singleTab 已启用，本页拒绝启动');
+                    return;
+                }
                 const acquired = await new Promise(resolve => {
-                    navigator.locks.request(TAB_LOCK_NAME, { ifAvailable: true }, lock => {
-                        resolve(!!lock);
-                        if (!lock) return undefined;
-                        return new Promise(r => { releaseTabLock = r; }); // 持锁直到 stop()
-                    }).catch(() => resolve(null));
+                    try {
+                        navigator.locks.request(TAB_LOCK_NAME, { ifAvailable: true }, lock => {
+                            resolve(!!lock);
+                            if (!lock) return undefined;
+                            return new Promise(r => { releaseTabLock = r; }); // 持锁直到 stop()
+                        }).catch(() => resolve(null));
+                    } catch (_) {
+                        resolve(null);
+                    }
                 });
                 if (acquired === false) {
                     statusLine.textContent = '已在其他标签页运行';
                     log('另一个标签页已在运行自动助手，本页不启动');
                     return;
                 }
-                if (acquired === null) log('Web Locks 请求失败，无法保证单标签页运行');
+                if (acquired === null) {
+                    statusLine.textContent = '未启动 · 单标签锁失败';
+                    log('Web Locks 请求失败；singleTab 已启用，本页拒绝启动');
+                    return;
+                }
             }
+            running = true;
+            runtime.controller = new AbortController();
+            runtime.actionCount = 0;
+            runtime.soldUnits = 0;
+            toggleBtn.textContent = '停止';
+            log('自动助手已启动');
+            tick();
+        } finally {
+            starting = false;
         }
-        running = true;
-        runtime.controller = new AbortController();
-        runtime.actionCount = 0;
-        runtime.soldUnits = 0;
-        toggleBtn.textContent = '停止';
-        log('自动助手已启动');
-        tick();
     }
 
     function stop() {
