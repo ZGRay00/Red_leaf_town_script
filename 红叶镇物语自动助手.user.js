@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.3.0
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -73,7 +73,7 @@
             enabled: true,            // 水产：自动垂钓 + 鱼塘管理
             fishing: true,            // 自动垂钓（消耗体力，当场结算，不占生产格）
             spotId: null,             // 指定钓点 id；null = 沿用聚鱼度所在钓点，否则第一个已解锁钓点
-            staminaReserve: 0,        // 垂钓体力下限：实时体力低于该值时不再抛竿（同时挖矿时建议设为挖矿单次的体力消耗）
+            staminaReserve: 0,        // 垂钓体力保底：实时体力低于该值时不再抛竿，留给其他产业用（同时挖矿时建议设为挖矿单次的体力消耗）
             chainCasts: 5,            // 连钓次数：攒够 N 竿的体力后一次性连钓 N 次（体力恢复比聚鱼度衰退慢，滴钓保不住连击）
             reserveBigCatch: true,    // 每次连钓为大物搏斗预留一竿体力（大物消耗 = 当前钓点单竿消耗；仅 bigCatch 为 'fight' 时生效）
             bigCatch: 'fight',        // 大物处理: 'fight' 搏一把 | 'release' 放线 | 'manual' 暂停等人工
@@ -486,7 +486,10 @@
         const v = localStorage.getItem(key);
         return v === null || v === '' ? null : v;
     }
-    function setOverride(key, value) { localStorage.setItem(key, value || ''); }
+    function setOverride(key, value) {
+        if (value === null || value === '') localStorage.removeItem(key); // 不留下空串键
+        else localStorage.setItem(key, value);
+    }
     const plotCropKey = slot => `rlt-plot-crop:${slot}`;
     const nodeJobKey = (industry, id) => `rlt-node-job:${industry}:${id}`;
     const AQUATIC_SPOT_KEY = 'rlt-aquatic-spot';
@@ -498,13 +501,20 @@
 
     // 自动垂钓总开关：配置允许 + 面板未手动关闭（面板开关优先，记忆在 localStorage）
     function fishingEnabled() {
-        return CONFIG.aquatic.enabled && CONFIG.aquatic.fishing && getOverride(FISHING_TOGGLE_KEY) !== 'off';
+        const v = getOverride(FISHING_TOGGLE_KEY);
+        return CONFIG.aquatic.enabled && CONFIG.aquatic.fishing && (v === null || v !== 'off');
     }
 
     const AQUATIC_CHAIN_KEY = 'rlt-aquatic-chain';
     // 连钓次数：面板输入优先，其次配置文件；至少 1
     function fishingChainCasts() {
         return Math.max(1, Math.floor(Number(getOverride(AQUATIC_CHAIN_KEY) ?? CONFIG.aquatic.chainCasts) || 1));
+    }
+
+    const AQUATIC_RESERVE_KEY = 'rlt-aquatic-stamina-reserve';
+    // 体力保底：实时体力低于该值时不再抛竿；面板输入优先，其次配置文件
+    function fishingStaminaReserve() {
+        return Math.max(0, Math.floor(Number(getOverride(AQUATIC_RESERVE_KEY) ?? CONFIG.aquatic.staminaReserve) || 0));
     }
 
     const AQUATIC_RESERVE_BIG_KEY = 'rlt-aquatic-reserve-big';
@@ -603,10 +613,39 @@
         return row;
     }
 
+    // 数字输入框：失焦时取整并夹到 [min, +∞)，回显规范化后的值
+    function makeNumberInput(value, { min = 0, width = '44px', placeholder = '', title = '', onchange } = {}) {
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = String(min);
+        input.value = String(value);
+        input.placeholder = placeholder;
+        input.title = title;
+        input.style.cssText = `width:${width};flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px`;
+        input.onchange = () => {
+            const n = Math.max(min, Math.floor(Number(input.value) || min));
+            input.value = String(n);
+            onchange?.(n);
+        };
+        return input;
+    }
+
+    // 标签 + 数字输入框的一整行
+    function makeNumberRow(labelText, value, opts) {
+        const row = document.createElement('div');
+        row.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px';
+        const label = document.createElement('span');
+        label.textContent = labelText;
+        label.style.cssText = 'opacity:.8;white-space:nowrap';
+        row.appendChild(label);
+        row.appendChild(makeNumberInput(value, opts));
+        return row;
+    }
+
     function makeFishingToggleRow(state) {
         const on = fishingEnabled();
         return makeToggleRow(state, '自动垂钓:', '点击切换自动垂钓（关闭后仍会自动处理已咬钩的大物）', on, () => {
-            setOverride(FISHING_TOGGLE_KEY, on ? 'off' : '');
+            setOverride(FISHING_TOGGLE_KEY, on ? 'off' : 'on');
             log(`自动垂钓：${on ? '已关闭' : '已开启'}`);
         });
     }
@@ -637,22 +676,17 @@
             text: `${it.timing === 'active' ? '【途中】' : '【开工】'}${it.name || '道具#' + taskItemRecordId(it)} ×${it.quantity || 0}${it.description ? ` · ${it.description}` : ''}`,
             disabled: Number(it.quantity || 0) <= 0,
         })), current, '不使用特殊道具');
-        const keep = document.createElement('input');
-        keep.type = 'number';
-        keep.min = '0';
-        keep.value = getOverride(keepKey) || '0';
-        keep.placeholder = '留0';
-        keep.title = '保留数量：该道具至少留下多少个不使用';
-        keep.style.cssText = 'width:44px;flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
+        const keep = makeNumberInput(getOverride(keepKey) || '0', {
+            placeholder: '留0',
+            title: '保留数量：该道具至少留下多少个不使用',
+            onchange: n => {
+                setOverride(keepKey, n ? String(n) : '');
+                log(`${labelPrefix}：道具保留数量设为 ${n}`);
+            },
+        });
         select.onchange = () => {
             setOverride(itemKey, select.value);
             log(`${labelPrefix}：${select.value ? '已锁定道具' : '不使用道具'}`);
-        };
-        keep.onchange = () => {
-            const n = Math.max(0, Math.floor(Number(keep.value) || 0));
-            keep.value = String(n);
-            setOverride(keepKey, n ? String(n) : '');
-            log(`${labelPrefix}：道具保留数量设为 ${n}`);
         };
         row.appendChild(keep);
         return row;
@@ -662,11 +696,11 @@
     function refreshConfigRows(state) {
         if (configBox.contains(document.activeElement)) return; // 用户正在操作下拉时不动它
         configBox.innerHTML = '';
-        if (CONFIG.farming.enabled && (state.plots || []).length) {
+        if (CONFIG.farming.enabled) {
             const { group, body } = makeGroup('农场');
             // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
             const slots = (state.plots || []).map(p => p.slot);
-            if (slots.length) slots.push(Math.max(...slots) + 1);
+            slots.push(slots.length ? Math.max(...slots) + 1 : 0);
             for (const slot of slots) {
                 const key = plotCropKey(slot);
                 const { row, select } = makeSelectRow(`土地${slot + 1}:`, '选择这块地要种的作物；「自动」按传送门/委托需求 > 经济价值选择');
@@ -720,26 +754,25 @@
             body.appendChild(makeFishingToggleRow(state));
             if (fishingEnabled()) {
                 // 连钓次数：攒够 N 竿体力后一次性连钓 N 次
-                const chainRow = document.createElement('div');
-                chainRow.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px';
-                const chainLabel = document.createElement('span');
-                chainLabel.textContent = '连钓次数:';
-                chainLabel.style.cssText = 'opacity:.8;white-space:nowrap';
-                const chainInput = document.createElement('input');
-                chainInput.type = 'number';
-                chainInput.min = '1';
-                chainInput.value = String(fishingChainCasts());
-                chainInput.title = '体力恢复比聚鱼度衰退慢：攒够 N 竿的体力后一次性连钓 N 次';
-                chainInput.style.cssText = 'width:56px;flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
-                chainInput.onchange = () => {
-                    const n = Math.max(1, Math.floor(Number(chainInput.value) || 1));
-                    chainInput.value = String(n);
-                    setOverride(AQUATIC_CHAIN_KEY, String(n));
-                    log(`连钓次数设为 ${n}（攒够 ${n} 竿体力后开钓）`);
-                };
-                chainRow.appendChild(chainLabel);
-                chainRow.appendChild(chainInput);
-                body.appendChild(chainRow);
+                body.appendChild(makeNumberRow('连钓次数:', fishingChainCasts(), {
+                    min: 1,
+                    width: '56px',
+                    title: '体力恢复比聚鱼度衰退慢：攒够 N 竿的体力后一次性连钓 N 次',
+                    onchange: n => {
+                        setOverride(AQUATIC_CHAIN_KEY, String(n));
+                        log(`连钓次数设为 ${n}（攒够 ${n} 竿体力后开钓）`);
+                    },
+                }));
+                // 体力保底：低于该值不再抛竿，留给其他产业
+                body.appendChild(makeNumberRow('体力保底:', fishingStaminaReserve(), {
+                    min: 0,
+                    width: '56px',
+                    title: '实时体力低于该值时不再抛竿，把体力留给其他产业（同时挖矿时建议设为挖矿单次的体力消耗）',
+                    onchange: n => {
+                        setOverride(AQUATIC_RESERVE_KEY, n ? String(n) : '');
+                        log(`体力保底设为 ${n}（实时体力低于 ${n} 时不再抛竿）`);
+                    },
+                }));
                 body.appendChild(makeBigCatchReserveRow(state));
                 const { row, select } = makeSelectRow('垂钓钓点:',
                     '选择自动垂钓的钓点；「自动」优先留在聚鱼度所在钓点（换钓点会清零聚鱼度）');
@@ -804,6 +837,7 @@
         const time = new Date().toLocaleTimeString();
         const line = document.createElement('div');
         line.textContent = `[${time}] ${msg}`;
+        if (/失败|不足|错误|暂停|无法|超过上限/.test(msg)) line.style.color = '#d98f7a'; // 异常类日志用暖色标出
         logBox.prepend(line);
         while (logBox.children.length > 30) logBox.lastChild.remove();
     }
@@ -898,7 +932,7 @@
             if (sw != null && isFinite(sw)) wait = Math.min(wait, sw);
         }
         // 鱼塘周期：对齐最近的繁殖/投喂结算时刻，及时补料和处理
-        if (CONFIG.aquatic.enabled) {
+        if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds) {
             for (const pond of state.aquatic?.ponds || []) {
                 const readyAt = Number(pond.last_settled_at || 0) + Number(pond.next_cycle_seconds || 0);
                 if (readyAt > now) wait = Math.min(wait, readyAt - now);
@@ -1063,12 +1097,29 @@
 
     // ---------- 需求、在途产量与安全库存 ----------
 
+    // 按 state 快照缓存重计算结果；acceptState 每次替换 state 对象，旧缓存随对象自动失效
+    const stateMemo = new WeakMap();
+    function memoizedForState(state, key, compute) {
+        let bucket = stateMemo.get(state);
+        if (!bucket) {
+            bucket = {};
+            stateMemo.set(state, bucket);
+        }
+        if (!(key in bucket)) bucket[key] = compute();
+        return bucket[key];
+    }
+
     function commissionActive(cm) {
         return !!cm && !cm.settled &&
             cm.status !== 'forwarded' && cm.status !== 'forward_completed' && cm.status !== 'completed';
     }
 
     function gatherNeeds(state, { productionOnly = false } = {}) {
+        return memoizedForState(state, productionOnly ? 'needs:production' : 'needs',
+            () => gatherNeedsUncached(state, { productionOnly }));
+    }
+
+    function gatherNeedsUncached(state, { productionOnly = false } = {}) {
         const needs = [];
         for (const portal of state.portals || []) {
             if (portal.completed || (productionOnly && !portal.unlocked) || (!portal.unlocked && !CONFIG.selling.protectLockedPortals)) continue;
@@ -1123,7 +1174,8 @@
 
     function chooseCropTarget(state, plot) {
         const cfg = CONFIG.farming;
-        // 槽位级指定作物优先于全局 cropId；锁定后不回退其他作物，但失败只跳过本块地，不中断其余土地
+        // 槽位级指定作物优先于全局 cropId；锁定后不回退其他作物。
+        // 槽位锁定失败只跳过本块地；全局 cropId 严格模式下每块地都锁定同一作物，失败即整轮停种等待（与逐块跳过等价，省掉重复评估）
         const plotWanted = plot ? plotCropOverride(plot.slot) : null;
         if (plotWanted != null) {
             const crop = (state.crops || []).find(c => sameId(cropId(c), plotWanted));
@@ -1224,6 +1276,10 @@
     // 每个加工站按“任一已解锁配方的一批最大用量”保留原料；同一物品跨站点累加。
     // 这样既不会像整类禁售那样让售卖候选清空，也不会卖掉各站下一次开工所需的原料。
     function craftingInputReserves(state) {
+        return memoizedForState(state, 'craftingReserves', () => craftingInputReservesUncached(state));
+    }
+
+    function craftingInputReservesUncached(state) {
         const reserves = new Map();
         if (!CONFIG.selling.protectCraftingInputs) return reserves;
         for (const station of state.crafting_stations || []) {
@@ -1389,10 +1445,6 @@
 
     // ---------- 每日委托 ----------
 
-    function surplusQty(state, itemId, name) {
-        return safeUnspecifiedConsumeQty(state, itemId, name);
-    }
-
     // 转发池接单：读取当前协议的 entries；每成功一单都接管新 state 并重新读取池子。
     async function tryTakeCommission() {
         let taken = 0;
@@ -1419,7 +1471,7 @@
                 const name = x.item?.name || x.name || '';
                 const qty = Number(x.quantity ?? x.required ?? 1);
                 if (itemId == null || qty <= 0) continue;
-                if (surplusQty(runtime.state, itemId, name) < qty) continue;
+                if (safeUnspecifiedConsumeQty(runtime.state, itemId, name) < qty) continue;
                 try {
                     await takeCommission(x.commission_id);
                     clearSkip(`fail:commission:take:${x.commission_id}`);
@@ -1883,8 +1935,10 @@
 
     // 产业编制的伙伴容量（state.industry_rules.<industry>.partner_capacity）
     function industryCapacity(state, industry) {
-        const cap = state.industry_rules?.[industry]?.partner_capacity;
-        return cap == null ? Infinity : cap;
+        const raw = state.industry_rules?.[industry]?.partner_capacity;
+        if (raw == null) return Infinity;
+        const cap = Number(raw);
+        return Number.isFinite(cap) ? Math.max(0, cap) : Infinity; // 非法值按不限制处理，避免 NaN 传播导致静默不派驻
     }
 
     const ASSIGN_FIELD = {
@@ -2017,7 +2071,7 @@
 
         const nodeId = adapter.id(node);
         const wanted = configuredJobId(industry, cfg, nodeId);
-        if (wanted === '__off') return { blocked: '已手动关闭', strict: true };
+        if (wanted === '__off') return { blocked: '已手动关闭' };
         // 面板锁定（点位级）始终严格；配置项锁定由 strictTaskId/strictRecipeId 决定
         const strict = !!cfg[adapter.strictKey] ||
             (nodeId != null && nodeJobOverride(industry, nodeId) != null);
@@ -2025,7 +2079,7 @@
         if (wanted != null) {
             const exact = jobs.find(job => sameId(jobId(job), wanted));
             if (exact) candidates = [exact];
-            else if (strict) return { blocked: `锁定目标 #${wanted} 当前不在此节点`, strict: true };
+            else if (strict) return { blocked: `锁定目标 #${wanted} 当前不在此节点` };
         }
 
         const stamina = liveStamina(state);
@@ -2033,7 +2087,7 @@
         if (!affordable.length) {
             const minCost = Math.min(...candidates.map(job => Number(job.stamina_cost || 0)));
             rememberStaminaNeed(state, minCost, `${INDUSTRY_NAMES[industry] || industry}任务`);
-            return { blocked: `体力不足（当前约 ${stamina}/${state.player?.stamina_cap ?? '?'}）`, stamina: true };
+            return { blocked: `体力不足（当前约 ${stamina}/${state.player?.stamina_cap ?? '?'}）` };
         }
 
         const partner = assignedPartner(state, node);
@@ -2048,7 +2102,7 @@
             const cost = Number(job.stamina_cost || 0);
             const efficiency = value == null ? -Infinity : (cost > 0 ? value / cost : hourly);
             return {
-                job, index, ability, hourly: hourly ?? -Infinity, efficiency,
+                job, index, hourly: hourly ?? -Infinity, efficiency,
                 demand: jobDemandScore(state, job, ability),
                 taskItemId: taskItemRecordId(startItem), taskItem: startItem,
             };
@@ -2194,11 +2248,11 @@
 
     // 垂钓：体力恢复比聚鱼度衰退慢，滴钓保不住连击——攒够「连钓次数」竿的体力后一次性连钓，
     // 让聚鱼度在这一连内叠上去；钓完等体力重新攒满再钓下一连。
-    async function doFishing(state) {
+    async function doFishing() {
         const cfg = CONFIG.aquatic;
-        if (!fishingEnabled() || !state.aquatic?.unlocked) return;
+        if (!fishingEnabled() || !runtime.state?.aquatic?.unlocked) return;
         const chain = fishingChainCasts();
-        const reserve = Number(cfg.staminaReserve || 0);
+        const reserve = fishingStaminaReserve();
         // 先处理挂着的大物（可能来自手动垂钓）
         if (runtime.state.aquatic?.pending_big_catch) {
             if (cfg.bigCatch === 'manual') return;
@@ -2215,14 +2269,31 @@
         // 大物预留：只有打算搏斗时才预留；大物消耗 = 当前钓点单竿消耗（已与开发者确认）
         const bigReserve = bigCatchReserveEnabled() && cfg.bigCatch === 'fight' ? cost : 0;
         const need = cost * chain + reserve + bigReserve;
-        if (liveStamina(runtime.state) < need) {
-            // 攒不够一连就不下竿；登记缺口，下一轮在体力刚攒够时醒来
-            rememberStaminaNeed(runtime.state, need, `垂钓连钓×${chain}`);
+        const cap = Number(runtime.state.player?.stamina_cap ?? Infinity);
+        let plan = chain;
+        let waitFull = false;
+        if (cost > 0 && need > cap) {
+            // 连钓次数＋大物预留超过体力上限：永远攒不够，提醒用户调低；未调整则满体力时按上限内最多次数连钓
+            plan = Math.floor((cap - reserve - bigReserve) / cost);
+            if (plan < 1) {
+                logSkip('aquatic:chain-over-cap', `垂钓：体力上限 ${cap} 连 1 竿＋保底预留（${cost + reserve + bigReserve} 体力）都不够，无法垂钓，请调低体力保底或关闭大物预留`);
+                return;
+            }
+            logSkip('aquatic:chain-over-cap', `垂钓：连钓×${chain}${bigReserve ? '＋大物预留 1 竿' : ''}共需 ${need} 体力，超过上限 ${cap}，永远攒不够；将在满体力时降级连钓×${plan}，请调低连钓次数`);
+            waitFull = true;
+        } else {
+            clearSkip('aquatic:chain-over-cap');
+        }
+        const planNeed = cost * plan + reserve + bigReserve;
+        const stamina = liveStamina(runtime.state);
+        if (waitFull ? stamina < cap : stamina < planNeed) {
+            // 攒不够一连就不下竿；登记缺口，下一轮在体力刚攒够时醒来（降级模式则等到满体力）
+            rememberStaminaNeed(runtime.state, waitFull ? cap : planNeed, `垂钓连钓×${plan}`);
             return;
         }
-        log(`体力已攒够（${liveStamina(runtime.state)}/${need}），在「${spot.name || spot.id}」连钓 ×${chain}${bigReserve ? '（含大物预留 1 竿）' : ''}`);
+        log(`体力已攒够（${Math.floor(stamina)}/${waitFull ? cap : planNeed}），在「${spot.name || spot.id}」连钓 ×${plan}${waitFull ? `（原设×${chain} 超体力上限，已降级）` : ''}${bigReserve ? '（含大物预留 1 竿）' : ''}`);
         let bigCatchSpent = !bigReserve; // 本连的大物预留是否已消耗（不预留视为已消耗）
-        for (let i = 0; i < chain && running; i++) {
+        for (let i = 0; i < plan && running; i++) {
             const hold = reserve + (bigCatchSpent ? 0 : bigReserve);
             if (liveStamina(runtime.state) - cost < hold) break;
             try {
@@ -2230,7 +2301,7 @@
                 clearSkip(`fail:cast:${spot.id}`);
                 if (result && !result.duplicate) {
                     const drops = (result.drops || []).map(d => `${d.quality_name || ''}${d.name}×${d.quantity}`).join('、');
-                    log(`第 ${i + 1}/${chain} 竿：${result.big_catch ? '有大家伙咬钩！' : (drops || '一无所获')}`);
+                    log(`第 ${i + 1}/${plan} 竿：${result.big_catch ? '有大家伙咬钩！' : (drops || '一无所获')}`);
                 }
                 if (runtime.state.aquatic?.pending_big_catch) {
                     if (cfg.bigCatch === 'manual') break;
@@ -2247,9 +2318,9 @@
     }
 
     // 鱼塘：投苗补到稳态线、捞走超出稳态线的成鱼（保持世代加值）
-    async function doPonds(state) {
+    async function doPonds() {
         const cfg = CONFIG.aquatic;
-        const aq = state.aquatic;
+        const aq = runtime.state?.aquatic;
         if (!cfg.enabled || !cfg.ponds || !aq?.unlocked) return;
         if (cfg.autoBuildPonds) {
             for (const site of aq.buildable_ponds || []) {
@@ -2304,10 +2375,10 @@
         }
     }
 
-    // 饲料槽：余量不足 feedKeepHours 时投料补足；优先单位品质分最低的饲料，保留量受 selling 配置保护
-    async function doAquaticFeed(state) {
+    // 饲料槽：余量不足 feedKeepHours 时投料补足；优先单位品质分最低的饲料，保留量受 selling 与加工原料保护
+    async function doAquaticFeed() {
         const cfg = CONFIG.aquatic;
-        const aq = state.aquatic;
+        const aq = runtime.state?.aquatic;
         if (!cfg.enabled || !cfg.autoFeed || !aq?.unlocked) return;
         const slot = aq.feed_slot;
         if (!slot || !Number(slot.hourly_rate)) return; // 没有消耗饲料的设施
@@ -2321,9 +2392,10 @@
             return;
         }
         clearSkip('aquatic:no-feed');
+        const craftingReserves = craftingInputReserves(runtime.state);
         for (const input of inputs) {
             if (deficit <= 0) break;
-            const keep = configuredKeep(input.item_id);
+            const keep = configuredKeep(input.item_id, craftingReserves);
             const available = Math.max(0, Number(input.quantity || 0) - keep);
             const roomUnits = Number(slot.capacity || 0) - Number(runtime.state.aquatic?.feed_slot?.units || 0);
             const count = Math.min(available, Math.floor(roomUnits / Number(input.units)),
@@ -2343,14 +2415,14 @@
     }
 
     // 水产伙伴：陪钓 1 名 + 每口塘 1 名，从有水产倾向的空闲伙伴中挑能力最强的
-    async function doAquaticPartners(state) {
+    async function doAquaticPartners() {
         const cfg = CONFIG.aquatic;
-        const aq = state.aquatic;
+        const aq = runtime.state?.aquatic;
         if (!cfg.enabled || !cfg.autoAssignPartner || !aq?.unlocked) return;
-        const capacity = Number(state.industry_rules?.aquatic?.partner_capacity || 0);
-        const aquaticIds = aquaticAssignedPartnerIds(state);
+        const capacity = Number(runtime.state.industry_rules?.aquatic?.partner_capacity || 0);
+        const aquaticIds = aquaticAssignedPartnerIds(runtime.state);
         if (capacity > 0 && aquaticIds.size >= capacity) return;
-        const idle = (state.partners || [])
+        const idle = (runtime.state.partners || [])
             .filter(p => isPartnerIdle(p) && hasTendency(p, 'aquatic') &&
                 !aquaticIds.has(String(p.partner_id ?? p.id)))
             .sort((a, b) => partnerAbility(b, 'aquatic') - partnerAbility(a, 'aquatic'));
@@ -2389,18 +2461,19 @@
         }
     }
 
-    async function doAquatic(state) {
+    async function doAquatic() {
         if (!CONFIG.aquatic.enabled) return;
-        if (!state.aquatic || typeof state.aquatic !== 'object') {
+        const aq = runtime.state?.aquatic;
+        if (!aq || typeof aq !== 'object') {
             logSkip('aquatic:no-state', 'state 中没有 aquatic 字段，水产自动化跳过');
             return;
         }
         clearSkip('aquatic:no-state');
-        if (!state.aquatic.unlocked) return;
-        await doAquaticPartners(state);
-        await doAquaticFeed(runtime.state);
-        await doPonds(runtime.state);
-        await doFishing(runtime.state); // 垂钓放最后：只花各产业开工后剩下的体力
+        if (!aq.unlocked) return;
+        await doAquaticPartners();
+        await doAquaticFeed();
+        await doPonds();
+        await doFishing(); // 垂钓放最后：只花各产业开工后剩下的体力
     }
 
     // ---------- 角色库扫描 ----------
@@ -2476,7 +2549,7 @@
                 }
                 if (!manualBigCatch) await doBigCatch(state); // 自动搏一把/放线后继续本轮
             }
-            clearSkip('aquatic:big-catch');
+            if (!runtime.state?.aquatic?.pending_big_catch) clearSkip('aquatic:big-catch');
             if (CONFIG.rosterScanOnStart && !rosterScanned) {
                 rosterScanned = true;
                 scanRoster(state);
@@ -2497,9 +2570,11 @@
                 await collectReadyIndustries();
             }
             // 水产排在各产业之后：伙伴先满足生产岗位，垂钓只花剩余的体力
-            await doAquatic(runtime.state);
+            await doAquatic();
             refreshConfigRows(runtime.state);
-            statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${summarize(runtime.state)}`;
+            const st = runtime.state;
+            const staminaText = st?.player ? `体力${Math.floor(liveStamina(st))}/${st.player.stamina_cap ?? '?'}` : '';
+            statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${staminaText} · 金币${playerCoins(st)} · ${summarize(st)}`;
             // 有实际操作时，触发游戏自带的 state 刷新，让页面 UI 立即同步（不刷新网页）
             if (dirty && await refreshGameUI()) dirty = false;
             // 自适应：对齐最近任务的完成时刻，无事可做时拉长间隔
