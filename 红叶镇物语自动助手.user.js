@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1
+// @version      2.4.0
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -28,8 +28,9 @@
         maxActionsPerTick: 80,
         // 同一浏览器只允许一个标签页执行自动化
         singleTab: true,
-        // 官网前端构建变化时暂停写操作，避免接口结构变化后误操作
-        expectedBuild: 'index-BM2xd7G-.js',
+        // 官网构建基线：null = 启动时自动识别当前构建作为基线，运行中检测到构建变化（游戏更新）则暂停，刷新页面即可恢复；
+        // 也可填具体构建名（如 'index-XXXX.js'）强制锁定
+        expectedBuild: null,
         pauseOnBuildChange: true,
         // 剧情结束后给 /story/:id/seen 留出回写奖励 state 的时间
         storySyncGrace: 1200,
@@ -75,6 +76,7 @@
             spotId: null,             // 指定钓点 id；null = 沿用聚鱼度所在钓点，否则第一个已解锁钓点
             staminaReserve: 0,        // 垂钓体力保底：实时体力低于该值时不再抛竿，留给其他产业用（同时挖矿时建议设为挖矿单次的体力消耗）
             chainCasts: 5,            // 连钓次数：攒够 N 竿的体力后一次性连钓 N 次（体力恢复比聚鱼度衰退慢，滴钓保不住连击）
+            castIntervalMs: 1500,     // 连钓时每竿之间的间隔（服务器限制最小抛竿间隔，太短会被拒并中止本轮）
             reserveBigCatch: true,    // 每次连钓为大物搏斗预留一竿体力（大物消耗 = 当前钓点单竿消耗；仅 bigCatch 为 'fight' 时生效）
             bigCatch: 'fight',        // 大物处理: 'fight' 搏一把 | 'release' 放线 | 'manual' 暂停等人工
             fightMinChance: 0,        // 大物成功率（0~1）低于该值时直接放线
@@ -83,6 +85,17 @@
             autoFeed: true,           // 饲料槽余量不足时自动投料（优先单位品质分最低的饲料，受保留量保护）
             feedKeepHours: 24,        // 饲料槽补到约 N 小时用量
             autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑空闲最强的）
+        },
+
+        livestock: {
+            enabled: true,            // 畜牧：照料 + 收取 + 派驻（购买/配种/孵蛋需人工决策，不自动化）
+            autoCare: false,           // 自动照料动物（每次 1 体力，提高亲密度；只花体力保底之上的余量）
+            autoCollect: true,        // 自动收取设施产出（不耗体力）
+            autoAssignPartner: true,  // 自动安排看场伙伴（畜牧倾向中挑空闲最强的）
+        },
+
+        achievements: {
+            enabled: true,            // 有可领取的成就奖励时自动一键领取（枫火）
         },
 
         commissions: {
@@ -153,6 +166,10 @@
         return Math.floor((runtime.serverMsAtSync + performance.now() - runtime.monotonicMsAtSync) / 1000);
     }
 
+    function sleep(ms) {
+        return new Promise(r => setTimeout(r, Math.max(0, Number(ms) || 0)));
+    }
+
     function getPageStore(id) {
         try {
             const app = document.querySelector('#app')?.__vue_app__;
@@ -171,13 +188,22 @@
         return null;
     }
 
+    let buildBaseline = null; // 本次运行识别到的官网构建基线（CONFIG.expectedBuild 为空时启用）
+
     function validateClientEnvironment() {
         const build = detectedGameBuild();
-        if (CONFIG.pauseOnBuildChange && build !== CONFIG.expectedBuild) {
-            const actual = build || '无法识别';
-            throw new ApiError(`检测到游戏官网构建为 ${actual}，助手预期 ${CONFIG.expectedBuild}，已安全暂停`, {
-                code: 'unknown_build',
-            });
+        if (CONFIG.pauseOnBuildChange) {
+            const expected = CONFIG.expectedBuild || buildBaseline;
+            if (build && !expected) {
+                // 首次识别：以当前构建为基线，不再要求手动维护 expectedBuild
+                buildBaseline = build;
+                log(`已识别官网构建 ${build}，作为本次运行基线`);
+            } else if (build && expected && build !== expected) {
+                throw new ApiError(`检测到官网构建从 ${expected} 变为 ${build}，游戏已在运行中更新，请刷新页面后再启动`, {
+                    code: 'unknown_build',
+                });
+            }
+            // 构建识别失败（页面结构异常）时不暂停：无法用基线比较，交由 state 结构校验兜底
         }
         const story = getPageStore('story');
         if (typeof story?.cue !== 'function') {
@@ -444,6 +470,17 @@
         payload: { item_id: itemId, quality, count },
     });
 
+    // 畜牧接口（照料每次 1 体力；收取不耗体力，animal_id 传空串 = 整栋全收）
+    const careAnimal = (animalId) => mutate(`/livestock/animals/${animalId}/care`, { cue: 'action:care_animal' });
+    const collectLivestock = (facilityId) => mutate(`/livestock/facilities/${facilityId}/collect`, {
+        payload: { animal_id: '' }, cue: 'action:collect_livestock',
+    });
+    const assignLivestockPartner = (facilityId, partnerId) =>
+        mutate(`/livestock/facilities/${facilityId}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
+
+    // 成就：一键领取全部可领奖励
+    const claimAllAchievements = () => mutate('/achievements/claim-all');
+
     // ---------- 小面板 ----------
     const panel = document.createElement('div');
     panel.id = 'rlt-auto-helper-panel';
@@ -523,6 +560,18 @@
         const v = getOverride(AQUATIC_RESERVE_BIG_KEY);
         return v === null ? !!CONFIG.aquatic.reserveBigCatch : v !== 'off';
     }
+
+    // 畜牧子功能开关：面板开关优先（'on'/'off'），缺省回退配置文件
+    const LIVESTOCK_CARE_KEY = 'rlt-livestock-care';
+    const LIVESTOCK_COLLECT_KEY = 'rlt-livestock-collect';
+    const LIVESTOCK_PARTNER_KEY = 'rlt-livestock-partner';
+    function livestockFlag(key, cfgValue) {
+        const v = getOverride(key);
+        return v === null ? !!cfgValue : v !== 'off';
+    }
+    const livestockCareEnabled = () => livestockFlag(LIVESTOCK_CARE_KEY, CONFIG.livestock.autoCare);
+    const livestockCollectEnabled = () => livestockFlag(LIVESTOCK_COLLECT_KEY, CONFIG.livestock.autoCollect);
+    const livestockPartnerEnabled = () => livestockFlag(LIVESTOCK_PARTNER_KEY, CONFIG.livestock.autoAssignPartner);
 
     function makeSelectRow(labelText, title) {
         const row = document.createElement('div');
@@ -749,6 +798,21 @@
             }
             configBox.appendChild(group);
         }
+        if (CONFIG.livestock.enabled && state.livestock?.unlocked) {
+            const { group, body } = makeGroup('畜牧');
+            const toggles = [
+                ['自动照料:', '照料动物提高亲密度（每次 1 体力，只花体力保底之上的余量）', livestockCareEnabled(), LIVESTOCK_CARE_KEY, '自动照料'],
+                ['自动收取:', '自动收取设施产出（不耗体力）', livestockCollectEnabled(), LIVESTOCK_COLLECT_KEY, '自动收取'],
+                ['自动派驻:', '自动安排畜牧倾向的空闲伙伴看场', livestockPartnerEnabled(), LIVESTOCK_PARTNER_KEY, '自动派驻'],
+            ];
+            for (const [label, title, on, key, name] of toggles) {
+                body.appendChild(makeToggleRow(state, label, title, on, () => {
+                    setOverride(key, on ? 'off' : 'on');
+                    log(`畜牧${name}：${on ? '已关闭' : '已开启'}`);
+                }));
+            }
+            configBox.appendChild(group);
+        }
         if (CONFIG.aquatic.enabled && state.aquatic?.unlocked) {
             const { group, body } = makeGroup('垂钓');
             body.appendChild(makeFishingToggleRow(state));
@@ -935,6 +999,13 @@
         if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds) {
             for (const pond of state.aquatic?.ponds || []) {
                 const readyAt = Number(pond.last_settled_at || 0) + Number(pond.next_cycle_seconds || 0);
+                if (readyAt > now) wait = Math.min(wait, readyAt - now);
+            }
+        }
+        // 畜牧结算周期：对齐最近的产出结算时刻，及时收取
+        if (CONFIG.livestock.enabled) {
+            for (const facility of state.livestock?.facilities || []) {
+                const readyAt = Number(facility.last_settled_at || 0) + Number(facility.next_cycle_seconds || 0);
                 if (readyAt > now) wait = Math.min(wait, readyAt - now);
             }
         }
@@ -1684,6 +1755,17 @@
         return ids;
     }
 
+    function livestockAssignedPartnerIds(state) {
+        const ids = new Set();
+        for (const facility of state.livestock?.facilities || []) {
+            for (const partner of facility.assigned_partners || []) {
+                const id = partner?.partner_id ?? partner?.id;
+                if (id != null) ids.add(String(id));
+            }
+        }
+        return ids;
+    }
+
     // 伙伴必须具有对应产业的倾向（tendencies）才能派驻
     function hasTendency(p, industry) {
         return (p.tendencies || []).some(t => t.industry === industry);
@@ -2304,7 +2386,10 @@
         }
         log(`体力已攒够（${Math.floor(stamina)}/${waitFull ? cap : planNeed}），在「${spot.name || spot.id}」连钓 ×${plan}${waitFull ? `（原设×${chain} 超体力上限，已降级）` : ''}${bigReserve ? '（含大物预留 1 竿）' : ''}`);
         let bigCatchSpent = !bigReserve; // 本连的大物预留是否已消耗（不预留视为已消耗）
+        let cooldownHits = 0; // 本连撞上的抛竿限流次数（自适应拉长间隔，最多重试 3 次）
+        let castInterval = Number(cfg.castIntervalMs || 0);
         for (let i = 0; i < plan && running; i++) {
+            if (i > 0 && castInterval > 0) await sleep(castInterval); // 服务器限制最小抛竿间隔
             const hold = reserve + (bigCatchSpent ? 0 : bigReserve);
             if (liveStamina(runtime.state) - cost < hold) break;
             try {
@@ -2321,6 +2406,16 @@
                     if (runtime.state.aquatic?.pending_big_catch) break; // 处理失败：中止本连
                 }
             } catch (e) {
+                // 抛竿限流（「缓一口气」类）：不是致命错误，拉长间隔后重试同一竿，避免整轮被中止
+                const cooldown = Number(e.status || 0) === 429 || /缓一口气|歇一歇|太快|稍后再/.test(e.message || '');
+                if (cooldown && cooldownHits < 3) {
+                    cooldownHits++;
+                    castInterval = Math.max(castInterval * 2, Number(e.retryAfter || 0));
+                    log(`抛竿太快被服务器拦下，${(castInterval / 1000).toFixed(1)} 秒后重试第 ${i + 1} 竿`);
+                    await sleep(castInterval);
+                    i--; // 重试同一竿
+                    continue;
+                }
                 if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:cast:${spot.id}`, `垂钓「${spot.name || spot.id}」失败：${e.message}`);
                 break;
@@ -2387,11 +2482,12 @@
     }
 
     // 饲料槽：余量不足 feedKeepHours 时投料补足；优先单位品质分最低的饲料，保留量受 selling 与加工原料保护
+    // 饲料槽为水产/畜牧共用（state.aquatic.feed_slot），任一系统解锁即需要补料
     async function doAquaticFeed() {
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
-        if (!cfg.enabled || !cfg.autoFeed || !aq?.unlocked) return;
-        const slot = aq.feed_slot;
+        if (!cfg.enabled || !cfg.autoFeed || !(aq?.unlocked || runtime.state?.livestock?.unlocked)) return;
+        const slot = aq?.feed_slot;
         if (!slot || !Number(slot.hourly_rate)) return; // 没有消耗饲料的设施
         let deficit = Number(slot.hourly_rate) * Number(cfg.feedKeepHours || 0) - Number(slot.units || 0);
         if (deficit <= 0) return;
@@ -2487,6 +2583,94 @@
         await doFishing(); // 垂钓放最后：只花各产业开工后剩下的体力
     }
 
+    // 成就：有可领取的奖励时一键领取（枫火）
+    async function doAchievements() {
+        if (!CONFIG.achievements.enabled) return;
+        const ach = runtime.state?.achievements;
+        if (!ach || Number(ach.claimable || 0) <= 0) return;
+        try {
+            const result = await claimAllAchievements();
+            clearSkip('fail:achievements');
+            const count = Array.isArray(result?.claimed) ? result.claimed.length : Number(ach.claimable);
+            log(`已领取 ${count} 项成就奖励（+${result?.maple_flame ?? '?'} 枫火）`);
+        } catch (e) {
+            if (shouldAbortTick(e)) throw e;
+            logSkip('fail:achievements', `领取成就奖励失败：${e.message}`);
+        }
+    }
+
+    // 畜牧：派驻看场伙伴 → 收取产出（免费）→ 照料动物（1 体力/次，只花体力保底之上的余量）
+    // 购买/配种/孵蛋涉及金币与基因决策，保持人工操作
+    async function doLivestock() {
+        const cfg = CONFIG.livestock;
+        const lv = runtime.state?.livestock;
+        if (!cfg.enabled || !lv?.unlocked) return;
+        if (livestockPartnerEnabled()) {
+            const capacity = Number(runtime.state.industry_rules?.livestock?.partner_capacity || 0);
+            const livestockIds = livestockAssignedPartnerIds(runtime.state);
+            const idle = (runtime.state.partners || [])
+                .filter(p => isPartnerIdle(p) && hasTendency(p, 'livestock') &&
+                    !livestockIds.has(String(p.partner_id ?? p.id)))
+                .sort((a, b) => partnerAbility(b, 'livestock') - partnerAbility(a, 'livestock'));
+            for (const facility of lv.facilities || []) {
+                if (facility.facility_id == null || (facility.assigned_partners || []).length > 0) continue;
+                if (capacity > 0 && livestockIds.size >= capacity) break;
+                const partner = idle.shift();
+                if (!partner) break;
+                const pid = partner.partner_id ?? partner.id;
+                try {
+                    await assignLivestockPartner(facility.facility_id, pid);
+                    clearSkip(`fail:assign-livestock:${facility.facility_id}`);
+                    livestockIds.add(String(pid));
+                    log(`已安排 ${partner.name || '伙伴#' + pid} 看场「${facility.name || facility.facility_id}」（畜牧 ${partnerAbility(partner, 'livestock')}）`);
+                } catch (e) {
+                    if (shouldAbortTick(e)) throw e;
+                    logSkip(`fail:assign-livestock:${facility.facility_id}`, `安排看场伙伴失败：${e.message}`);
+                }
+            }
+        }
+        if (livestockCollectEnabled()) {
+            for (const facility of runtime.state.livestock?.facilities || []) {
+                if (facility.facility_id == null) continue;
+                const pending = Number(facility.pending_total || 0) + Number(facility.pending_special || 0);
+                if (pending <= 0) continue;
+                try {
+                    const result = await collectLivestock(facility.facility_id);
+                    clearSkip(`fail:collect-livestock:${facility.facility_id}`);
+                    const drops = (result?.drops || []).map(d => `${d.quality_name || ''}${d.name}×${d.quantity}`).join('、');
+                    log(`畜牧「${facility.name || facility.facility_id}」：收取 ${drops || `${pending} 份产出`}`);
+                } catch (e) {
+                    if (shouldAbortTick(e)) throw e;
+                    logSkip(`fail:collect-livestock:${facility.facility_id}`, `畜牧收取失败：${e.message}`);
+                }
+            }
+        }
+        if (livestockCareEnabled()) {
+            const floor = fishingStaminaReserve(); // 与垂钓共用体力保底：只花保底之上的余量
+            outer:
+            for (const facility of runtime.state.livestock?.facilities || []) {
+                for (const animal of facility.animals || []) {
+                    if (animal.animal_id == null || animal.stage === 'incubating') continue;
+                    if (Number(animal.cared_today || 0) >= Number(animal.care_daily_limit || 0)) continue;
+                    if (Number(animal.affection || 0) >= Number(animal.affection_cap || 0)) continue;
+                    if (liveStamina(runtime.state) - 1 < floor) break outer;
+                    try {
+                        const result = await careAnimal(animal.animal_id);
+                        clearSkip(`fail:care:${animal.animal_id}`);
+                        const name = animal.nickname || animal.name || animal.species_name || animal.animal_id;
+                        log(`照料了「${name}」（亲密度 ${result?.affection_before ?? '?'} → ${result?.affection ?? '?'}）`);
+                    } catch (e) {
+                        if (shouldAbortTick(e)) throw e;
+                        logSkip(`fail:care:${animal.animal_id}`, `照料失败：${e.message}`);
+                        break outer; // 照料失败多为全局原因（体力不足等），本连不再逐只尝试
+                    }
+                }
+            }
+        }
+        // 饲料槽水产/畜牧共用：水产未解锁但畜牧已解锁时也要补料（水产启用时 doAquatic 会再检查一次，余量够则不重复投）
+        await doAquaticFeed();
+    }
+
     // ---------- 角色库扫描 ----------
     const INDUSTRY_NAMES = {
         farming: '农作', gathering: '采集', mining: '矿产',
@@ -2499,6 +2683,7 @@
             if (p[field] != null) return `派驻于${INDUSTRY_NAMES[industry] || industry}`;
         }
         if (state && aquaticAssignedPartnerIds(state).has(String(p.partner_id ?? p.id))) return '派驻于水产';
+        if (state && livestockAssignedPartnerIds(state).has(String(p.partner_id ?? p.id))) return '派驻于畜牧';
         return '空闲';
     }
 
@@ -2532,6 +2717,13 @@
                 if (cap !== Infinity) text += `(编${assignedCount(state, industry)}/${cap})`;
             }
             parts.push(text);
+        }
+        // 畜牧：有动物的设施数/设施总数（编制占用为驻场伙伴数）
+        const facilities = state.livestock?.unlocked ? state.livestock.facilities : null;
+        if (facilities?.length) {
+            const used = facilities.filter(f => (f.animals || []).length > 0).length;
+            const cap = Number(state.industry_rules?.livestock?.partner_capacity || 0);
+            parts.push(`牧${used}/${facilities.length}${cap ? `(编${livestockAssignedPartnerIds(state).size}/${cap})` : ''}`);
         }
         return parts.join(' ');
     }
@@ -2570,6 +2762,8 @@
             await collectReadyIndustries();
             // 先把本轮新产物收入背包，再提交/承接委托，避免平白多等一轮。
             await doCommissions();
+            // 成就奖励是免费的枫火，收了产物后顺手领取
+            await doAchievements();
             // 伙伴只能在生产前派驻/调整（开工后即锁定），所以先收取腾点位，再派伙伴，最后种植/开工
             await optimizePartnerAssignments();
             await plantEmptyPlots();
@@ -2580,6 +2774,8 @@
                 await collectReadyPlots();
                 await collectReadyIndustries();
             }
+            // 畜牧排在各产业之后、水产之前：照料只花剩余的体力，但仍优先于垂钓
+            await doLivestock();
             // 水产排在各产业之后：伙伴先满足生产岗位，垂钓只花剩余的体力
             await doAquatic();
             refreshConfigRows(runtime.state);
@@ -2603,7 +2799,7 @@
                 return;
             }
             if (e.code === 'unknown_build' || e.code === 'invalid_story_bridge') {
-                statusLine.textContent = '安全暂停 · 等待兼容性确认';
+                statusLine.textContent = '安全暂停 · 游戏已更新，请刷新页面';
                 delay = CONFIG.maxPollInterval;
                 logSkip('environment:paused', e.message);
                 return;
