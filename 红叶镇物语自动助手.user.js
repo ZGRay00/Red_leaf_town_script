@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.0
+// @version      2.4.1
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -2423,7 +2423,7 @@
         }
     }
 
-    // 鱼塘：投苗补到稳态线、捞走超出稳态线的成鱼（保持世代加值）
+    // 鱼塘：捞走超出稳态线的成鱼（保持世代加值），捞后用手头鱼苗把鱼塘补齐到容量上限（不从商店购买鱼苗）
     async function doPonds() {
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
@@ -2446,26 +2446,6 @@
             const label = `鱼塘「${pond.definition?.name || pond.pond_id}」`;
             const stock = Math.max(0, Number(pond.stock || 0));
             const steady = Math.max(0, Number(pond.steady_stock || 0));
-            const fryCount = (pond.fry || []).reduce((sum, f) => sum + Number(f.count || 0), 0);
-            // 投苗：成鱼 + 在养鱼苗低于稳态线时补足（沿用官方选种：塘里已有品种优先，否则第一个已解锁品种）
-            const species = pond.species_id != null
-                ? (runtime.state.aquatic.species || []).find(s => sameId(s.id, pond.species_id))
-                : (runtime.state.aquatic.species || []).find(s => s.unlocked);
-            if (species && species.id != null && Number(species.owned_fry || 0) > 0) {
-                const room = Math.max(0, Number(pond.capacity || 0) - Number(pond.population ?? (stock + fryCount)));
-                const needed = Math.max(steady - stock - fryCount, pond.empty ? 1 : 0);
-                const qty = Math.min(needed, room, Number(species.owned_fry || 0));
-                if (qty > 0) {
-                    try {
-                        await stockPond(pond.pond_id, species.id, qty);
-                        clearSkip(`fail:stock:${pond.pond_id}`);
-                        log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${qty}`);
-                    } catch (e) {
-                        if (shouldAbortTick(e)) throw e;
-                        logSkip(`fail:stock:${pond.pond_id}`, `${label} 投苗失败：${e.message}`);
-                    }
-                }
-            }
             // 捞鱼：只捞超出稳态线的部分，捞鱼不消耗体力
             const surplus = stock - steady;
             if (surplus > 0) {
@@ -2476,6 +2456,29 @@
                 } catch (e) {
                     if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:harvest-pond:${pond.pond_id}`, `${label} 捞鱼失败：${e.message}`);
+                }
+            }
+            // 投苗补齐：捞鱼后若鱼塘未满，用手头现有鱼苗补到容量上限（只用手头鱼苗，不从商店购买；
+            // 沿用官方选种：塘里已有品种优先，否则第一个已解锁品种）。捞鱼会刷新 state，需重新取该塘数据
+            const fresh = (runtime.state.aquatic?.ponds || []).find(p => sameId(p.pond_id, pond.pond_id)) || pond;
+            const species = fresh.species_id != null
+                ? (runtime.state.aquatic.species || []).find(s => sameId(s.id, fresh.species_id))
+                : (runtime.state.aquatic.species || []).find(s => s.unlocked);
+            if (species && species.id != null && Number(species.owned_fry || 0) > 0) {
+                const freshStock = Math.max(0, Number(fresh.stock || 0));
+                const freshFry = (fresh.fry || []).reduce((sum, f) => sum + Number(f.count || 0), 0);
+                const capacity = Number(fresh.capacity || 0);
+                const room = Math.max(0, capacity - Number(fresh.population ?? (freshStock + freshFry)));
+                const qty = Math.min(room, Number(species.owned_fry || 0));
+                if (qty > 0) {
+                    try {
+                        await stockPond(fresh.pond_id, species.id, qty);
+                        clearSkip(`fail:stock:${fresh.pond_id}`);
+                        log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${qty}（补齐至容量 ${capacity}）`);
+                    } catch (e) {
+                        if (shouldAbortTick(e)) throw e;
+                        logSkip(`fail:stock:${fresh.pond_id}`, `${label} 投苗失败：${e.message}`);
+                    }
                 }
             }
         }
