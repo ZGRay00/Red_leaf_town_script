@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.6
+// @version      2.4.7
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
-// @downloadURL  https://cdn.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js
-// @updateURL    https://cdn.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js?v=2.4.7
+// @updateURL    https://cdn.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js?v=2.4.7
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -16,7 +16,20 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    window[INSTANCE_KEY] = { version: '2.4.6' };
+    const SCRIPT_VERSION = '2.4.7';
+    const SCRIPT_IDENTITY = {
+        name: '红叶镇物语 · 自动农场助手',
+        namespace: 'http://tampermonkey.net/',
+    };
+    // 手动检查会并行查询全部可信源并选择版本最高者，避免单个 CDN 节点缓存滞后。
+    // jsDelivr 三个域名属于同一官方服务；GitHub raw 只作为最后兜底。
+    const UPDATE_SOURCES = [
+        { name: 'jsDelivr', url: 'https://cdn.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js' },
+        { name: 'jsDelivr GCore', url: 'https://gcore.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js' },
+        { name: 'jsDelivr Fastly', url: 'https://fastly.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js' },
+        { name: 'GitHub Raw', url: 'https://raw.githubusercontent.com/ZGRay00/Red_leaf_town_script/main/red-leaf-town-helper.user.js' },
+    ];
+    window[INSTANCE_KEY] = { version: SCRIPT_VERSION };
 
     /******************** 配置区 ********************/
     const CONFIG = {
@@ -494,6 +507,10 @@
     ].join(';');
     const toggleBtn = document.createElement('button');
     toggleBtn.style.cssText = 'margin-right:8px;padding:2px 10px;cursor:pointer;background:#8ead71;border:none;border-radius:4px;color:#17211b;font-weight:bold';
+    const updateBtn = document.createElement('button');
+    updateBtn.textContent = '检查更新';
+    updateBtn.title = '检查可信发布源；发现新版本时打开 Tampermonkey 更新确认页';
+    updateBtn.style.cssText = 'margin-right:8px;padding:2px 10px;cursor:pointer;background:#8ead71;border:none;border-radius:4px;color:#17211b;font-weight:bold';
     const rosterBtn = document.createElement('button');
     rosterBtn.textContent = '伙伴库';
     rosterBtn.title = '扫描并打印当前角色库';
@@ -509,6 +526,7 @@
     // 只有日志区滚动，按钮行始终固定在面板顶部
     logBox.style.cssText = 'margin-top:6px;white-space:pre-wrap;opacity:.85;max-height:32vh;overflow-y:auto';
     panel.appendChild(toggleBtn);
+    panel.appendChild(updateBtn);
     panel.appendChild(rosterBtn);
     panel.appendChild(collapseBtn);
     panel.appendChild(statusLine);
@@ -921,6 +939,129 @@
         logBox.prepend(line);
         while (logBox.children.length > 30) logBox.lastChild.remove();
     }
+
+    // ---------- 更新检查 ----------
+    let checkingUpdate = false;
+    let pendingUpdate = null;
+
+    function parseUserscriptMetadata(source) {
+        const block = String(source || '').match(/^\/\/ ==UserScript==[\s\S]*?^\/\/ ==\/UserScript==/m)?.[0];
+        if (!block) return null;
+        const read = key => block.match(new RegExp(`^\\/\\/\\s*@${key}\\s+(.+?)\\s*$`, 'm'))?.[1]?.trim() || '';
+        return { name: read('name'), namespace: read('namespace'), version: read('version') };
+    }
+
+    // 返回正数表示 a 更新，负数表示 b 更新；支持 2.4.10 以及常见预发布后缀。
+    function compareVersions(a, b) {
+        const parse = value => {
+            const [core, prerelease = ''] = String(value || '').trim().replace(/^v/i, '').split('-', 2);
+            return { core: core.split('.').map(x => Number(x) || 0), prerelease };
+        };
+        const av = parse(a), bv = parse(b);
+        const length = Math.max(av.core.length, bv.core.length);
+        for (let i = 0; i < length; i++) {
+            const diff = (av.core[i] || 0) - (bv.core[i] || 0);
+            if (diff) return diff;
+        }
+        if (!av.prerelease && bv.prerelease) return 1;
+        if (av.prerelease && !bv.prerelease) return -1;
+        return av.prerelease.localeCompare(bv.prerelease, undefined, { numeric: true });
+    }
+
+    async function inspectUpdateSource(source) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        const separator = source.url.includes('?') ? '&' : '?';
+        const requestUrl = `${source.url}${separator}_rlt_check=${Date.now()}`;
+        try {
+            const response = await fetch(requestUrl, {
+                cache: 'no-store', credentials: 'omit', redirect: 'follow', signal: controller.signal,
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const metadata = parseUserscriptMetadata(await response.text());
+            if (!metadata || metadata.name !== SCRIPT_IDENTITY.name ||
+                metadata.namespace !== SCRIPT_IDENTITY.namespace ||
+                !/^\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?$/.test(metadata.version)) {
+                throw new Error('脚本身份或版本元数据不匹配');
+            }
+            return { ...source, version: metadata.version, installUrl: requestUrl };
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    function resetUpdateButton(delay = 4000) {
+        setTimeout(() => {
+            if (!checkingUpdate && !pendingUpdate) updateBtn.textContent = '检查更新';
+        }, delay);
+    }
+
+    async function checkForUpdates() {
+        // 异步检查后再 window.open 容易被浏览器当成弹窗拦截；首次点击时先预留安装页。
+        const installerWindow = window.open('about:blank', 'rlt-helper-update');
+        if (installerWindow) {
+            try {
+                installerWindow.document.title = '红叶镇助手 · 正在检查更新';
+                installerWindow.document.body.textContent = '正在检查可信更新源，请稍候……';
+            } catch (_) { /* 某些浏览器不允许操作预留页，不影响后续跳转 */ }
+        }
+
+        if (pendingUpdate) {
+            if (installerWindow) {
+                installerWindow.location.replace(pendingUpdate.installUrl);
+                pendingUpdate = null;
+                resetUpdateButton();
+            } else {
+                log(`浏览器阻止了更新页，请允许本站弹出窗口后再次点击（待更新 v${pendingUpdate.version}）`);
+            }
+            return;
+        }
+        if (checkingUpdate) {
+            installerWindow?.close();
+            return;
+        }
+
+        checkingUpdate = true;
+        updateBtn.disabled = true;
+        updateBtn.textContent = '检查中…';
+        log(`正在检查更新（当前 v${SCRIPT_VERSION}）…`);
+        try {
+            const settled = await Promise.allSettled(UPDATE_SOURCES.map(inspectUpdateSource));
+            const available = settled.filter(x => x.status === 'fulfilled').map(x => x.value)
+                .sort((a, b) => compareVersions(b.version, a.version));
+            if (!available.length) throw new Error('所有可信更新源均不可访问');
+            const latest = available[0];
+            const reachable = available.map(x => `${x.name} v${x.version}`).join('；');
+            if (compareVersions(latest.version, SCRIPT_VERSION) <= 0) {
+                installerWindow?.close();
+                updateBtn.textContent = '已是最新';
+                log(`当前已是最新版本 v${SCRIPT_VERSION}（已验证：${reachable}）`);
+                resetUpdateButton();
+                return;
+            }
+
+            pendingUpdate = latest;
+            updateBtn.textContent = `安装 v${latest.version}`;
+            log(`发现新版本 v${latest.version}（${latest.name}），正在打开 Tampermonkey 更新确认页`);
+            if (installerWindow) {
+                installerWindow.location.replace(latest.installUrl);
+                pendingUpdate = null;
+                resetUpdateButton();
+            } else {
+                log('浏览器阻止了更新页；请允许本站弹出窗口，然后再次点击“安装”按钮');
+            }
+        } catch (e) {
+            installerWindow?.close();
+            updateBtn.textContent = '检查失败';
+            log(`检查更新失败：${e.message || e}`);
+            resetUpdateButton();
+        } finally {
+            checkingUpdate = false;
+            updateBtn.disabled = false;
+        }
+    }
+
+    updateBtn.onclick = checkForUpdates;
 
     // ---------- 自动化逻辑 ----------
     let running = false;

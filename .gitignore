@@ -2,3 +2,6 @@
 !红叶镇物语自动助手.user.js
 !red-leaf-town-helper.user.js
 !.gitignore
+!.github/
+!.github/workflows/
+!.github/workflows/purge-jsdelivr.yml

@@ -1,0 +1,42 @@
+name: Refresh userscript CDN
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - red-leaf-town-helper.user.js
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Purge jsDelivr and verify published version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="$(sed -nE 's|^// @version[[:space:]]+||p' red-leaf-town-helper.user.js | head -n 1)"
+          cdn_url="https://cdn.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/red-leaf-town-helper.user.js"
+          purge_url="https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/red-leaf-town-helper.user.js"
+
+          for attempt in {1..9}; do
+            curl --fail --silent --show-error "${purge_url}" || true
+            remote_version="$(curl --fail --silent --show-error --location \
+              "${cdn_url}?verify=${GITHUB_SHA}-${attempt}" \
+              | sed -nE 's|^// @version[[:space:]]+||p' | head -n 1 || true)"
+            if [[ "${remote_version}" == "${expected_version}" ]]; then
+              echo "jsDelivr now serves v${remote_version}."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: expected v${expected_version}, received v${remote_version:-unknown}."
+            if [[ "${attempt}" -lt 9 ]]; then sleep 300; fi
+          done
+
+          echo "jsDelivr did not refresh to v${expected_version} within 40 minutes." >&2
+          exit 1
