@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.3
+// @version      2.4.4
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -16,7 +16,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    window[INSTANCE_KEY] = { version: '2.4.3' };
+    window[INSTANCE_KEY] = { version: '2.4.4' };
 
     /******************** 配置区 ********************/
     const CONFIG = {
