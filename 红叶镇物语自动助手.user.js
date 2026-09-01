@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.10
+// @version      3.0.1
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '2.4.10';
+    const SCRIPT_VERSION = '3.0.1';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -556,6 +556,12 @@
     const nodeTaskItemKeepKey = (industry, id) => `rlt-node-task-item-keep:${industry}:${id}`;
     const plotCropOverride = slot => getOverride(plotCropKey(slot));
     const nodeJobOverride = (industry, id) => getOverride(nodeJobKey(industry, id));
+    const NODE_JOB_OFF_RELEASE = '__off';
+    const NODE_JOB_OFF_KEEP = '__off_keep';
+    const nodeJobClosed = (industry, id) => {
+        const value = nodeJobOverride(industry, id);
+        return value === NODE_JOB_OFF_RELEASE || value === NODE_JOB_OFF_KEEP;
+    };
 
     // 自动垂钓总开关：配置允许 + 面板未手动关闭（面板开关优先，记忆在 localStorage）
     function fishingEnabled() {
@@ -803,9 +809,10 @@
                 const nodeName = node.definition?.name || id;
                 const label = `${nodeName}:`;
                 const { row, select } = makeSelectRow(label,
-                    industry === 'crafting' ? '选择这个加工站的配方；「自动」按需求/价值选择' : '选择这个点位的任务；「自动」按需求/价值选择');
+                    industry === 'crafting' ? '选择这个加工站的配方；关闭时可选择是否释放伙伴' : '选择这个点位的任务；关闭时可选择是否释放伙伴');
                 fillSelect(select, [
-                    { value: '__off', text: '关闭（此点位不开工）' },
+                    { value: NODE_JOB_OFF_RELEASE, text: '关闭（释放伙伴）' },
+                    { value: NODE_JOB_OFF_KEEP, text: '关闭（保留伙伴）' },
                     ...adapter.jobs(node).map(j => ({
                         value: jobId(j),
                         text: `${j.name || '任务#' + jobId(j)}${j.stamina_cost ? `（体力${j.stamina_cost}）` : ''}${industry === 'crafting' && j.unlocked === false ? '（未解锁）' : ''}`,
@@ -814,7 +821,9 @@
                 ], getOverride(key), '自动');
                 select.onchange = () => {
                     setOverride(key, select.value);
-                    const what = select.value === '__off' ? '已关闭' : (select.value ? '已锁定目标' : '恢复自动选择');
+                    const what = select.value === NODE_JOB_OFF_RELEASE ? '已关闭，将释放伙伴' :
+                        select.value === NODE_JOB_OFF_KEEP ? '已关闭，将保留伙伴' :
+                        (select.value ? '已锁定目标' : '恢复自动选择');
                     log(`${INDUSTRY_NAMES[industry] || industry}点 ${nodeName}：${what}`);
                 };
                 body.appendChild(row);
@@ -952,7 +961,7 @@
         return { name: read('name'), namespace: read('namespace'), version: read('version') };
     }
 
-    // 返回正数表示 a 更新，负数表示 b 更新；支持 2.4.10 以及常见预发布后缀。
+    // 返回正数表示 a 更新，负数表示 b 更新；支持 3.0.1 以及常见预发布后缀。
     function compareVersions(a, b) {
         const parse = value => {
             const [core, prerelease = ''] = String(value || '').trim().replace(/^v/i, '').split('-', 2);
@@ -1892,36 +1901,59 @@
         }
     }
 
-    function isPartnerIdle(p) {
-        return !p.locked && !p.missing &&
-            p.assigned_plot_slot == null &&
-            p.assigned_gathering_site_id == null &&
-            p.assigned_mining_site_id == null &&
-            p.assigned_crafting_station_id == null;
+    function partnerRecordId(partner) {
+        if (partner == null) return null;
+        return typeof partner === 'object' ? (partner.partner_id ?? partner.id ?? null) : partner;
     }
 
+    function addPartnerIds(ids, values) {
+        for (const value of values || []) {
+            const id = typeof value === 'object' ? partnerRecordId(value) : value;
+            if (id != null) ids.add(String(id));
+        }
+    }
+
+    // 水产/畜牧的换人可能先进入 pending，实际生效前也必须视为已占用，避免被其他产业抢走或重复排队。
     function aquaticAssignedPartnerIds(state) {
         const ids = new Set();
-        const companionId = state.aquatic?.companion?.partner_id ?? state.aquatic?.companion?.id;
+        const companionId = partnerRecordId(state?.aquatic?.companion);
         if (companionId != null) ids.add(String(companionId));
-        for (const pond of state.aquatic?.ponds || []) {
-            for (const partner of pond.assigned_partners || []) {
-                const id = partner?.partner_id ?? partner?.id;
-                if (id != null) ids.add(String(id));
-            }
+        for (const pond of state?.aquatic?.ponds || []) {
+            addPartnerIds(ids, pond.assigned_partner_ids);
+            addPartnerIds(ids, pond.assigned_partners);
+            addPartnerIds(ids, pond.pending_partner_ids);
+            addPartnerIds(ids, pond.pending_partner ? [pond.pending_partner] : []);
         }
         return ids;
     }
 
     function livestockAssignedPartnerIds(state) {
         const ids = new Set();
-        for (const facility of state.livestock?.facilities || []) {
-            for (const partner of facility.assigned_partners || []) {
-                const id = partner?.partner_id ?? partner?.id;
-                if (id != null) ids.add(String(id));
-            }
+        for (const facility of state?.livestock?.facilities || []) {
+            addPartnerIds(ids, facility.assigned_partner_ids);
+            addPartnerIds(ids, facility.assigned_partners);
+            addPartnerIds(ids, facility.pending_partner_ids);
+            addPartnerIds(ids, facility.pending_partner ? [facility.pending_partner] : []);
         }
         return ids;
+    }
+
+    function nodeHasAssignedOrPendingPartner(node) {
+        return (node?.assigned_partner_ids || []).length > 0 ||
+            (node?.assigned_partners || []).length > 0 ||
+            (node?.pending_partner_ids || []).length > 0 ||
+            partnerRecordId(node?.pending_partner) != null;
+    }
+
+    function isPartnerIdle(p, state = runtime.state) {
+        const id = partnerRecordId(p);
+        if (id == null || p.locked || p.missing ||
+            p.assigned_plot_slot != null ||
+            p.assigned_gathering_site_id != null ||
+            p.assigned_mining_site_id != null ||
+            p.assigned_crafting_station_id != null) return false;
+        return !aquaticAssignedPartnerIds(state).has(String(id)) &&
+            !livestockAssignedPartnerIds(state).has(String(id));
     }
 
     // 伙伴必须具有对应产业的倾向（tendencies）才能派驻
@@ -2010,7 +2042,10 @@
                     logSkip(`schema:id:${industry}`, `${industry} 节点缺少 id，已跳过派驻`);
                     continue;
                 }
-                const disabled = nodeJobOverride(industry, id) === '__off';
+                const override = nodeJobOverride(industry, id);
+                // “关闭（保留伙伴）”完全退出换人规划：现有伙伴成为固定占用，空岗也不会自动补人。
+                if (override === NODE_JOB_OFF_KEEP) continue;
+                const disabled = override === NODE_JOB_OFF_RELEASE;
                 slots.push({
                     key: `${industry}:${id}`, industry, id,
                     label: `${INDUSTRY_NAMES[industry] || industry}点 ${id}`, node,
@@ -2138,10 +2173,13 @@
             selectedSlots.push(...industrySlots.slice(0, available));
         }
 
-        const aquaticPartnerIds = aquaticAssignedPartnerIds(state);
+        const occupiedOutsideCore = new Set([
+            ...aquaticAssignedPartnerIds(state),
+            ...livestockAssignedPartnerIds(state),
+        ]);
         const partners = (state.partners || []).filter(p => {
-            const rawId = p.partner_id ?? p.id;
-            return rawId != null && !p.missing && !aquaticPartnerIds.has(String(rawId)) &&
+            const rawId = partnerRecordId(p);
+            return rawId != null && !p.missing && !occupiedOutsideCore.has(String(rawId)) &&
                 (isPartnerIdle(p) || mutableCurrentIds.has(String(rawId)));
         });
         const desired = maximumWeightPartnerMatching(selectedSlots, partners);
@@ -2322,7 +2360,9 @@
 
         const nodeId = adapter.id(node);
         const wanted = configuredJobId(industry, cfg, nodeId);
-        if (wanted === '__off') return { blocked: '已手动关闭' };
+        if (wanted === NODE_JOB_OFF_RELEASE || wanted === NODE_JOB_OFF_KEEP) {
+            return { blocked: wanted === NODE_JOB_OFF_KEEP ? '已手动关闭（保留伙伴）' : '已手动关闭（释放伙伴）' };
+        }
         // 面板锁定（点位级）始终严格；配置项锁定由 strictTaskId/strictRecipeId 决定
         const strict = !!cfg[adapter.strictKey] ||
             (nodeId != null && nodeJobOverride(industry, nodeId) != null);
@@ -2417,7 +2457,7 @@
                         continue;
                     }
                     if (failedNodes.has(`${industry}:${id}`)) continue;
-                    if (nodeJobOverride(industry, id) === '__off') continue; // 面板手动关闭的点位不开工
+                    if (nodeJobClosed(industry, id)) continue; // 两种关闭模式都禁止点位开工
                     if (adapter.requiresPartner && !siteHasPartner(node)) {
                         logSkip(`nopartner:${industry}:${id}`, `${INDUSTRY_NAMES[industry]}点 ${id}：必须派驻伙伴才能开工`);
                         continue;
@@ -2715,7 +2755,7 @@
             }
         }
         for (const pond of runtime.state.aquatic?.ponds || []) {
-            if (pond.pond_id == null || (pond.assigned_partners || []).length > 0) continue;
+            if (pond.pond_id == null || nodeHasAssignedOrPendingPartner(pond)) continue;
             if (capacity > 0 && aquaticIds.size >= capacity) break;
             const partner = takeNext();
             if (!partner) break;
@@ -2777,7 +2817,7 @@
                     !livestockIds.has(String(p.partner_id ?? p.id)))
                 .sort((a, b) => partnerAbility(b, 'livestock') - partnerAbility(a, 'livestock'));
             for (const facility of lv.facilities || []) {
-                if (facility.facility_id == null || (facility.assigned_partners || []).length > 0) continue;
+                if (facility.facility_id == null || nodeHasAssignedOrPendingPartner(facility)) continue;
                 if (capacity > 0 && livestockIds.size >= capacity) break;
                 const partner = idle.shift();
                 if (!partner) break;
