@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '3.0.1';
+    const SCRIPT_VERSION = '3.0.2';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -133,6 +133,7 @@
             maxUnitsPerTick: 20,      // 单轮最多卖出数量
             protectLockedPortals: true,
             protectCraftingInputs: true, // 每个加工站为已解锁配方保留至少一批原料
+            protectExplorationGear: true, // 永不售卖探索装备（武器/饰品）与探索道具（库存中带 equipment/delve_use 字段），即使误入白名单
         },
 
         partnerMinImprovement: 0.05, // 非必需岗位换人至少提升 5%，避免频繁抖动
@@ -961,7 +962,7 @@
         return { name: read('name'), namespace: read('namespace'), version: read('version') };
     }
 
-    // 返回正数表示 a 更新，负数表示 b 更新；支持 3.0.1 以及常见预发布后缀。
+    // 返回正数表示 a 更新，负数表示 b 更新；支持 3.0.2 以及常见预发布后缀。
     function compareVersions(a, b) {
         const parse = value => {
             const [core, prerelease = ''] = String(value || '').trim().replace(/^v/i, '').split('-', 2);
@@ -1589,6 +1590,12 @@
         return rows;
     }
 
+    // 探索物品硬保护：武器/饰品（equipment 字段）与探索携带道具（delve_use 字段）即使 id 进了白名单也永不出售。
+    // 官方客户端同样用这两个字段从 inventory 识别可装备/可携带物品。
+    function isExplorationGear(item) {
+        return !!(item && (item.equipment || item.delve_use));
+    }
+
     function computeSellables(state) {
         const whitelist = new Set((CONFIG.selling.allowedItemIds || []).map(String));
         for (const id of inferredSellItemIds(state)) whitelist.add(id);
@@ -1596,6 +1603,7 @@
         const craftingReserves = craftingInputReserves(state);
         const groups = new Map();
         for (const item of state.inventory || []) {
+            if (CONFIG.selling.protectExplorationGear && isExplorationGear(item)) continue;
             const key = String(item.item_id);
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key).push(item);
