@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.3
+// @version      3.1.5
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -570,20 +570,30 @@
     const craftPipelineProgKey = stationId => `rlt-craft-pipe-prog:${stationId}`;
 
     // 读取并校验流程：只保留 recipeId 非空、批次数 ≥1 的步骤，最多 4 步；非法一律视为未配置
+    // taskItemId：该步开工携带的道具——'' 跟随站点「道具」行（默认）、'__off' 不使用、其余为指定道具 id
     function craftPipelineSteps(stationId) {
         let raw;
         try { raw = JSON.parse(getOverride(craftPipelineKey(stationId)) || '[]'); }
         catch { return []; }
         if (!Array.isArray(raw)) return [];
         return raw
-            .map(s => ({ recipeId: s?.recipeId ?? '', times: Math.floor(Number(s?.times) || 0) }))
+            .map(s => ({
+                recipeId: s?.recipeId ?? '',
+                times: Math.floor(Number(s?.times) || 0),
+                taskItemId: typeof s?.taskItemId === 'string' ? s.taskItemId : (s?.useItem === false ? '__off' : ''),
+            }))
             .filter(s => s.recipeId !== '' && s.times >= 1)
             .slice(0, CRAFT_PIPELINE_MAX_STEPS); // 先过滤无效步再截断，避免无效步占用 4 步名额
     }
 
+    // 进度签名只含配方与批次数：切换某步的道具选择不改变签名，不会误重置进度
+    function craftPipelineSig(steps) {
+        return JSON.stringify(steps.map(s => ({ recipeId: s.recipeId, times: s.times })));
+    }
+
     // 进度与流程内容绑定：流程被编辑（sig 变化）后进度自动归零，避免新旧步骤错位
     function craftPipelineProgress(stationId, steps) {
-        const sig = JSON.stringify(steps);
+        const sig = craftPipelineSig(steps);
         let saved = null;
         try { saved = JSON.parse(getOverride(craftPipelineProgKey(stationId)) || 'null'); }
         catch { saved = null; }
@@ -597,7 +607,7 @@
         const prog = craftPipelineProgress(stationId, steps);
         if (stepIndex < 0 || stepIndex >= steps.length) return prog;
         prog.done[stepIndex] += 1;
-        setOverride(craftPipelineProgKey(stationId), JSON.stringify({ sig: JSON.stringify(steps), done: prog.done }));
+        setOverride(craftPipelineProgKey(stationId), JSON.stringify({ sig: craftPipelineSig(steps), done: prog.done }));
         return craftPipelineProgress(stationId, steps);
     }
 
@@ -842,34 +852,60 @@
 
         const title = document.createElement('div');
         title.textContent = '└ 流程（最多4步，跑完一轮即停）：';
-        title.title = '配置后需点下方「开始」才执行；按顺序执行：当前步做满批次数才推进下一步；缺材料会原地等待；编辑流程自动重置进度';
+        title.title = '配置后需点下方「开始」才执行；按顺序执行：当前步做满批次数才推进下一步；缺材料会原地等待；每步可单独选开工道具（跟随站点道具行/不使用/指定道具，切换不影响进度）；改配方/批次数自动重置进度';
         title.style.cssText = 'margin-top:4px;opacity:.8';
         frag.appendChild(title);
 
+        // 加工适用的道具列表，供每步单独指定开工道具
+        const craftItems = (state.task_items || []).filter(it => {
+            const eligible = it?.eligible_industries;
+            return !Array.isArray(eligible) || eligible.length === 0 || eligible.includes('crafting');
+        });
         const editors = [];
         const save = () => {
+            const prevSig = craftPipelineSig(craftPipelineSteps(stationId));
             const next = editors
-                .map(({ select, count }) => ({ recipeId: select.value, times: Math.floor(Number(count.value) || 0) }))
+                .map(({ select, count, itemSel }) => ({
+                    recipeId: select.value,
+                    times: Math.floor(Number(count.value) || 0),
+                    taskItemId: itemSel.value,
+                }))
                 .filter(s => s.recipeId !== '' && s.times >= 1);
             setOverride(craftPipelineKey(stationId), next.length ? JSON.stringify(next) : '');
-            log(`加工点 ${stationId}：流程已更新（${next.length} 步），进度已重置`);
+            // 道具选择不参与签名：只换道具不会重置进度，改配方/批次数才会
+            const sigChanged = craftPipelineSig(next) !== prevSig;
+            log(`加工点 ${stationId}：流程已更新（${next.length} 步）${sigChanged ? '，进度已重置' : ''}`);
             wakeSoon();
         };
         for (let i = 0; i < CRAFT_PIPELINE_MAX_STEPS; i++) {
             const { row, select } = makeSelectRow(`　第${i + 1}步:`, '选择该步配方；留空则忽略此步');
-            select.style.maxWidth = '140px'; // 给批次数输入留出行内空间
+            select.style.maxWidth = '118px'; // 给道具下拉与批次数输入留出行内空间
             fillSelect(select, recipes.map(j => ({
                 value: jobId(j),
                 text: `${j.name || '配方#' + jobId(j)}${j.unlocked === false ? '（未解锁）' : ''}`,
                 disabled: j.unlocked === false,
             })), steps[i]?.recipeId ?? null, '（空）');
             select.onchange = save;
+            // 每步单独的开工道具：默认跟随上方站点「道具」行，可改为不使用或指定道具；切换不影响流程进度
+            const itemSel = document.createElement('select');
+            itemSel.title = '本步开工道具：默认跟随上方「道具」行，可改为不使用或指定道具（切换不影响进度）';
+            itemSel.style.cssText = 'flex:1;min-width:64px;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px';
+            fillSelect(itemSel, [
+                { value: '__off', text: '不使用道具' },
+                ...craftItems.map(it => ({
+                    value: taskItemRecordId(it),
+                    text: `【${it.timing === 'active' ? '途中' : '开工'}】${it.name || '道具#' + taskItemRecordId(it)} ×${it.quantity || 0}`,
+                    disabled: Number(it.quantity || 0) <= 0,
+                })),
+            ], steps[i]?.taskItemId || null, '站点道具');
+            itemSel.onchange = save;
             const count = makeNumberInput(steps[i]?.times ?? 1, {
-                min: 1, placeholder: '次数',
+                min: 1, width: '38px', placeholder: '次数',
                 title: '批次数：该步开工多少次后推进下一步',
                 onchange: save,
             });
-            editors.push({ select, count });
+            editors.push({ select, count, itemSel });
+            row.appendChild(itemSel);
             row.appendChild(count);
             frag.appendChild(row);
         }
@@ -1396,8 +1432,9 @@
     }
 
     // 槽位级任务道具：只认面板锁定的道具（支持保留数量），未锁定即不使用
-    function slotTaskItem(state, industry, slotId, timing, { notify = true } = {}) {
-        const override = getOverride(nodeTaskItemKey(industry, slotId));
+    // forcedId：加工流程步骤单独指定的道具 id，传入时跳过槽位配置查找
+    function slotTaskItem(state, industry, slotId, timing, { notify = true, forcedId = null } = {}) {
+        const override = forcedId != null ? forcedId : getOverride(nodeTaskItemKey(industry, slotId));
         if (override == null || override === '__off') return null; // '__off' 兼容旧版存储
         const keep = Math.max(0, Number(getOverride(nodeTaskItemKeepKey(industry, slotId)) || 0));
         const item = (state.task_items || []).find(candidate => {
@@ -2576,7 +2613,7 @@
             const isLocked = override != null && override !== NODE_JOB_OFF_RELEASE && override !== NODE_JOB_OFF_KEEP;
             const lockTimes = isLocked ? Math.floor(Number(getOverride(craftLockTimesKey(nodeId))) || 0) : 0;
             const steps = override == null ? craftPipelineSteps(nodeId)
-                : (lockTimes > 0 ? [{ recipeId: override, times: lockTimes }] : []);
+                : (lockTimes > 0 ? [{ recipeId: override, times: lockTimes, taskItemId: '' }] : []);
             if (steps.length) {
                 if (override == null && !craftPipelineRunning(nodeId)) return { blocked: '流程未启动（面板点「开始」）' };
                 const prog = craftPipelineProgress(nodeId, steps);
@@ -2596,7 +2633,7 @@
                 if (!jobAvailable(state, industry, job)) {
                     return { blocked: `流程第 ${prog.stepIndex + 1} 步「${job.name || step.recipeId}」等待材料` };
                 }
-                pipeline = { stationId: nodeId, stepIndex: prog.stepIndex, steps, done: prog.done };
+                pipeline = { stationId: nodeId, stepIndex: prog.stepIndex, steps, done: prog.done, taskItemId: step.taskItemId || '' };
                 pipelineJob = job;
             }
         }
@@ -2633,7 +2670,11 @@
         const partner = assignedPartner(state, node);
         const ability = Number(state.industry_rules?.[industry]?.character_base_ability || 0) +
             (partner ? partnerAbility(partner, industry) : 0);
-        const startItem = slotTaskItem(state, industry, INDUSTRY_ADAPTERS[industry]?.id(node), 'start');
+        // 流程步骤可单独指定道具：'' 跟随站点「道具」行、'__off' 本批不使用、其余为指定道具 id
+        const pipeItemId = pipeline ? (pipeline.taskItemId || '') : '';
+        const startItem = (pipeline && pipeItemId === '__off') ? null
+            : slotTaskItem(state, industry, INDUSTRY_ADAPTERS[industry]?.id(node), 'start',
+                pipeItemId && pipeItemId !== '__off' ? { forcedId: pipeItemId } : {});
         const durationMultiplier = taskItemDurationMultiplier(startItem);
         const scored = affordable.map((job, index) => {
             const hourly = jobHourlyValue(state, industry, job, ability, durationMultiplier);
