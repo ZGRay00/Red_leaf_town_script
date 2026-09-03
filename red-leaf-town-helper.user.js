@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      3.1.5
+// @version      3.2.1
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '3.1.3';
+    const SCRIPT_VERSION = '3.2.1';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -100,14 +100,14 @@
             autoBuildPonds: false,    // 自动挖塘（一次性投入红叶币，默认关闭）
             autoFeed: false,          // 饲料槽余量不足时自动投料（面板「饲料槽」分组可开关，面板设置优先）
             feedKeepHours: 24,        // 饲料槽补到约 N 小时用量
-            autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑空闲最强的）
+            autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑特性最贴合、能力最强的）
         },
 
         livestock: {
             enabled: true,            // 畜牧：照料 + 收取 + 派驻（购买/配种/孵蛋需人工决策，不自动化）
             autoCare: false,           // 自动照料动物（每次 1 体力，提高亲密度；只花体力保底之上的余量）
             autoCollect: true,        // 自动收取设施产出（不耗体力）
-            autoAssignPartner: true,  // 自动安排看场伙伴（畜牧倾向中挑空闲最强的）
+            autoAssignPartner: true,  // 自动安排看场伙伴（畜牧倾向中挑特性最贴合、能力最强的）
         },
 
         achievements: {
@@ -136,6 +136,8 @@
             protectExplorationGear: true, // 永不售卖探索装备（武器/饰品）与探索道具（库存中带 equipment/delve_use 字段），即使误入白名单
         },
 
+        partnerAutoSwap: true,       // 自动换人：已有伙伴的岗位出现更优人选时自动更换（关闭后只补空岗；面板「伙伴」分组可开关，面板设置优先）
+        partnerTraitBonus: 20,       // 换人评分时，每个与岗位产业相关的特性折算的能力加成（特性优先于纯能力值比较）
         partnerMinImprovement: 0.05, // 非必需岗位换人至少提升 5%，避免频繁抖动
 
         rosterScanOnStart: true,      // 启动时自动扫描并打印角色库
@@ -667,6 +669,10 @@
     const CRAFT_ENABLED_KEY = 'rlt-craft-enabled';
     const craftingEnabled = () => livestockFlag(CRAFT_ENABLED_KEY, CONFIG.crafting.enabled);
 
+    // 自动换人总开关：面板开关优先（'on'/'off'），缺省回退配置文件；关闭后只补空岗，不替换已有伙伴
+    const PARTNER_AUTO_SWAP_KEY = 'rlt-partner-auto-swap';
+    const partnerAutoSwapEnabled = () => livestockFlag(PARTNER_AUTO_SWAP_KEY, CONFIG.partnerAutoSwap);
+
     // 产业是否启用：加工走面板总开关，其余产业看配置文件
     function industryEnabled(industry) {
         return industry === 'crafting' ? craftingEnabled() : !!INDUSTRY_ADAPTERS[industry]?.config().enabled;
@@ -1052,6 +1058,17 @@
                     if (pipeRows) body.appendChild(pipeRows);
                 }
             }
+            configBox.appendChild(group);
+        }
+        // 伙伴：全局换人开关（农作/采集/矿产/加工的统一换人规划共用）
+        {
+            const { group, body } = makeGroup('伙伴');
+            const on = partnerAutoSwapEnabled();
+            body.appendChild(makeToggleRow(state, '自动换人:', '开启后，已有伙伴的岗位出现更优人选（特性优先、其次能力值）时自动更换；关闭后只给空岗补人，不替换已有伙伴', on, () => {
+                setOverride(PARTNER_AUTO_SWAP_KEY, on ? 'off' : 'on');
+                log(`自动换人：${on ? '已关闭（只补空岗）' : '已开启'}`);
+                wakeSoon();
+            }));
             configBox.appendChild(group);
         }
         if (CONFIG.livestock.enabled && state.livestock?.unlocked) {
@@ -2213,6 +2230,32 @@
         return t ? (t.effective_ability ?? t.current_ability ?? 0) : 0;
     }
 
+    // 特性与产业的相关性按名称/描述关键词识别（游戏未提供结构化字段）；“所有产业”类通用特性对所有产业生效
+    const TRAIT_GENERIC_KEYWORDS = ['所有产业', '全部产业', '全产业', '任意产业', '各产业'];
+    const TRAIT_INDUSTRY_KEYWORDS = {
+        farming: ['农作', '种植', '作物', '收获', '耕地', '农田'],
+        gathering: ['采集', '林野', '伐木', '拾取', '采摘'],
+        mining: ['采矿', '矿产', '矿石', '掘金'],
+        crafting: ['加工', '制作', '工艺', '锻造'],
+        aquatic: ['水产', '垂钓', '钓鱼', '鱼塘', '鱼类'],
+        livestock: ['畜牧', '牧场', '动物', '饲养', '照料'],
+    };
+
+    // 伙伴身上与该产业相关的特性列表
+    function partnerTraitMatches(partner, industry) {
+        return (partner?.traits || []).filter(t => {
+            const text = `${t?.name || ''} ${t?.code || ''} ${t?.description || ''}`;
+            return TRAIT_GENERIC_KEYWORDS.some(k => text.includes(k)) ||
+                (TRAIT_INDUSTRY_KEYWORDS[industry] || []).some(k => text.includes(k));
+        });
+    }
+
+    // 换人/派驻评分：能力值 + 每个相关特性折算的加成（特性优先于纯能力值）
+    function partnerIndustryScore(p, industry) {
+        const bonus = Math.max(0, Number(CONFIG.partnerTraitBonus ?? 0));
+        return Number(partnerAbility(p, industry) || 0) + bonus * partnerTraitMatches(p, industry).length;
+    }
+
     // ---------- 产业字段适配 ----------
     const INDUSTRY_ADAPTERS = {
         gathering: {
@@ -2304,14 +2347,20 @@
     }
 
     // 匈牙利算法求全局最大权匹配；每个岗位额外配一个虚拟列，允许合法地保持空缺。
-    function maximumWeightPartnerMatching(slots, partners) {
+    // allowSwap=false 时，已有伙伴的岗位只允许保留现任伙伴（只补空岗、不换人）。
+    function maximumWeightPartnerMatching(slots, partners, allowSwap = true) {
         if (!slots.length || !partners.length) return new Map();
         const priorities = { gathering: 4, mining: 3, crafting: 2, farming: 1 };
         const edgeAbilities = slots.map(slot => partners.map(partner => {
-            if (!hasTendency(partner, slot.industry)) return null;
             const pid = partner.partner_id ?? partner.id;
             const same = sameId(pid, currentPartnerId(slot.node));
-            const rawAbility = Number(partnerAbility(partner, slot.industry) || 0);
+            if (!allowSwap && currentPartnerId(slot.node) != null) {
+                // 关闭自动换人：已派驻岗位锁定现任伙伴（给一个不会被超越的权重，空岗列权重为 0 无法挤掉它）
+                if (!same || !hasTendency(partner, slot.industry)) return null;
+                return { pid, same, weightedAbility: Number.MAX_SAFE_INTEGER / 4 };
+            }
+            if (!hasTendency(partner, slot.industry)) return null;
+            const rawAbility = Number(partnerIndustryScore(partner, slot.industry) || 0);
             const rawDifficulty = Number(slot.difficulty || 0);
             const ability = Number.isFinite(rawAbility) ? Math.max(0, rawAbility) : 0;
             const difficulty = Number.isFinite(rawDifficulty) ? Math.max(0, rawDifficulty) : 0;
@@ -2428,7 +2477,15 @@
             return rawId != null && !p.missing && !occupiedOutsideCore.has(String(rawId)) &&
                 (isPartnerIdle(p) || mutableCurrentIds.has(String(rawId)));
         });
-        const desired = maximumWeightPartnerMatching(selectedSlots, partners);
+        const desired = maximumWeightPartnerMatching(selectedSlots, partners, partnerAutoSwapEnabled());
+
+        // 关闭自动换人时：现任伙伴不在候选池（缺失等异常）导致匹配空缺的岗位，也强制保留现状，绝不释放
+        if (!partnerAutoSwapEnabled()) {
+            for (const slot of allSlots) {
+                const current = currentPartnerId(slot.node);
+                if (current != null && !slot.disabled) desired.set(slot.key, current);
+            }
+        }
 
         // 先释放所有需要移动的可调整岗位，响应 state 会逐次确认真实编制。
         for (const slot of allSlots) {
@@ -2460,7 +2517,9 @@
                 clearSkip(`fail:assign:${slot.key}`);
                 clearSkip(`nopartner:${slot.key}`);
                 const partner = (runtime.state.partners || []).find(p => sameId(p.partner_id ?? p.id, target));
-                log(`${slot.label}：派驻 ${partner?.name || '伙伴#' + target}（${INDUSTRY_NAMES[slot.industry] || slot.industry} ${partner ? partnerAbility(partner, slot.industry) : '?'}）`);
+                const traits = partner ? partnerTraitMatches(partner, slot.industry) : [];
+                const traitText = traits.length ? `，特性：${traits.map(t => t.name || t.code).join('、')}` : '';
+                log(`${slot.label}：派驻 ${partner?.name || '伙伴#' + target}（${INDUSTRY_NAMES[slot.industry] || slot.industry} ${partner ? partnerAbility(partner, slot.industry) : '?'}${traitText}）`);
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:assign:${slot.key}`, `${slot.label} 派驻伙伴失败：${e.message}`);
@@ -3026,7 +3085,7 @@
         }
     }
 
-    // 水产伙伴：陪钓 1 名 + 每口塘 1 名，从有水产倾向的空闲伙伴中挑能力最强的
+    // 水产伙伴：陪钓 1 名 + 每口塘 1 名，从有水产倾向的空闲伙伴中挑特性最贴合、能力最强的
     async function doAquaticPartners() {
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
@@ -3037,7 +3096,7 @@
         const idle = (runtime.state.partners || [])
             .filter(p => isPartnerIdle(p) && hasTendency(p, 'aquatic') &&
                 !aquaticIds.has(String(p.partner_id ?? p.id)))
-            .sort((a, b) => partnerAbility(b, 'aquatic') - partnerAbility(a, 'aquatic'));
+            .sort((a, b) => partnerIndustryScore(b, 'aquatic') - partnerIndustryScore(a, 'aquatic'));
         if (!idle.length) return;
         const takeNext = () => idle.shift();
         if (fishingEnabled() && aq.companion == null) {
@@ -3116,7 +3175,7 @@
             const idle = (runtime.state.partners || [])
                 .filter(p => isPartnerIdle(p) && hasTendency(p, 'livestock') &&
                     !livestockIds.has(String(p.partner_id ?? p.id)))
-                .sort((a, b) => partnerAbility(b, 'livestock') - partnerAbility(a, 'livestock'));
+                .sort((a, b) => partnerIndustryScore(b, 'livestock') - partnerIndustryScore(a, 'livestock'));
             for (const facility of lv.facilities || []) {
                 if (facility.facility_id == null || nodeHasAssignedOrPendingPartner(facility)) continue;
                 if (capacity > 0 && livestockIds.size >= capacity) break;
@@ -3200,7 +3259,8 @@
             const tend = (p.tendencies || [])
                 .map(t => `${INDUSTRY_NAMES[t.industry] || t.industry}${t.effective_ability ?? t.current_ability ?? 0}`)
                 .join(' / ');
-            log(`· ${p.name || p.partner_id}｜${tend || '无产业倾向'}｜${partnerPost(p, state)}`);
+            const traits = (p.traits || []).map(t => t.name || t.code).filter(Boolean).join('、');
+            log(`· ${p.name || p.partner_id}｜${tend || '无产业倾向'}${traits ? `｜特性：${traits}` : ''}｜${partnerPost(p, state)}`);
         }
     }
 
