@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.1
+// @version      3.2.3
 // @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '3.2.1';
+    const SCRIPT_VERSION = '3.2.3';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -1558,14 +1558,21 @@
         const producePrice = itemSellPrice(state, produceId, cropProduceName(crop), crop.produce_sell_price ?? crop.produce?.sell_price ?? crop.item?.sell_price);
         const shopEntry = (state.shop || []).find(e => sameId(shopEntryItemId(e), crop.seed_item_id));
         const seedRaw = crop.seed_price ?? shopEntry?.price;
-        if (producePrice == null || seedRaw == null) return null;
-        const seedPrice = Number(seedRaw);
-        if (!Number.isFinite(seedPrice)) return null;
+        if (producePrice == null) return null;
+        // 种子不可购买（树果等探索/航海掉落地）：库存有货时按边际成本 0 估值（种子卖价也是 0，无机会成本）；无货无法估值
+        let seedPrice;
+        if (seedRaw == null || !Number.isFinite(Number(seedRaw))) {
+            if (seedQty(state, crop) <= 0) return null;
+            seedPrice = 0;
+        } else {
+            seedPrice = Number(seedRaw);
+        }
         const minYield = Number(crop.yield_min ?? 1);
         const maxYield = Number(crop.yield_max ?? minYield);
         const startItem = plot ? slotTaskItem(state, 'farming', plot.slot, 'start', { notify: false }) : null;
-        const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability, 1,
-            taskItemDurationMultiplier(startItem));
+        // 树果等作物带 minimum_duration_seconds 时长下限：能力加成不能把收获压缩到下限以内
+        const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability,
+            crop.minimum_duration_seconds ?? 1, taskItemDurationMultiplier(startItem));
         if (!seconds) return null;
         return (((minYield + maxYield) / 2) * producePrice - seedPrice) / (seconds / 3600);
     }
