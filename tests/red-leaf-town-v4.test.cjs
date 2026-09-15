@@ -25,9 +25,9 @@ function element(tag = 'div') {
         tagName: tag.toUpperCase(), style: {}, dataset: {}, children: [], attrs: {}, value: '', scrollTop: 0,
         classList: { contains: c => classes.has(c), toggle(c, flag) { if (flag ?? !classes.has(c)) classes.add(c); else classes.delete(c); }, add: c => classes.add(c) },
         setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; },
-        appendChild(x) { x.parent = this; this.children.push(x); return x; }, append(...xs) { xs.forEach(x => this.appendChild(x)); },
-        prepend(x) { x.parent = this; this.children.unshift(x); }, remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); },
-        replaceChildren(...xs) { this.children = []; this.append(...xs); }, addEventListener() {}, removeEventListener() {}, blur() {},
+        appendChild(x) { x.remove?.(); x.parent = this; this.children.push(x); return x; }, append(...xs) { xs.forEach(x => this.appendChild(x)); },
+        prepend(x) { x.remove?.(); x.parent = this; this.children.unshift(x); }, remove() { if (this.parent) { this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; } },
+        replaceChildren(...xs) { for (const child of this.children) child.parent = null; this.children = []; this.append(...xs); }, addEventListener() {}, removeEventListener() {}, blur() {}, focus() {},
         contains(x) { return x === this || this.children.some(child => child.contains?.(x)); },
         getBoundingClientRect() { return { left: 0, top: 0 }; },
         querySelectorAll(selector) { return this.children.flatMap(child => [...(selector === '[data-page]' && child.dataset?.page ? [child] : []), ...(child.querySelectorAll?.(selector) || [])]); },
@@ -57,6 +57,8 @@ function harness(initial = fixture(), entries = []) {
         craftFlight, saveCraftFlight, craftPipelineProgress, creditCraftFlight, reconcileCraftFlights, startCraftPlan, configuredCraftSteps,
         craftingInputReserves, inFlightIndustryGuaranteedQty, isPartnerIdle, sailingPartners, processCraftCancel, acceptState, slotTaskItem, managedPartnerSlots,
         renderDashboard, refreshConfigRows, panel, dashboard, tabBar, configBox,
+        start, stop, tick, sleep, wakeSoon,
+        activity() { return { running, starting, busy, retryNotBefore }; },
         setRunning(value = true) { running = value; runtime.controller = value ? new AbortController() : null; } };`;
     let source = fs.readFileSync(sourcePath, 'utf8');
     assert.ok(source.includes('if (CONFIG.ui.autoStart) start();'));
@@ -231,6 +233,102 @@ async function run() {
         const { h } = harness(), node = h.runtime.state.crafting_stations[0];
         Object.assign(node, { empty: false, ready: false, recipe: node.recipes[0], queued_count: 3, task_snapshot: {}, completed_results: [{ item_id: 'flour', quality: 1, quantity: 2 }] });
         assert.equal(h.inFlightIndustryGuaranteedQty(h.runtime.state, { itemId: 'flour', minQuality: 0 }), 6);
+    });
+    await test('legacy boolean and numeric settings survive; canonical edits take priority', () => {
+        const x = harness(fixture(), [['rlt-craft-enabled', 'off'], ['rlt-aquatic-chain', '9'], ['rlt-aquatic-stamina-reserve', '25']]);
+        assert.equal(x.h.CONFIG.crafting.enabled, false); assert.equal(x.h.CONFIG.aquatic.chainCasts, 9); assert.equal(x.h.CONFIG.aquatic.staminaReserve, 25);
+        x.h.CONFIG.crafting.enabled = true; x.h.CONFIG.aquatic.chainCasts = 3;
+        const next = harness(fixture(), [...x.storage]);
+        assert.equal(next.h.CONFIG.crafting.enabled, true); assert.equal(next.h.CONFIG.aquatic.chainCasts, 3);
+    });
+    await test('reserves refresh on settings change and keep cache for identical writes', () => {
+        const { h } = harness(); h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        const first = h.craftingInputReserves(h.runtime.state); assert.ok(first.size > 0);
+        assert.equal(h.setOverride('rlt-node-job:crafting:mill', 'flour'), false);
+        assert.equal(h.craftingInputReserves(h.runtime.state), first);
+        h.CONFIG.crafting.enabled = false;
+        assert.equal(h.craftingInputReserves(h.runtime.state).size, 0);
+    });
+    await test('settings render only the selected page and retain independent scroll positions', () => {
+        const { h } = harness();
+        assert.equal(h.configBox.children.length, 0);
+        const go = page => h.tabBar.children.find(button => button.dataset.page === page).onclick();
+        go('production'); h.configBox.scrollTop = 123;
+        go('feed'); assert.equal(h.configBox.scrollTop, 0);
+        assert.ok(h.configBox.children.every(group => group.dataset.page === 'feed'));
+        h.configBox.scrollTop = 45; go('production'); assert.equal(h.configBox.scrollTop, 123);
+        assert.ok(h.configBox.children.every(group => group.dataset.page === 'production'));
+        go('feed'); assert.equal(h.configBox.scrollTop, 45);
+    });
+    await test('dashboard retains card nodes while updating values and removing ended tasks', () => {
+        const { h } = harness();
+        h.runtime.state.plots = [{ slot: 0, empty: false, ready: false, ready_at: h.runtime.state.server_time + 30 }];
+        h.renderDashboard(h.runtime.state); const cards = [...h.dashboard.children];
+        const next = structuredClone(h.runtime.state); next.player.coins += 100;
+        h.renderDashboard(next);
+        cards.forEach((card, index) => assert.equal(h.dashboard.children[index], card));
+        assert.equal(h.dashboard.children[0].children[1].children[1].textContent, '20,100');
+        next.plots = []; h.renderDashboard(next); assert.ok(!h.dashboard.children.includes(cards[2]));
+    });
+    await test('settings refresh preserves an in-progress numeric edit', () => {
+        const x = harness(), { h } = x;
+        h.tabBar.children.find(button => button.dataset.page === 'feed').onclick();
+        const input = element('input'); input.value = '37'; h.configBox.children[0].appendChild(input);
+        x.context.document.activeElement = input;
+        h.refreshConfigRows(structuredClone(h.runtime.state));
+        assert.ok(h.configBox.contains(input)); assert.equal(input.value, '37');
+        x.context.document.activeElement = null;
+        h.refreshConfigRows(structuredClone(h.runtime.state)); assert.equal(h.configBox.contains(input), false);
+    });
+    await test('configuration pages also render before login', () => {
+        const x = harness(); x.h.setRunning(false);
+        x.context.document.querySelector = () => null; x.h.runtime.state = null;
+        for (const button of x.h.tabBar.children) button.onclick();
+        assert.ok(x.h.configBox.children.length);
+    });
+    await test('stop cancels a waiting fishing interval immediately', async () => {
+        const { h } = harness(), waiting = h.sleep(60000);
+        h.stop(); await assert.rejects(waiting, error => error.code === 'aborted');
+    });
+    await test('rapid restart holds the tab lock until the old request drains', async () => {
+        const x = harness(), { h } = x; h.stop();
+        let locks = 0, released = 0, respond, entered;
+        const requestEntered = new Promise(resolve => { entered = resolve; });
+        x.context.navigator.locks = { async request(name, options, callback) { locks++; try { await callback({ name }); } finally { released++; } } };
+        x.setResponder(() => { entered(); return new Promise(resolve => { respond = resolve; }); });
+        try {
+            await h.start(); await requestEntered;
+            const oldController = h.runtime.controller;
+            h.stop(); const restarting = h.start(); await Promise.resolve();
+            assert.equal(locks, 1); assert.equal(released, 0); assert.equal(h.runtime.controller, oldController);
+            assert.equal(oldController.signal.aborted, true); assert.equal(h.activity().running, false);
+            respond({ ok: true, status: 200, json: async () => ({ data: structuredClone(x.backend) }) });
+            await restarting;
+            assert.equal(locks, 2); assert.equal(released, 1); assert.equal(h.activity().running, true);
+            assert.notEqual(h.runtime.controller, oldController); assert.equal(x.calls.length, 1);
+        } finally { h.stop(); }
+    });
+    await test('stopping during lock acquisition cannot reactivate a canceled start', async () => {
+        const x = harness(), { h } = x; h.stop();
+        let deliver;
+        x.context.navigator.locks = { request(name, options, callback) { return new Promise(resolve => { deliver = () => resolve(callback({ name })); }); } };
+        const starting = h.start(); await Promise.resolve(); h.stop(); deliver(); await starting;
+        assert.equal(h.activity().running, false); assert.equal(h.runtime.controller, null);
+    });
+    await test('settings wakeups cannot bypass server rate-limit backoff', async () => {
+        const x = harness(), { h } = x;
+        x.setResponder(() => { h.wakeSoon(); return { ok: false, status: 429, headers: { get: () => '60' }, json: async () => ({ message: 'Too many requests' }) }; });
+        try {
+            await h.tick(); assert.equal(x.calls.length, 1); assert.ok(h.activity().retryNotBefore > Date.now() + 50000);
+            h.wakeSoon(); await h.tick(); assert.equal(x.calls.length, 1);
+        } finally { h.stop(); }
+    });
+    await test('aborted crafting submission retains its uncertain queue journal', async () => {
+        const x = harness(), node = x.h.runtime.state.crafting_stations[0];
+        x.setResponder(() => { x.h.stop(); throw new DOMException('Stopped after request was sent', 'AbortError'); });
+        await assert.rejects(x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0] }), error => error.code === 'aborted');
+        assert.equal(x.h.craftFlight('mill').phase, 'uncertain');
+        assert.equal(x.h.runtime.stateUncertain, true);
     });
     console.log(`\n${passed} scenarios passed (mock HTTP only).`);
 }
