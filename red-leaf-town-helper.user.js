@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      3.2.3
-// @description  红叶镇物语自动收菜/种菜、采集、采矿、加工、每日委托、畜牧、垂钓与鱼塘循环脚本（基于游戏自身 API）
+// @version      4.0.0
+// @description  红叶镇物语自动生产、批量加工流程、航海、均衡饲料补充与图形化管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @downloadURL  none
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '3.2.3';
+    const SCRIPT_VERSION = '4.0.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -53,6 +53,8 @@
 
         farming: {
             enabled: true,            // 自动收获 + 种菜
+            autoCollect: true,
+            autoPlant: true,
             cropId: null,             // 指定作物 id；null = 自动选择
             strictCropId: true,       // 指定作物无种子/不可种时等待，不偷偷改种其他作物
             prefer: 'first',          // 自动选择策略: 'first' 列表第一种 | 'fastest' 生长最快 | 'slowest' 生长最慢
@@ -65,6 +67,8 @@
 
         gathering: {
             enabled: true,            // 林野采集：自动领取 + 重新开工
+            autoCollect: true,
+            autoStart: true,
             taskId: null,             // 指定任务 id；null = 用该点第一个可接任务
             strictTaskId: true,       // 指定任务不存在时等待，不回退到其他任务
             autoAssignPartner: true,  // 采集必须派驻伙伴：自动安排/优化驻场伙伴
@@ -72,6 +76,8 @@
 
         mining: {
             enabled: true,            // 矿山采矿：自动收取 + 重新开工
+            autoCollect: true,
+            autoStart: true,
             taskId: null,             // 指定任务 id；null = 用该点第一个可接任务
             strictTaskId: true,
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴（不设则会独自采矿）
@@ -79,6 +85,14 @@
 
         crafting: {
             enabled: true,            // 加工总开关默认值；面板「加工启停」开关优先（本地记忆）。站点需在面板配置流程或锁定配方才会开工
+            autoCollect: true,
+            autoStart: true,
+            batchEnabled: true,
+            batchLimit: 10,           // 每次提交的份数，最大 99
+            staminaReserve: 0,
+            useTaskItems: true,
+            partialTaskItems: true,   // 道具不足时仅队列前段使用，仍遵守道具保留量
+            repeatPipeline: false,
             recipeId: null,           // 指定配方 id；null = 用第一个配方
             strictRecipeId: true,
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴
@@ -95,11 +109,11 @@
             bigCatch: 'fight',        // 大物处理: 'fight' 搏一把 | 'release' 放线 | 'manual' 暂停等人工
             fightMinChance: 0,        // 大物成功率（0~1）低于该值时直接放线
             ponds: true,              // 鱼塘：捞走超出保留线的成鱼（保持世代加值），再用手头鱼苗补到目标尾数
+            autoHarvestPonds: true,
+            autoStockPonds: true,
             pondKeepStock: 30,        // 捞鱼保留线：成鱼捞到剩 N 尾为止（同时不低于游戏稳态线，取两者较大值）
             pondRestockTarget: 37,    // 投苗目标：捞鱼后用手头鱼苗把塘内总数补到 N（不超过鱼塘容量）
             autoBuildPonds: false,    // 自动挖塘（一次性投入红叶币，默认关闭）
-            autoFeed: false,          // 饲料槽余量不足时自动投料（面板「饲料槽」分组可开关，面板设置优先）
-            feedKeepHours: 24,        // 饲料槽补到约 N 小时用量
             autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑特性最贴合、能力最强的）
         },
 
@@ -109,6 +123,35 @@
             autoCollect: true,        // 自动收取设施产出（不耗体力）
             autoAssignPartner: true,  // 自动安排看场伙伴（畜牧倾向中挑特性最贴合、能力最强的）
         },
+
+        feed: {
+            enabled: false,          // 独立于水产总开关，仅投入商店的“均衡饲料”
+            autoBuy: true,
+            thresholdMode: 'percent', // percent = 容量百分比，units = 饲料份数
+            low: 20,
+            target: 80,
+            coinReserve: 1000,
+            maxSpendPerTick: 1000,
+        },
+        sailing: {
+            enabled: false,
+            autoCollect: true,
+            autoStart: false,
+            autoBuild: false,
+            autoUpgrade: false,
+            autoAssign: true,
+            reservePartners: true,
+            routeId: '',             // 必须在面板明确选择航线
+            supplyId: 'none',
+            partnerIds: '',          // JSON 数组；留空由空闲伙伴中选择
+            partySize: 1,
+            staminaReserve: 10,
+            coinReserve: 1000,
+            maxSpendPerTick: 1000,
+            upgradeLimit: 1,
+        },
+        taskItems: { enabled: true },
+        ui: { showGraphs: true, showLogs: true, compact: false, autoStart: true },
 
         achievements: {
             enabled: true,            // 有可领取的成就奖励时自动一键领取（枫火）
@@ -143,6 +186,43 @@
         rosterScanOnStart: true,      // 启动时自动扫描并打印角色库
     };
     /****************** 配置区结束 ******************/
+
+    // 标量设置统一持久化，兼容旧版开关；配置文件仍提供默认值。
+    let settingsRevision = 0;
+    const LEGACY_SETTINGS = {
+        'crafting.enabled': 'rlt-craft-enabled', 'aquatic.fishing': 'rlt-aquatic-fishing',
+        'aquatic.reserveBigCatch': 'rlt-aquatic-reserve-big', 'feed.enabled': 'rlt-feed-auto',
+        'livestock.autoCare': 'rlt-livestock-care', 'livestock.autoCollect': 'rlt-livestock-collect',
+        'livestock.autoAssignPartner': 'rlt-livestock-partner', 'partnerAutoSwap': 'rlt-partner-auto-swap',
+    };
+    function installSettings(object, prefix = '') {
+        for (const key of Object.keys(object)) {
+            const path = prefix ? `${prefix}.${key}` : key;
+            const fallback = object[key];
+            if (fallback && typeof fallback === 'object' && !Array.isArray(fallback)) {
+                installSettings(fallback, path);
+            } else if (['boolean', 'number', 'string'].includes(typeof fallback)) {
+                Object.defineProperty(object, key, {
+                    enumerable: true, configurable: true,
+                    get() {
+                        const legacy = LEGACY_SETTINGS[path] && getOverride(LEGACY_SETTINGS[path]);
+                        if (legacy != null) return legacy !== 'off';
+                        try {
+                            const value = JSON.parse(getOverride(`rlt-setting:${path}`) ?? 'null');
+                            return typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value)) ? value : fallback;
+                        } catch { return fallback; }
+                    },
+                    set(value) { setSetting(path, value); },
+                });
+            }
+        }
+    }
+    function setting(path) { return path.split('.').reduce((value, key) => value?.[key], CONFIG); }
+    function setSetting(path, value) {
+        setOverride(`rlt-setting:${path}`, JSON.stringify(value));
+        if (LEGACY_SETTINGS[path]) setOverride(LEGACY_SETTINGS[path], value ? 'on' : 'off');
+    }
+    installSettings(CONFIG);
 
     const API = '/api/red-leaf-town';
 
@@ -241,7 +321,7 @@
         requireArray('inventory');
         requireArray('plots', CONFIG.farming.enabled);
         requireArray('crops', CONFIG.farming.enabled);
-        requireArray('shop', CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds);
+        requireArray('shop', (CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds) || CONFIG.feed.enabled);
         requireArray('gathering_sites', CONFIG.gathering.enabled);
         requireArray('mining_sites', CONFIG.mining.enabled);
         const needsSafeInventory = (CONFIG.commissions.enabled && CONFIG.commissions.autoTake) ||
@@ -257,7 +337,8 @@
             (CONFIG.gathering.enabled && CONFIG.gathering.autoAssignPartner) ||
             (CONFIG.mining.enabled && CONFIG.mining.autoAssignPartner) ||
             (craftingEnabled() && CONFIG.crafting.autoAssignPartner) ||
-            (CONFIG.aquatic.enabled && CONFIG.aquatic.autoAssignPartner);
+            (CONFIG.aquatic.enabled && CONFIG.aquatic.autoAssignPartner) ||
+            (CONFIG.livestock.enabled && CONFIG.livestock.autoAssignPartner) || CONFIG.sailing.enabled;
         requireArray('partners', needsPartners);
         // 面板道具下拉和槽位级道具选择都依赖 task_items，任一产业启用即要求该字段
         const needsTaskItems = CONFIG.farming.enabled || CONFIG.gathering.enabled ||
@@ -447,9 +528,9 @@
     const sellItem = (itemId, qty, quality = 0) =>
         mutate(`/inventory/${itemId}/sell`, { payload: { quantity: qty, quality }, cue: 'action:sell' });
     const siteUrl = (industry, siteId) => `/${industry}/${industry === 'crafting' ? 'stations' : 'sites'}/${siteId}`;
-    const startSite = (industry, siteId, payloadKey, id, taskItemId = '') =>
+    const startSite = (industry, siteId, payloadKey, id, taskItemId = '', quantity = 1) =>
         mutate(`${siteUrl(industry, siteId)}/start`, {
-            payload: { [payloadKey]: id, task_item_id: taskItemId || '' }, cue: `action:start_${industry}`,
+            payload: { [payloadKey]: id, task_item_id: taskItemId || '', ...(industry === 'crafting' ? { quantity } : {}) }, cue: `action:start_${industry}`,
         });
     const collectSite = (industry, siteId) => mutate(`${siteUrl(industry, siteId)}/collect`, {
         cue: `action:collect_${industry}`,
@@ -503,6 +584,7 @@
     // ---------- 小面板 ----------
     const panel = document.createElement('div');
     panel.id = 'rlt-auto-helper-panel';
+    panel.setAttribute('aria-label', '红叶镇自动助手');
     panel.style.cssText = [
         'position:fixed', 'right:12px', 'bottom:12px', 'z-index:99999',
         'background:rgba(23,33,27,.92)', 'color:#e8e0cf', 'font:12px/1.6 monospace',
@@ -529,11 +611,22 @@
     const logBox = document.createElement('div');
     // 只有日志区滚动，按钮行始终固定在面板顶部
     logBox.style.cssText = 'margin-top:6px;white-space:pre-wrap;opacity:.85;max-height:32vh;overflow-y:auto';
-    panel.appendChild(toggleBtn);
-    panel.appendChild(updateBtn);
-    panel.appendChild(rosterBtn);
-    panel.appendChild(collapseBtn);
+    const brand = document.createElement('div');
+    brand.className = 'rlt-brand';
+    brand.innerHTML = '<span class="rlt-brand-icon" aria-hidden="true">🍁</span><div><strong>红叶镇 · 管理手册</strong><small>生产有序，远航可期 · v4.0.0</small></div>';
+    brand.appendChild(collapseBtn);
+    panel.appendChild(brand);
+    const toolbar = document.createElement('div');
+    toolbar.className = 'rlt-toolbar';
+    toolbar.append(toggleBtn, updateBtn, rosterBtn);
+    panel.appendChild(toolbar);
     panel.appendChild(statusLine);
+    const tabBar = document.createElement('nav');
+    tabBar.className = 'rlt-tabs';
+    tabBar.setAttribute('aria-label', '助手功能导航');
+    const dashboard = document.createElement('div');
+    dashboard.className = 'rlt-dashboard';
+    panel.append(tabBar, dashboard);
 
     // 槽位配置区：每块土地/采集点/矿点/加工站各一行下拉，选择记忆在 localStorage
     const configBox = document.createElement('div');
@@ -541,6 +634,315 @@
     panel.appendChild(configBox);
     panel.appendChild(logBox);
     document.body.appendChild(panel);
+    let activeDashboardPage = getOverride('rlt-ui-page') || 'overview';
+    let lastConfigState = null;
+    let lastConfigRevision = -1;
+    let lastConfigBusy = null;
+
+    function uiElement(tag, className, text) {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text != null) element.textContent = text;
+        return element;
+    }
+    function applyDashboardPage() {
+        const isCollapsed = panel.classList.contains('rlt-collapsed');
+        dashboard.style.display = !isCollapsed && activeDashboardPage === 'overview' ? '' : 'none';
+        configBox.style.display = !isCollapsed && activeDashboardPage !== 'overview' ? '' : 'none';
+        logBox.style.display = !isCollapsed && CONFIG.ui.showLogs ? '' : 'none';
+        panel.classList.toggle('rlt-compact', CONFIG.ui.compact);
+        panel.classList.toggle('rlt-no-graphs', !CONFIG.ui.showGraphs);
+        for (const group of configBox.querySelectorAll('[data-page]')) group.hidden = group.dataset.page !== activeDashboardPage;
+        for (const button of tabBar.children) {
+            const selected = button.dataset.page === activeDashboardPage;
+            button.classList.toggle('selected', selected);
+            button.setAttribute('aria-current', selected ? 'page' : 'false');
+        }
+    }
+    function initializeDashboard() {
+        const style = uiElement('style');
+        style.textContent = `
+        #rlt-auto-helper-panel{--rlt-text:#eef3e9;--rlt-muted:#adb9a9;--rlt-accent:#dca46d;--rlt-line:#3b493b;box-sizing:border-box;width:470px;max-width:calc(100vw - 24px)!important;max-height:calc(100dvh - 24px);display:flex;flex-direction:column;padding:16px!important;border:1px solid #687458!important;border-radius:20px!important;background:linear-gradient(145deg,#253328,#15211c)!important;box-shadow:0 18px 65px #0008;color:var(--rlt-text)!important;font:13px/1.6 system-ui,'Microsoft YaHei',sans-serif!important;overflow:hidden;color-scheme:dark}
+        #rlt-auto-helper-panel *{box-sizing:border-box}#rlt-auto-helper-panel button,#rlt-auto-helper-panel input,#rlt-auto-helper-panel select{font:inherit!important;line-height:1.45!important;border-radius:8px!important;min-height:30px;outline-offset:3px}
+        #rlt-auto-helper-panel button{cursor:pointer;transition:filter .15s}#rlt-auto-helper-panel button:hover{filter:brightness(1.16)}#rlt-auto-helper-panel button:disabled{opacity:.45;cursor:not-allowed}#rlt-auto-helper-panel :focus-visible{outline:2px solid var(--rlt-accent)}
+        #rlt-auto-helper-panel select{min-width:0;max-width:none!important;padding:5px 7px!important}#rlt-auto-helper-panel input{padding:5px!important}#rlt-auto-helper-panel small{font-size:11px;color:var(--rlt-muted)}
+        #rlt-auto-helper-panel .rlt-brand{display:flex;align-items:center;gap:10px;margin-bottom:12px}.rlt-brand>div{flex:1}.rlt-brand strong{display:block;font-size:18px;letter-spacing:1px}.rlt-brand small{display:block;margin-top:1px}.rlt-brand-icon{font-size:29px;background:#ffffff09;border:1px solid #a4855d66;border-radius:13px;padding:3px 8px}
+        #rlt-auto-helper-panel .rlt-toolbar{display:flex;gap:7px;margin-bottom:8px}#rlt-auto-helper-panel .rlt-toolbar button{flex:1;margin:0!important;padding:7px!important}.rlt-toolbar+span{font-size:11px;color:var(--rlt-muted);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:19px}
+        #rlt-auto-helper-panel .rlt-tabs{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:9px 0 11px;flex-shrink:0;border-bottom:1px solid var(--rlt-line)}#rlt-auto-helper-panel .rlt-tabs button{background:transparent;border:0;color:#adb9a9;padding:7px 0}#rlt-auto-helper-panel .rlt-tabs .selected{background:#dca46d;color:#20271c;font-weight:700}
+        #rlt-auto-helper-panel .rlt-dashboard{overflow:auto;min-height:0;padding:12px 2px 4px;max-height:52vh;scrollbar-width:thin}.rlt-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.rlt-stat{background:#ffffff06;border:1px solid var(--rlt-line);border-radius:12px;padding:10px}.rlt-stat strong{display:block;font-size:20px;font-variant-numeric:tabular-nums}.rlt-stat small{display:block}.rlt-meter{height:6px;border-radius:6px;background:#080e0980;overflow:hidden;margin:8px 0 3px}.rlt-meter>i{height:100%;display:block;background:linear-gradient(90deg,#7d9c69,#c9d49e);border-radius:6px;transition:width .5s}.rlt-section-label{font-size:12px;letter-spacing:1px;color:#dca46d;margin:16px 0 8px}.rlt-work{padding:9px 11px;background:#ffffff05;border:1px solid var(--rlt-line);border-radius:10px;margin:6px 0}.rlt-work-head{display:flex;justify-content:space-between;gap:8px}.rlt-work-head>span:last-child{color:var(--rlt-muted);font-size:11px}.rlt-empty{color:var(--rlt-muted);font-size:12px;margin:8px 0}.rlt-voyage{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px dashed #8ba39855;color:#9db9b5}.rlt-voyage b{font-size:26px}.rlt-warning{color:#e4b185;font-size:12px;margin:8px 0}.rlt-note{color:var(--rlt-muted);font-size:12px;margin:7px 0}.rlt-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+        #rlt-auto-helper-panel .rlt-group{border:1px solid var(--rlt-line);border-radius:12px;background:#ffffff04;padding:9px 11px;margin:8px 0}#rlt-auto-helper-panel .rlt-group[hidden]{display:none}#rlt-auto-helper-panel .rlt-group-title{width:100%;text-align:left;border:0;background:none;color:var(--rlt-text);font-weight:700;margin:0!important;padding:2px 0 6px}#rlt-auto-helper-panel .rlt-group-title+div{margin:0!important;padding:0!important;border:0!important}#rlt-auto-helper-panel .rlt-switch{margin-left:auto!important;min-width:78px;border-radius:16px!important;padding:4px 10px!important}#rlt-auto-helper-panel .rlt-switch[aria-checked=true]::before{content:'● ';font-size:9px}#rlt-auto-helper-panel .rlt-switch[aria-checked=false]::before{content:'○ ';font-size:9px}
+        #rlt-auto-helper-panel .rlt-group label{display:block}#rlt-auto-helper-panel .rlt-group .rlt-work{margin:9px 0}#rlt-auto-helper-panel .rlt-status-chip{display:inline-block;color:#d6dfb9;background:#8ead7118;padding:2px 8px;border-radius:10px}#rlt-auto-helper-panel .rlt-no-graphs .rlt-meter{display:none}
+        #rlt-auto-helper-panel.rlt-no-graphs .rlt-meter,#rlt-auto-helper-panel.rlt-no-graphs .rlt-voyage{display:none}#rlt-auto-helper-panel.rlt-collapsed{width:280px}#rlt-auto-helper-panel.rlt-collapsed>:not(.rlt-brand){display:none!important}#rlt-auto-helper-panel.rlt-collapsed .rlt-brand{margin:0}#rlt-auto-helper-panel.rlt-compact{padding:10px!important;font-size:12px!important}#rlt-auto-helper-panel.rlt-compact .rlt-group{padding:6px 9px}.rlt-footer{font-size:10px;color:#91a18a;margin-top:12px}
+        @media(max-width:540px){#rlt-auto-helper-panel{right:8px!important;left:auto!important;bottom:8px!important;max-width:calc(100vw - 16px)!important;padding:11px!important;border-radius:14px!important}.rlt-brand strong{font-size:16px}#rlt-auto-helper-panel .rlt-group select{font-size:11px!important}.rlt-stats{gap:5px}.rlt-stat{padding:7px}.rlt-stat strong{font-size:17px}}
+        @media(prefers-reduced-motion:reduce){#rlt-auto-helper-panel *{transition:none!important}}
+        `;
+        document.head.appendChild(style);
+        const pages = [['overview', '概览'], ['production', '生产'], ['crafting', '加工'], ['sailing', '航海'], ['feed', '饲料'], ['settings', '设置']];
+        if (!pages.some(([id]) => id === activeDashboardPage)) activeDashboardPage = 'overview';
+        for (const [id, name] of pages) {
+            const button = uiElement('button', '', name);
+            button.dataset.page = id;
+            button.onclick = () => {
+                activeDashboardPage = id; setOverride('rlt-ui-page', id);
+                refreshConfigRows(runtime.state || getPageStore('game')?.state || { inventory: [] });
+                applyDashboardPage();
+            };
+            tabBar.appendChild(button);
+        }
+        configBox.style.cssText = 'min-height:0;max-height:54vh;overflow:auto;scrollbar-width:thin;padding:2px';
+        logBox.style.cssText = 'font-size:11px;white-space:pre-wrap;max-height:100px;flex-shrink:1;overflow:auto;border-top:1px solid #3b493b;margin-top:10px;padding-top:8px;scrollbar-width:thin';
+        configBox.addEventListener('focusout', () => setTimeout(() => refreshConfigRows(runtime.state || getPageStore('game')?.state || { inventory: [] }), 0));
+        // 每秒只更新可见图形，不触发游戏请求，也不打断配置输入。
+        setInterval(() => {
+            if (!document.hidden && activeDashboardPage === 'overview' && !panel.classList.contains('rlt-collapsed')) {
+                renderDashboard(runtime.state || getPageStore('game')?.state || { inventory: [] });
+            }
+        }, 1000);
+        applyDashboardPage();
+    }
+    function durationLabel(seconds) {
+        const value = Math.max(0, Math.ceil(Number(seconds) || 0));
+        if (value >= 3600) return `${Math.floor(value / 3600)}时${Math.floor(value % 3600 / 60)}分`;
+        return value >= 60 ? `${Math.floor(value / 60)}分${value % 60}秒` : `${value}秒`;
+    }
+    function meter(value, label) {
+        const bar = uiElement('div', 'rlt-meter');
+        bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', label);
+        const percent = Math.max(0, Math.min(100, Number(value) || 0));
+        bar.setAttribute('aria-valuenow', String(Math.round(percent))); bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
+        const fill = uiElement('i'); fill.style.width = `${percent}%`; bar.appendChild(fill);
+        return bar;
+    }
+    function workCard(name, status, percent = null, note = '') {
+        const card = uiElement('div', 'rlt-work');
+        const head = uiElement('div', 'rlt-work-head'); head.append(uiElement('strong', '', name), uiElement('span', '', status));
+        card.appendChild(head);
+        if (percent != null) card.appendChild(meter(percent, name));
+        if (note) card.appendChild(uiElement('small', '', note));
+        return card;
+    }
+    function renderDashboard(state) {
+        if (!state || activeDashboardPage !== 'overview') return;
+        const scroll = dashboard.scrollTop;
+        dashboard.replaceChildren();
+        if (!state.player) { dashboard.appendChild(uiElement('p', 'rlt-empty', '登录游戏后显示生产概况。可先切换标签配置各功能。')); return; }
+        const now = serverNowSeconds(), stats = uiElement('div', 'rlt-stats');
+        const stamina = liveStamina(state), cap = Number(state.player.stamina_cap || 0);
+        const values = [['⚡ 体力', `${Math.floor(stamina)} / ${cap}`, cap ? stamina / cap * 100 : 0], ['◈ 红叶币', playerCoins(state).toLocaleString(), null], ['▣ 库存估值', Math.round(inventoryTotalValue(state)).toLocaleString(), null]];
+        for (const [name, value, percent] of values) {
+            const card = uiElement('div', 'rlt-stat'); card.append(uiElement('small', '', name), uiElement('strong', '', value));
+            if (percent != null) card.appendChild(meter(percent, name)); stats.appendChild(card);
+        }
+        dashboard.append(stats, uiElement('h3', 'rlt-section-label', '生产进度'));
+        let count = 0;
+        const groups = [['农田', state.plots, 'farming'], ['采集', state.gathering_sites, 'gathering'], ['采矿', state.mining_sites, 'mining'], ['加工', state.crafting_stations, 'crafting']];
+        for (const [name, nodes, industry] of groups) for (const node of nodes || []) {
+            if (node.empty) continue;
+            count++;
+            const readyAt = taskReadyAt(node), started = Number(node.task_snapshot?.started_at ?? node.planted_at ?? node.started_at ?? 0);
+            const progress = node.ready ? 100 : started > 0 && readyAt > started ? (now - started) / (readyAt - started) * 100 : null;
+            const readyCount = Number(node.completed_count || 0);
+            const status = industry === 'crafting' && readyCount > 0 ? `${readyCount} 份可领` : node.ready ? '待领取' : readyAt > now ? durationLabel(readyAt - now) : '等待结算';
+            const nameText = node.definition?.name || `${name} ${node.slot != null ? Number(node.slot) + 1 : node.site_id ?? node.station_id}`;
+            dashboard.appendChild(workCard(nameText, status, progress, node.recipe?.name || node.crop?.name || node.task?.name || ''));
+        }
+        if (!count) dashboard.appendChild(uiElement('p', 'rlt-empty', '暂无进行中的生产任务'));
+        const sail = state.sailing?.active_run;
+        dashboard.appendChild(uiElement('h3', 'rlt-section-label', '航海与饲料'));
+        if (sail) {
+            const sea = uiElement('div', 'rlt-voyage'); sea.append(uiElement('span', '', '红叶港'), uiElement('b', '', '⛵'), uiElement('span', '', sail.route_name || '远方海域')); dashboard.appendChild(sea);
+            dashboard.appendChild(workCard(sail.route_name || '航海', sail.ready_at <= now ? '已回港' : durationLabel(sail.ready_at - now), (now - sail.started_at) / Math.max(1, sail.ready_at - sail.started_at) * 100));
+        } else dashboard.appendChild(workCard('初帆号', CONFIG.sailing.enabled ? '港口待命' : '自动航海关闭'));
+        const slot = state.aquatic?.feed_slot;
+        if (slot) {
+            const bounds = feedThresholds(slot);
+            dashboard.appendChild(workCard('均衡饲料', `${Math.floor(slot.units)} / ${slot.capacity} 份`, slot.units / slot.capacity * 100,
+                bounds.valid ? `底限 ${Math.floor(bounds.low)} → 目标 ${Math.ceil(bounds.target)} 份 · ${autoFeedEnabled() ? '自动补充' : '自动补充关闭'}` : '请检查上下限设置'));
+        }
+        dashboard.appendChild(uiElement('div', 'rlt-footer', `状态同步 ${state.server_time ? new Date(state.server_time * 1000).toLocaleTimeString() : '待同步'} · ${running ? '助手运行中' : '助手已停止'}`));
+        dashboard.scrollTop = scroll;
+    }
+    function appendSetting(body, state, path, label, options = {}) {
+        const value = setting(path);
+        if (typeof value === 'boolean') {
+            body.appendChild(makeToggleRow(state, label, options.title || label, value, () => setSetting(path, !setting(path))));
+        } else if (typeof value === 'number') {
+            body.appendChild(makeNumberRow(label, value, { min: 0, title: label, ...options, onchange: number => setSetting(path, number) }));
+        } else if (options.choices) {
+            const { row, select } = makeSelectRow(label, options.title || label);
+            fillSelect(select, options.choices, value || null, options.empty || '请选择');
+            select.onchange = () => { setSetting(path, select.value); if (path.startsWith('feed.')) setOverride(FEED_FILL_KEY, ''); wakeSoon(); };
+            body.appendChild(row);
+        }
+    }
+    function renderModuleSettings(state) {
+        const sections = [
+            ['农场开关', 'production', [['farming.enabled', '农场总开关'], ['farming.autoCollect', '自动收获'], ['farming.autoPlant', '自动种植'], ['farming.autoBuySeeds', '自动买种'], ['farming.autoSellForSeeds', '卖出余料凑种子钱'], ['farming.autoAssignPartner', '农场伙伴派驻']]],
+            ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
+            ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
+            ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '自动提交队列'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.repeatPipeline', '流程完成后循环'], ['crafting.batchLimit', '每次最多份数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
+            ['均衡饲料策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
+            ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
+            ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
+        ];
+        for (const [title, page, fields] of sections) {
+            const { group, body } = makeGroup(title, page);
+            for (const [path, label, options] of fields) appendSetting(body, state, path, label, options || {});
+            if (page === 'feed') {
+                body.appendChild(uiElement('p', 'rlt-note', '只购买并投入商店中的“均衡饲料”。达到底限后补至目标；整件投料可能略超目标，始终不超容量。预算为 0 时不购买。'));
+                const slot = state.aquatic?.feed_slot;
+                if (slot) {
+                    const bounds = feedThresholds(slot);
+                    body.appendChild(workCard('饲料余量', `${Math.floor(slot.units)} / ${slot.capacity} 份`, slot.units / slot.capacity * 100,
+                        bounds.valid ? `触发 ${Math.floor(bounds.low)} 份 → 补至 ${Math.ceil(bounds.target)} 份` : '上下限无效，自动补料暂停'));
+                }
+            }
+            if (page === 'crafting') body.appendChild(uiElement('p', 'rlt-note', '流程按已领取份数推进。暂停后续提交不会取消服务器队列；总开关关闭后，自动领取也会暂停。'));
+            configBox.appendChild(group);
+        }
+        const { group, body } = makeGroup('鱼塘与大物设置', 'production');
+        appendSetting(body, state, 'aquatic.autoHarvestPonds', '自动捞成鱼');
+        appendSetting(body, state, 'aquatic.autoStockPonds', '自动补鱼苗');
+        appendSetting(body, state, 'aquatic.pondKeepStock', '成鱼保留尾数');
+        appendSetting(body, state, 'aquatic.pondRestockTarget', '补苗目标尾数');
+        appendSetting(body, state, 'aquatic.bigCatch', '大物处理', { choices: [{ value: 'fight', text: '体力够时挑战' }, { value: 'release', text: '放线' }, { value: 'manual', text: '暂停并手动处理' }] });
+        configBox.appendChild(group);
+    }
+
+    function makeCraftQueueCard(state, node) {
+        const id = node.station_id, flight = craftFlight(id), steps = configuredCraftSteps(id);
+        const progress = craftPipelineProgress(id, steps);
+        const total = steps.reduce((sum, step) => sum + step.times, 0);
+        const done = progress.done.reduce((sum, value) => sum + value, 0);
+        const card = workCard(node.definition?.name || `加工点 ${id}`,
+            flight?.phase === 'uncertain' ? '需要核对' : node.empty ? '空闲' : `${Number(node.completed_count || 0)} 份可领取`,
+            total ? done / total * 100 : null,
+            total ? `流程已领取 ${done} / ${total} 份` : '锁定配方可设置总份数，0 为持续生产');
+        if (!node.empty) card.appendChild(uiElement('p', 'rlt-note', `队列 ${node.queue_total || flight?.quantity || 1} 份 · 待加工 ${node.queued_count || 0} 份 · 剩余约 ${durationLabel(node.queue_remaining_seconds || Math.max(0, taskReadyAt(node) - serverNowSeconds()))}`));
+        const paused = getOverride(`rlt-craft-paused:${id}`) === '1';
+        card.appendChild(makeToggleRow(state, '本站允许提交', '只控制后续开工，已提交的队列继续执行', !paused, () => setOverride(`rlt-craft-paused:${id}`, paused ? '' : '1')));
+        if (progress.legacy) card.appendChild(uiElement('p', 'rlt-warning', '旧版以开工次数计数，请在本站空闲时重置为新版领取进度。'));
+        if (steps.length) {
+            const reset = uiElement('button', '', '重置本站进度');
+            reset.disabled = !!flight || !node.empty || busy;
+            reset.onclick = () => {
+                const fresh = nodeById(runtime.state || state, 'crafting', id);
+                if (busy || !fresh?.empty || craftFlight(id)) return;
+                if (!window.confirm('将已领取进度归零，下次从头执行当前配置。是否重置？')) return;
+                resetCraftPipeline(id); reset.blur(); wakeSoon(); refreshConfigRows(runtime.state || state);
+            };
+            card.appendChild(reset);
+        }
+        if (flight?.phase === 'uncertain') {
+            card.appendChild(uiElement('p', 'rlt-warning', flight.reason || '请核对游戏中的加工状态'));
+            const actions = uiElement('div', 'rlt-actions');
+            const count = makeNumberInput(flight.credited, { min: flight.credited, max: flight.quantity, title: '本批累计已领取份数（不是队列总数）' });
+            const settle = uiElement('button', '', '确认已领取份数');
+            settle.disabled = busy || !node.empty;
+            settle.title = '队列结束后填写本批累计已领取数量；未完成份数仍留在流程中';
+            settle.onclick = () => {
+                const fresh = nodeById(runtime.state || state, 'crafting', id);
+                const current = craftFlight(id);
+                if (busy || !fresh?.empty || !current) return;
+                const value = Math.min(current.quantity, Math.max(current.credited, Math.floor(Number(count.value) || 0)));
+                if (!window.confirm(`确认本批已累计领取 ${value} / ${current.quantity} 份？流程将按此数量结算。`)) return;
+                creditCraftFlight(id, value - current.credited); saveCraftFlight(id, null);
+                settle.blur(); wakeSoon(); refreshConfigRows(runtime.state || state);
+            };
+            actions.append(count, settle); card.appendChild(actions);
+            if (!node.empty) {
+                const adopt = uiElement('button', '', '确认这是本批队列');
+                adopt.disabled = busy;
+                adopt.onclick = () => {
+                    const fresh = nodeById(runtime.state || state, 'crafting', id), current = craftFlight(id);
+                    if (busy || !fresh || fresh.empty || !current) return;
+                    const recipeId = fresh.recipe?.id ?? fresh.recipe?.recipe_id ?? fresh.task_snapshot?.recipe_id;
+                    if (!sameId(recipeId, current.recipeId) || Number(fresh.queue_total || 1) !== current.quantity) {
+                        log('当前配方或队列数量与本批不符，无法接管'); return;
+                    }
+                    if (!window.confirm('确认游戏中当前队列由本次助手提交？确认后恢复自动领取与计数。')) return;
+                    current.phase = 'active'; current.reason = ''; saveCraftFlight(id, current);
+                    adopt.blur(); wakeSoon(); refreshConfigRows(runtime.state || state);
+                };
+                card.appendChild(adopt);
+            }
+        }
+        if (!node.empty && node.task_snapshot && Number(node.queued_count || 0) >= 0) {
+            const cancel = uiElement('button', '', '取消本站队列');
+            cancel.disabled = !running || busy;
+            cancel.onclick = () => {
+                if (!running || busy) return;
+                if (!window.confirm('取消会损失当前一份的投入；未开始部分退回，已完成产物保留。本站后续提交会暂停。是否继续？')) return;
+                runtime.cancelCraft = { id, recipeId: node.recipe?.id ?? node.task_snapshot?.recipe_id, readyAt: taskReadyAt(node) };
+                setOverride(`rlt-craft-paused:${id}`, '1');
+                wakeSoon(); cancel.disabled = true;
+            };
+            card.appendChild(cancel);
+        }
+        return card;
+    }
+    async function processCraftCancel() {
+        const request = runtime.cancelCraft;
+        if (!request) return;
+        runtime.cancelCraft = null;
+        const node = nodeById(runtime.state, 'crafting', request.id);
+        const recipeId = node?.recipe?.id ?? node?.task_snapshot?.recipe_id;
+        if (!node || node.empty || taskReadyAt(node) !== request.readyAt || !sameId(recipeId, request.recipeId)) {
+            log('加工队列已变化，本次取消未执行，请重新查看'); return;
+        }
+        try {
+            await mutate('/tasks/cancel', { payload: { industry: 'crafting', slot_id: String(request.id) }, cue: 'action:cancel_crafting' });
+            const flight = craftFlight(request.id), fresh = nodeById(runtime.state, 'crafting', request.id);
+            if (flight) {
+                flight.quantity = flight.credited + Number(fresh?.completed_count || 0);
+                flight.phase = 'active';
+                saveCraftFlight(request.id, flight.quantity > flight.credited ? flight : null);
+            }
+            log(`加工点 ${request.id}：队列已取消，本站后续提交已暂停，已完成产物仍可领取`);
+        } catch (error) {
+            const flight = craftFlight(request.id);
+            if (flight && (uncertainWrite(error) || error.code === 'aborted')) {
+                flight.phase = 'uncertain'; flight.reason = '取消结果待核对'; saveCraftFlight(request.id, flight);
+            }
+            throw error;
+        }
+    }
+    function renderSailingSettings(state) {
+        const { group, body } = makeGroup('航海', 'sailing');
+        const fields = [['sailing.enabled', '航海总开关'], ['sailing.autoCollect', '到港自动领取'], ['sailing.autoStart', '自动再次出航'], ['sailing.autoBuild', '自动建造初帆号'], ['sailing.autoUpgrade', '自动改装船舶'], ['sailing.upgradeLimit', '改装目标等级', { min: 1, max: 3 }], ['sailing.autoAssign', '未指定时选择空闲伙伴'], ['sailing.reservePartners', '为航海保留指定伙伴'], ['sailing.partySize', '自动选人数量', { min: 1, max: 3 }], ['sailing.staminaReserve', '出航后体力保底'], ['sailing.coinReserve', '花费后金币保底'], ['sailing.maxSpendPerTick', '每轮花费预算']];
+        for (const [path, label, options] of fields) appendSetting(body, state, path, label, options || {});
+        const sail = state.sailing;
+        if (!sail?.unlocked) body.appendChild(uiElement('p', 'rlt-note', '航海尚未解锁或游戏数据未加载。开关与预算可提前设置。'));
+        appendSetting(body, state, 'sailing.routeId', '航线', { choices: (sail?.routes || []).map(route => ({ value: route.id, text: `${route.name} · ${durationLabel(route.duration)} · ${route.coins} 币 / ${route.stamina} 体力`, disabled: !route.unlocked })), empty: '请选择航线（未选不出航）' });
+        appendSetting(body, state, 'sailing.supplyId', '航海补给', { choices: [{ value: 'none', text: '基础补给' }, ...(sail?.supplies || []).filter(supply => supply.id !== 'none').map(supply => ({ value: supply.id, text: `${supply.name} · ${supply.owned ?? 0}/${supply.quantity ?? 0}` }))], empty: '请选择补给' });
+        const selected = sailingConfiguredIds();
+        for (let index = 0; index < 3; index++) {
+            const { row, select } = makeSelectRow(`伙伴 ${index + 1}`, '明确指定的伙伴忙碌时等待，不撤销其他岗位派驻');
+            fillSelect(select, (state.partners || []).map(partner => ({ value: partnerRecordId(partner), text: `${partner.name}${partner.locked ? '（忙碌）' : ''}`, disabled: selected.some((id, slot) => slot !== index && sameId(id, partnerRecordId(partner))) })), selected[index] || null, '不指定');
+            select.onchange = () => {
+                const next = [...selected]; next[index] = select.value;
+                setSetting('sailing.partnerIds', JSON.stringify(next.filter(Boolean))); wakeSoon();
+            };
+            body.appendChild(row);
+        }
+        body.appendChild(uiElement('p', 'rlt-note', '指定任一伙伴后严格使用指定队伍；全部留空才自动选人。自动出航优先于本轮生产派驻。建造、改装、出航共用每轮预算。'));
+        if (sail?.active_run) {
+            const run = sail.active_run, now = serverNowSeconds();
+            body.appendChild(workCard(run.route_name || '航海', run.ready_at <= now ? '已回港，等待领取' : durationLabel(run.ready_at - now), (now - run.started_at) / Math.max(1, run.ready_at - run.started_at) * 100));
+        }
+        if (readJson(SAILING_INTENT_KEY) && !sail?.active_run) {
+            body.appendChild(uiElement('p', 'rlt-warning', '上次出航结果未确认，已暂停重复出航。请先在游戏中检查船只状态。'));
+            const clear = uiElement('button', '', '确认当前没有航程');
+            clear.disabled = busy;
+            clear.onclick = () => {
+                if (busy || (runtime.state || state).sailing?.active_run) return;
+                if (!window.confirm('确认已经在游戏中检查，当前没有进行中的航程？清除后将重新规划出航。')) return;
+                setOverride(SAILING_INTENT_KEY, ''); clear.blur(); wakeSoon(); refreshConfigRows(runtime.state || state);
+            };
+            body.appendChild(clear);
+        }
+        configBox.appendChild(group);
+    }
 
     // ---------- 槽位级覆盖配置（localStorage 记忆） ----------
     function getOverride(key) {
@@ -550,6 +952,7 @@
     function setOverride(key, value) {
         if (value === null || value === '') localStorage.removeItem(key); // 不留下空串键
         else localStorage.setItem(key, value);
+        settingsRevision++;
     }
     const plotCropKey = slot => `rlt-plot-crop:${slot}`;
     const nodeJobKey = (industry, id) => `rlt-node-job:${industry}:${id}`;
@@ -602,19 +1005,19 @@
         const done = steps.map((_, i) =>
             Math.max(0, Math.floor(Number(saved?.sig === sig ? saved?.done?.[i] : 0) || 0)));
         const stepIndex = steps.findIndex((s, i) => done[i] < s.times);
-        return { done, finished: stepIndex === -1, stepIndex };
+        return { done, finished: stepIndex === -1, stepIndex, legacy: saved?.sig === sig && saved?.version !== 2 };
     }
 
-    function advanceCraftPipeline(stationId, steps, stepIndex) {
+    function advanceCraftPipeline(stationId, steps, stepIndex, count = 1) {
         const prog = craftPipelineProgress(stationId, steps);
         if (stepIndex < 0 || stepIndex >= steps.length) return prog;
-        prog.done[stepIndex] += 1;
-        setOverride(craftPipelineProgKey(stationId), JSON.stringify({ sig: craftPipelineSig(steps), done: prog.done }));
+        prog.done[stepIndex] = Math.min(steps[stepIndex].times, prog.done[stepIndex] + Math.max(0, count));
+        setOverride(craftPipelineProgKey(stationId), JSON.stringify({ version: 2, sig: craftPipelineSig(steps), done: prog.done }));
         return craftPipelineProgress(stationId, steps);
     }
 
     function resetCraftPipeline(stationId) {
-        localStorage.removeItem(craftPipelineProgKey(stationId));
+        setOverride(craftPipelineProgKey(stationId), '');
     }
 
     // 流程启停：默认停止，面板「开始」后置 '1'；停止不清进度，开始后从当前进度继续
@@ -623,6 +1026,114 @@
 
     // 锁定配方批次数：0/未设置 = 不限；设 N = 做满 N 批后停工（与流程共用进度存储，靠签名区分模式）
     const craftLockTimesKey = stationId => `rlt-craft-lock-times:${stationId}`;
+
+    const craftFlightKey = id => `rlt-craft-flight:${id}`;
+    function readJson(key, fallback = null) {
+        try { return JSON.parse(getOverride(key) || 'null') ?? fallback; } catch { return fallback; }
+    }
+    function craftFlight(id) { return readJson(craftFlightKey(id)); }
+    function saveCraftFlight(id, value) { setOverride(craftFlightKey(id), value ? JSON.stringify(value) : ''); }
+    function configuredCraftSteps(id) {
+        const selected = nodeJobOverride('crafting', id);
+        if (selected === NODE_JOB_OFF_RELEASE || selected === NODE_JOB_OFF_KEEP) return [];
+        if (selected == null) return craftPipelineSteps(id);
+        const times = Math.max(0, Math.floor(Number(getOverride(craftLockTimesKey(id))) || 0));
+        return times ? [{ recipeId: selected, times, taskItemId: '' }] : [];
+    }
+    function craftCollectable(node) {
+        return !!node && (Number(node.completed_count || 0) > 0 || (!node.empty && node.ready));
+    }
+    function creditCraftFlight(id, count) {
+        const flight = craftFlight(id);
+        if (!flight) return;
+        const amount = Math.min(Math.max(0, count), flight.quantity - flight.credited);
+        if (amount <= 0) return;
+        if (flight.steps?.length) advanceCraftPipeline(id, flight.steps, flight.stepIndex, amount);
+        flight.credited += amount;
+        saveCraftFlight(id, flight);
+    }
+    // 服务端队列计数用于恢复刷新/手动领取；不能确认归属或结果时只暂停这个站点。
+    function reconcileCraftFlights(state) {
+        for (const node of state.crafting_stations || []) {
+            const id = node.station_id;
+            let flight = craftFlight(id);
+            if (!flight) continue;
+            const recipe = node.recipe?.id ?? node.recipe?.recipe_id ?? node.task_snapshot?.recipe_id;
+            if (flight.phase === 'submitting') {
+                flight.phase = 'uncertain';
+                flight.reason = '开工结果未确认，请核对游戏队列';
+                saveCraftFlight(id, flight);
+            }
+            if (flight.phase === 'uncertain') continue;
+            if (recipe != null && !sameId(recipe, flight.recipeId) && !node.empty) {
+                flight.phase = 'uncertain'; flight.reason = '检测到其他加工队列，请核对本批已领取份数';
+                saveCraftFlight(id, flight); continue;
+            }
+            const collected = Number(node.collected_count || 0);
+            if (collected > flight.observedCollected) creditCraftFlight(id, collected - flight.observedCollected);
+            flight = craftFlight(id);
+            flight.observedCollected = Math.max(flight.observedCollected, collected);
+            if (flight.credited >= flight.quantity && node.empty) {
+                saveCraftFlight(id, null);
+            } else if (node.empty && flight.credited < flight.quantity) {
+                flight.phase = 'uncertain'; flight.reason = '队列已结束或取消，无法确认剩余部分是否领取';
+                saveCraftFlight(id, flight);
+            } else saveCraftFlight(id, flight);
+        }
+    }
+    function craftBatchSize(state, node, plan) {
+        const cfg = CONFIG.crafting;
+        let count = cfg.batchEnabled ? Math.min(99, Math.max(1, Math.floor(cfg.batchLimit))) : 1;
+        if (plan.pipeline) count = Math.min(count, plan.pipeline.steps[plan.pipeline.stepIndex].times - plan.pipeline.done[plan.pipeline.stepIndex]);
+        const cost = Number(plan.job.stamina_cost || 0);
+        if (cost > 0) count = Math.min(count, Math.floor(Math.max(0, liveStamina(state) - cfg.staminaReserve) / cost));
+        const totals = new Map();
+        for (const input of plan.job.inputs || []) {
+            const key = input.item_id ?? input.item?.item_id;
+            const qty = Number(input.quantity);
+            if (key == null || !Number.isFinite(qty) || qty <= 0) return 0;
+            totals.set(String(key), (totals.get(String(key)) || 0) + qty);
+        }
+        for (const [itemId, quantity] of totals) {
+            const safe = safeUnspecifiedConsumeQty(state, itemId, '', { reserveCraftingInputs: false, applyKeep: false });
+            count = Math.min(count, Math.floor(safe / quantity));
+        }
+        if (plan.taskItem) {
+            const keep = Math.max(0, Number(getOverride(nodeTaskItemKeepKey('crafting', node.station_id))) || 0);
+            const available = Math.max(0, Number(plan.taskItem.quantity || 0) - keep);
+            // 服务端按队列逐份预留道具。保留量非零时，限制批量，禁止服务器动用保留部分。
+            if (keep > 0 || !cfg.partialTaskItems) count = Math.min(count, available);
+        }
+        return Math.max(0, Math.floor(count));
+    }
+    function uncertainWrite(error) {
+        return !isControlFlowError(error) && (isFatalTickError(error) || error?.code === 'invalid_state');
+    }
+    async function startCraftPlan(plan) {
+        const beforeState = runtime.state;
+        const quantity = craftBatchSize(runtime.state, plan.node, plan);
+        if (!quantity) return false;
+        const flight = {
+            phase: 'submitting', recipeId: jobId(plan.job), quantity, credited: 0, observedCollected: 0,
+            steps: plan.pipeline?.steps || [], stepIndex: plan.pipeline?.stepIndex ?? 0,
+            taskItemChoice: plan.pipeline?.taskItemId || null,
+        };
+        saveCraftFlight(plan.id, flight); // 写前保存，刷新和网络结果不确定时不会重复开工。
+        try {
+            await startSite('crafting', plan.id, 'recipe_id', flight.recipeId, plan.taskItemId ?? '', quantity);
+            flight.phase = 'active';
+            saveCraftFlight(plan.id, flight);
+            log(`加工点 ${plan.id}：已提交「${plan.job.name || flight.recipeId}」×${quantity}，领取后累计流程进度`);
+            return true;
+        } catch (error) {
+            // aborted 也可能发生在请求已经发出后，保留待核对记录。
+            if (uncertainWrite(error) || error?.code === 'aborted' || runtime.state !== beforeState) {
+                flight.phase = 'uncertain'; flight.reason = '开工返回中断，请核对已提交的队列';
+                saveCraftFlight(plan.id, flight);
+            } else saveCraftFlight(plan.id, null);
+            throw error;
+        }
+    }
 
     // 自动垂钓总开关：配置允许 + 面板未手动关闭（面板开关优先，记忆在 localStorage）
     function fishingEnabled() {
@@ -663,7 +1174,7 @@
 
     // 自动投料开关（饲料槽水产/畜牧共用）：面板开关优先，缺省回退配置文件（默认关闭）
     const FEED_AUTO_KEY = 'rlt-feed-auto';
-    const autoFeedEnabled = () => livestockFlag(FEED_AUTO_KEY, CONFIG.aquatic.autoFeed);
+    const autoFeedEnabled = () => CONFIG.feed.enabled;
 
     // 加工总开关：面板开关优先（'on'/'off'），缺省回退配置文件
     const CRAFT_ENABLED_KEY = 'rlt-craft-enabled';
@@ -722,9 +1233,12 @@
     const groupCollapseKey = name => `rlt-group-collapsed:${name}`;
 
     // 分组容器：标题点击折叠/展开
-    function makeGroup(title) {
+    function makeGroup(title, page = null) {
         const group = document.createElement('div');
-        const header = document.createElement('div');
+        group.className = 'rlt-group';
+        group.dataset.page = page || ({ '加工': 'crafting', '航海': 'sailing', '饲料槽': 'feed', '伙伴': 'settings' }[title] || 'production');
+        const header = document.createElement('button');
+        header.className = 'rlt-group-title';
         header.style.cssText = 'margin-top:5px;cursor:pointer;user-select:none;font-weight:bold;opacity:.85;transition:opacity .15s';
         header.title = '点击折叠/展开';
         header.onmouseenter = () => { header.style.opacity = '1'; };
@@ -734,6 +1248,7 @@
         const isCollapsed = () => localStorage.getItem(groupCollapseKey(title)) === '1';
         const render = () => {
             header.textContent = `${isCollapsed() ? '▸' : '▾'} ${title}`;
+            header.setAttribute('aria-expanded', String(!isCollapsed()));
             body.style.display = isCollapsed() ? 'none' : '';
         };
         header.onclick = () => {
@@ -755,12 +1270,17 @@
         label.style.cssText = 'opacity:.8;white-space:nowrap';
         const btn = document.createElement('button');
         btn.textContent = on ? '开启中' : '已关闭';
+        btn.className = 'rlt-switch';
+        btn.setAttribute('role', 'switch');
+        btn.setAttribute('aria-label', labelText);
+        btn.setAttribute('aria-checked', String(on));
         btn.title = title;
         btn.style.cssText = `padding:1px 10px;cursor:pointer;border:none;border-radius:4px;font:11px monospace;background:${on ? '#8ead71' : '#555f52'};color:${on ? '#17211b' : '#e8e0cf'}`;
         btn.onclick = () => {
             onToggle();
             btn.blur(); // 焦点离开面板，避免刷新守卫挡住本次重建
-            refreshConfigRows(state);
+            wakeSoon();
+            refreshConfigRows(runtime.state || state);
         };
         row.appendChild(label);
         row.appendChild(btn);
@@ -768,18 +1288,22 @@
     }
 
     // 数字输入框：失焦时取整并夹到 [min, +∞)，回显规范化后的值
-    function makeNumberInput(value, { min = 0, width = '44px', placeholder = '', title = '', onchange } = {}) {
+    function makeNumberInput(value, { min = 0, max = Number.MAX_SAFE_INTEGER, width = '72px', placeholder = '', title = '', onchange } = {}) {
         const input = document.createElement('input');
         input.type = 'number';
         input.min = String(min);
+        input.max = String(max);
+        input.setAttribute('aria-label', title || placeholder || '数量');
         input.value = String(value);
         input.placeholder = placeholder;
         input.title = title;
         input.style.cssText = `width:${width};flex:none;background:#17211b;color:#e8e0cf;border:1px solid #555f52;border-radius:4px;font:11px monospace;padding:1px 4px`;
         input.onchange = () => {
-            const n = Math.max(min, Math.floor(Number(input.value) || min));
+            const raw = Number(input.value);
+            const n = Math.min(max, Math.max(min, Number.isFinite(raw) ? Math.floor(raw) : min));
             input.value = String(n);
             onchange?.(n);
+            wakeSoon();
         };
         return input;
     }
@@ -854,6 +1378,7 @@
         if (!recipes.length) return null;
         const steps = craftPipelineSteps(stationId);
         const prog = craftPipelineProgress(stationId, steps);
+        const editLocked = !!craftFlight(stationId) || !node.empty;
         const frag = document.createElement('div');
 
         const title = document.createElement('div');
@@ -869,6 +1394,7 @@
         });
         const editors = [];
         const save = () => {
+            if (editLocked) return;
             const prevSig = craftPipelineSig(craftPipelineSteps(stationId));
             const next = editors
                 .map(({ select, count, itemSel }) => ({
@@ -910,6 +1436,7 @@
                 title: '批次数：该步开工多少次后推进下一步',
                 onchange: save,
             });
+            select.disabled = itemSel.disabled = count.disabled = editLocked;
             editors.push({ select, count, itemSel });
             row.appendChild(itemSel);
             row.appendChild(count);
@@ -920,18 +1447,13 @@
         statusRow.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px;opacity:.85';
         const running = craftPipelineRunning(stationId);
         const status = document.createElement('span');
-        // 批次在开工时计数：站点忙碌（加工中/待领取）时，显示的应是正在加工的步骤而不是下一步
         const busy = steps.length > 0 && node && !node.empty;
-        let dispIdx = prog.stepIndex;
-        if (busy) {
-            if (prog.finished) dispIdx = steps.length - 1;
-            else if (prog.stepIndex > 0 && prog.done[prog.stepIndex] === 0) dispIdx = prog.stepIndex - 1;
-        }
         const stepName = idx => recipes.find(r => sameId(jobId(r), steps[idx]?.recipeId))?.name || `#${steps[idx]?.recipeId}`;
         const progText = prog.finished ? '' :
             `第 ${prog.stepIndex + 1}/${steps.length} 步「${stepName(prog.stepIndex)}」 · 第 ${Math.min(prog.done[prog.stepIndex] + 1, steps[prog.stepIndex].times)}/${steps[prog.stepIndex].times} 批`;
-        if (!steps.length) status.textContent = '未配置流程（该站停工；上方可锁定单一配方）';
-        else if (busy) status.textContent = `${running ? '运行中' : '已停止'} · 第 ${dispIdx + 1}/${steps.length} 步「${stepName(dispIdx)}」${node.ready ? '待领取' : '加工中'}（第 ${Math.max(prog.done[dispIdx], 1)}/${steps[dispIdx].times} 批）`;
+        if (prog.legacy) status.textContent = '旧版开工进度：请待队列结束后重置，改用领取计数';
+        else if (!steps.length) status.textContent = '未配置自动流程；现有队列仍可自动领取';
+        else if (busy) status.textContent = `${running ? '流程运行中' : '暂停后续提交'} · 累计已领取 ${prog.done.reduce((a, b) => a + b, 0)} / ${steps.reduce((sum, step) => sum + step.times, 0)} 份`;
         else if (prog.finished) status.textContent = `流程已完成（${steps.length} 步），点开始再跑一轮`;
         else status.textContent = `${running ? '运行中' : '已停止'} · 待开工 ${progText}`;
         statusRow.appendChild(status);
@@ -956,6 +1478,7 @@
             };
             statusRow.appendChild(runBtn);
             const reset = document.createElement('button');
+            reset.disabled = editLocked;
             reset.textContent = '重置';
             reset.title = '清空进度（不改变启动/停止状态）';
             reset.style.cssText = 'padding:0 8px;cursor:pointer;background:#555f52;border:none;border-radius:4px;color:#e8e0cf;font:11px monospace';
@@ -974,8 +1497,12 @@
 
     // 每轮用最新 state 重建槽位配置行（选项来自实时 state，选择从 localStorage 恢复）
     function refreshConfigRows(state) {
+        renderDashboard(state);
         if (configBox.contains(document.activeElement)) return; // 用户正在操作下拉时不动它
+        if (state === lastConfigState && settingsRevision === lastConfigRevision && busy === lastConfigBusy) { applyDashboardPage(); return; }
+        const scroll = configBox.scrollTop;
         configBox.innerHTML = '';
+        renderModuleSettings(state);
         if (CONFIG.farming.enabled) {
             const { group, body } = makeGroup('农场');
             // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
@@ -1004,14 +1531,6 @@
             const nodes = industryNodes(state, industry).filter(node => adapter.id(node) != null);
             if (!nodes.length) continue;
             const { group, body } = makeGroup(INDUSTRY_NAMES[industry] || industry);
-            if (industry === 'crafting') {
-                const on = craftingEnabled();
-                body.appendChild(makeToggleRow(state, '加工启停:', '停止后不开工、不派驻伙伴（已完成站点的收取不受影响）；面板设置优先并本地记忆', on, () => {
-                    setOverride(CRAFT_ENABLED_KEY, on ? 'off' : 'on');
-                    log(`加工：${on ? '已停止' : '已开启'}`);
-                    wakeSoon();
-                }));
-            }
             for (const node of nodes) {
                 const id = adapter.id(node);
                 const key = nodeJobKey(industry, id);
@@ -1037,6 +1556,7 @@
                     wakeSoon();
                 };
                 if (industry === 'crafting') {
+                    select.disabled = !!craftFlight(id) || !node.empty;
                     // 压缩下拉宽度，给批次数输入留出行内空间，避免横向滚动才看得到
                     select.style.maxWidth = '140px';
                     const lockTimes = makeNumberInput(Number(getOverride(craftLockTimesKey(id))) || 0, {
@@ -1049,12 +1569,15 @@
                         },
                     });
                     row.appendChild(lockTimes);
+                    lockTimes.disabled = !!craftFlight(id) || !node.empty;
+                    lockTimes.hidden = nodeJobOverride('crafting', id) == null || nodeJobClosed('crafting', id);
                 }
                 body.appendChild(row);
                 const itemRow = makeTaskItemRow(state, industry, id);
                 if (itemRow) body.appendChild(itemRow);
                 if (industry === 'crafting') {
-                    const pipeRows = makeCraftPipelineRows(state, node, id);
+                    body.appendChild(makeCraftQueueCard(state, node));
+                    const pipeRows = nodeJobOverride('crafting', id) == null ? makeCraftPipelineRows(state, node, id) : null;
                     if (pipeRows) body.appendChild(pipeRows);
                 }
             }
@@ -1087,10 +1610,10 @@
             configBox.appendChild(group);
         }
         // 饲料槽为水产/畜牧共用，任一解锁即显示
-        if (CONFIG.aquatic.enabled && (state.aquatic?.unlocked || state.livestock?.unlocked)) {
+        if (state.aquatic?.unlocked || state.livestock?.unlocked) {
             const { group, body } = makeGroup('饲料槽');
             const on = autoFeedEnabled();
-            body.appendChild(makeToggleRow(state, '自动投料:', '饲料槽余量不足时自动投料（优先单位品质分最低的饲料，受保留量与加工原料保护）', on, () => {
+            body.appendChild(makeToggleRow(state, '自动补料:', '余量达到底限时触发补充，只投入均衡饲料；自动购买可独立关闭', on, () => {
                 setOverride(FEED_AUTO_KEY, on ? 'off' : 'on');
                 log(`自动投料：${on ? '已关闭' : '已开启'}`);
             }));
@@ -1134,14 +1657,20 @@
             }
             configBox.appendChild(group);
         }
+        renderSailingSettings(state);
+        // 加工页先呈现站点与队列，策略开关放在其后。
+        const craftStrategy = [...configBox.children].find(group => group.dataset.page === 'crafting');
+        if (craftStrategy) configBox.appendChild(craftStrategy);
+        configBox.scrollTop = scroll;
+        applyDashboardPage();
+        lastConfigState = state; lastConfigRevision = settingsRevision; lastConfigBusy = busy;
     }
 
     // 收起/展开（记住选择）
     let collapsed = localStorage.getItem('rlt-helper-collapsed') === '1';
     function applyCollapsed() {
-        logBox.style.display = collapsed ? 'none' : '';
-        configBox.style.display = collapsed ? 'none' : '';
-        statusLine.style.display = collapsed ? 'none' : '';
+        panel.classList.toggle('rlt-collapsed', collapsed);
+        applyDashboardPage();
         collapseBtn.textContent = collapsed ? '+' : '—';
     }
     collapseBtn.onclick = () => {
@@ -1356,6 +1885,7 @@
         const p = state.player;
         if (!p) return Infinity;
         const base = p.stamina ?? 0;
+        if (base >= (p.stamina_cap ?? Infinity)) return base;
         const restore = p.stamina_restore_seconds || 0;
         if (!restore) return base;
         const regen = Math.floor(Math.max(0, serverNowSeconds() - (p.stamina_updated_at || 0)) / restore);
@@ -1366,9 +1896,9 @@
     function staminaWaitSeconds(state, target) {
         const p = state.player;
         if (!p || !p.stamina_restore_seconds) return null;
-        if (target > (p.stamina_cap ?? Infinity)) return Infinity;
         const cur = liveStamina(state);
         if (cur >= target) return 0;
+        if (target > (p.stamina_cap ?? Infinity)) return Infinity;
         const elapsed = Math.max(0, serverNowSeconds() - (p.stamina_updated_at || 0));
         const partial = elapsed % p.stamina_restore_seconds;
         return Math.max(0, (target - cur) * p.stamina_restore_seconds - partial);
@@ -1411,6 +1941,16 @@
             const sw = staminaWaitSeconds(state, pendingStaminaCost);
             if (sw != null && isFinite(sw)) wait = Math.min(wait, sw);
         }
+        if (CONFIG.sailing.enabled && CONFIG.sailing.autoCollect) {
+            const readyAt = Number(state.sailing?.active_run?.ready_at || 0);
+            if (readyAt > now) wait = Math.min(wait, readyAt - now);
+        }
+        if (autoFeedEnabled()) {
+            const slot = state.aquatic?.feed_slot, bounds = feedThresholds(slot);
+            if (bounds.valid && Number(slot.hourly_rate) > 0 && slot.units > bounds.low) {
+                wait = Math.min(wait, (slot.units - bounds.low) / slot.hourly_rate * 3600);
+            }
+        }
         // 鱼塘周期：对齐最近的繁殖/投喂结算时刻，及时补料和处理
         if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds) {
             for (const pond of state.aquatic?.ponds || []) {
@@ -1451,7 +1991,9 @@
     // 槽位级任务道具：只认面板锁定的道具（支持保留数量），未锁定即不使用
     // forcedId：加工流程步骤单独指定的道具 id，传入时跳过槽位配置查找
     function slotTaskItem(state, industry, slotId, timing, { notify = true, forcedId = null } = {}) {
-        const override = forcedId != null ? forcedId : getOverride(nodeTaskItemKey(industry, slotId));
+        if (!CONFIG.taskItems.enabled || (industry === 'crafting' && !CONFIG.crafting.useTaskItems)) return null;
+        const override = forcedId != null ? forcedId :
+            (industry === 'crafting' && timing === 'active' ? craftFlight(slotId)?.taskItemChoice : null) ?? getOverride(nodeTaskItemKey(industry, slotId));
         if (override == null || override === '__off') return null; // '__off' 兼容旧版存储
         const keep = Math.max(0, Number(getOverride(nodeTaskItemKeepKey(industry, slotId)) || 0));
         const item = (state.task_items || []).find(candidate => {
@@ -1634,6 +2176,7 @@
                 name: cm.item?.name || '', minQuality: 0, need: Number(cm.quantity || 0), commission: cm,
             });
         }
+        if (!productionOnly) needs.push(...sailingMaterialNeeds(state));
         return needs;
     }
 
@@ -1779,29 +2322,42 @@
         return ids;
     }
 
-    // 每个加工站按“任一已解锁配方的一批最大用量”保留原料；同一物品跨站点累加。
-    // 这样既不会像整类禁售那样让售卖候选清空，也不会卖掉各站下一次开工所需的原料。
+    // 按实际启用流程各步骤的下一段队列预留原料；已提交给服务器的部分不重复预留。
     function craftingInputReserves(state) {
         return memoizedForState(state, 'craftingReserves', () => craftingInputReservesUncached(state));
     }
 
     function craftingInputReservesUncached(state) {
         const reserves = new Map();
-        if (!CONFIG.selling.protectCraftingInputs) return reserves;
+        if (!CONFIG.selling.protectCraftingInputs || !craftingEnabled()) return reserves;
         for (const station of state.crafting_stations || []) {
+            const id = station.station_id;
+            if (nodeJobClosed('crafting', id) || getOverride(`rlt-craft-paused:${id}`) === '1') continue;
+            const steps = configuredCraftSteps(id), progress = craftPipelineProgress(id, steps), flight = craftFlight(id);
+            const selected = nodeJobOverride('crafting', id) ?? CONFIG.crafting.recipeId;
+            const wanted = new Map();
+            if (steps.length && (selected != null || craftPipelineRunning(id))) {
+                steps.forEach((step, index) => {
+                    const queued = flight?.stepIndex === index ? Math.max(0, flight.quantity - flight.credited) : 0;
+                    const count = Math.max(0, Math.min(CONFIG.crafting.batchEnabled ? CONFIG.crafting.batchLimit : 1, step.times - progress.done[index] - queued));
+                    wanted.set(String(step.recipeId), (wanted.get(String(step.recipeId)) || 0) + count);
+                });
+            } else if (selected != null) wanted.set(String(selected), 1);
             const stationReserves = new Map();
             for (const recipe of station.recipes || []) {
                 if (recipe.unlocked === false) continue;
+                const count = wanted.get(String(jobId(recipe))) || 0;
+                if (!count) continue;
                 const recipeTotals = new Map();
                 for (const input of recipe.inputs || []) {
                     const id = input.item_id ?? input.item?.item_id;
-                    const quantity = Math.max(0, Number(input.quantity || 0));
+                    const quantity = Math.max(0, Number(input.quantity || 0)) * count;
                     if (id == null || quantity <= 0) continue;
                     const key = String(id);
                     recipeTotals.set(key, (recipeTotals.get(key) || 0) + quantity);
                 }
                 for (const [key, quantity] of recipeTotals) {
-                    stationReserves.set(key, Math.max(stationReserves.get(key) || 0, quantity));
+                    stationReserves.set(key, (stationReserves.get(key) || 0) + quantity);
                 }
             }
             for (const [key, quantity] of stationReserves) {
@@ -1819,7 +2375,7 @@
     }
 
     // 为一个物品的全部品质栈统一分配需求：高门槛需求优先，使用最低可满足品质。
-    function reservedStacksForItem(state, stacks, craftingReserves = null) {
+    function reservedStacksForItem(state, stacks, craftingReserves = null, { dedicatedFeed = false } = {}) {
         const needs = gatherNeeds(state).filter(n => stacks.some(item => needMatchesItem(n, item)))
             .sort((a, b) => b.minQuality - a.minQuality);
         const rows = stacks.map(item => ({ item, free: Number(item.quantity || 0), reserved: 0 }))
@@ -1835,7 +2391,9 @@
                 remaining -= take;
             }
         }
-        let keep = configuredKeep(stacks[0]?.item_id, craftingReserves);
+        let keep = dedicatedFeed
+            ? Math.max(0, Number(CONFIG.selling.keepByItemId?.[String(stacks[0]?.item_id)] || 0), Number(craftingReserves?.get(String(stacks[0]?.item_id)) || 0))
+            : configuredKeep(stacks[0]?.item_id, craftingReserves);
         for (const row of rows) {
             if (keep <= 0) break;
             const take = Math.min(row.free, keep);
@@ -1880,10 +2438,10 @@
     // 接单/加工接口不指定品质：按“服务器优先扣最高品质”的最坏情况计算仍可安全消耗多少。
     // applyKeep：是否套用 selling 的保留量（defaultKeep/keepByItemId）——售卖/接单场景要保留，
     // 加工投料场景不能保留，否则库存不足 defaultKeep 的合法原料会被误判为“材料不足”
-    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true } = {}) {
+    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, excludeSailing = false } = {}) {
         const stacks = (state.inventory || []).filter(i => itemId != null ? sameId(i.item_id, itemId) : i.name === name);
         if (!stacks.length) return 0;
-        const needs = gatherNeeds(state).filter(n => stacks.some(item => needMatchesItem(n, item)));
+        const needs = gatherNeeds(state).filter(n => (!excludeSailing || n.source !== 'sailing') && stacks.some(item => needMatchesItem(n, item)));
         const thresholds = new Set([0, ...needs.map(n => Number(n.minQuality || 0))]);
         const craftingReserves = reserveCraftingInputs ? craftingInputReserves(state) : null;
         const keep = applyKeep ? configuredKeep(itemId, craftingReserves) : 0;
@@ -2048,7 +2606,7 @@
         const targets = [];
         let used = 0;
         const hasActiveItem = (industry, id) => {
-            const override = getOverride(nodeTaskItemKey(industry, id));
+            const override = (industry === 'crafting' ? craftFlight(id)?.taskItemChoice : null) ?? getOverride(nodeTaskItemKey(industry, id));
             if (override == null || override === '__off') return false;
             // 仅当锁定的道具确实存在 active（收尾）时机时才纳入巡检；
             // 否则开工类道具（如厚土肥）会在作物生长期间反复误报"库存不足/类型不符"
@@ -2103,7 +2661,7 @@
     }
 
     async function collectReadyPlots() {
-        if (!CONFIG.farming.enabled) return;
+        if (!CONFIG.farming.enabled || !CONFIG.farming.autoCollect) return;
         const slots = (runtime.state.plots || []).filter(p => p.ready && !p.empty).map(p => p.slot);
         for (const slot of slots) {
             const plot = (runtime.state.plots || []).find(p => p.slot === slot);
@@ -2120,6 +2678,7 @@
     }
 
     async function plantEmptyPlots() {
+        if (!CONFIG.farming.autoPlant) return;
         const cfg = CONFIG.farming;
         if (!cfg.enabled) return;
         const slots = (runtime.state.plots || []).filter(p => p.empty).map(p => p.slot);
@@ -2217,7 +2776,7 @@
 
     function isPartnerIdle(p, state = runtime.state) {
         const id = partnerRecordId(p);
-        if (id == null || p.locked || p.missing ||
+        if (id == null || p.locked || p.missing || outsidePartnerIds(state).has(String(id)) ||
             p.assigned_plot_slot != null ||
             p.assigned_gathering_site_id != null ||
             p.assigned_mining_site_id != null ||
@@ -2318,6 +2877,7 @@
         if (CONFIG.farming.enabled && CONFIG.farming.autoAssignPartner) {
             for (const plot of state.plots || []) {
                 if (!plot.empty || plot.assignment_locked) continue;
+                if (outsidePartnerIds(state).has(String(currentPartnerId(plot)))) continue;
                 slots.push({
                     key: `farming:${plot.slot}`, industry: 'farming', id: plot.slot,
                     label: `土地 ${plot.slot + 1}`, node: plot, mandatory: false,
@@ -2333,6 +2893,7 @@
             if (!industryEnabled(industry) || !cfg.autoAssignPartner) continue;
             for (const node of industryNodes(state, industry)) {
                 if (!node.empty || node.task_snapshot || node.assignment_locked) continue;
+                if (outsidePartnerIds(state).has(String(currentPartnerId(node)))) continue;
                 const id = adapter.id(node);
                 if (id == null) {
                     logSkip(`schema:id:${industry}`, `${industry} 节点缺少 id，已跳过派驻`);
@@ -2478,6 +3039,7 @@
         const occupiedOutsideCore = new Set([
             ...aquaticAssignedPartnerIds(state),
             ...livestockAssignedPartnerIds(state),
+            ...outsidePartnerIds(state),
         ]);
         const partners = (state.partners || []).filter(p => {
             const rawId = partnerRecordId(p);
@@ -2668,6 +3230,8 @@
         const adapter = INDUSTRY_ADAPTERS[industry];
         const cfg = adapter.config();
         const nodeId = adapter.id(node);
+        if (industry === 'crafting' && craftFlight(nodeId)) return { blocked: '本批队列尚未结算，请查看加工状态' };
+        if (industry === 'crafting' && getOverride(`rlt-craft-paused:${nodeId}`) === '1') return { blocked: '本站后续提交已暂停' };
 
         // 加工的两种限量模式：
         // - 下拉「流程」：面板配置的多步流程（需点「开始」）
@@ -2682,18 +3246,20 @@
                 : (lockTimes > 0 ? [{ recipeId: override, times: lockTimes, taskItemId: '' }] : []);
             if (steps.length) {
                 if (override == null && !craftPipelineRunning(nodeId)) return { blocked: '流程未启动（面板点「开始」）' };
-                const prog = craftPipelineProgress(nodeId, steps);
+                let prog = craftPipelineProgress(nodeId, steps);
+                if (prog.legacy) return { blocked: '旧版进度按开工计数，请在空闲时重置后继续' };
                 if (prog.finished) {
+                    if (CONFIG.crafting.repeatPipeline && override == null) {
+                        resetCraftPipeline(nodeId);
+                        prog = craftPipelineProgress(nodeId, steps);
+                    } else {
                     return { blocked: override == null ? '加工流程已完成（面板可重置）' : `锁定配方已完成 ${lockTimes} 批（改一下批次数即可重跑）` };
+                    }
                 }
                 const step = steps[prog.stepIndex];
                 const job = adapter.jobs(node).find(j => sameId(jobId(j), step.recipeId));
                 if (!job || job.unlocked === false) {
-                    // 配方不存在/未解锁：跳步并记日志，下一轮自动推进到下一步
-                    advanceCraftPipeline(nodeId, steps, prog.stepIndex);
-                    logSkip(`pipe:skip:${nodeId}:${prog.stepIndex}:${step.recipeId}`,
-                        `加工点 ${nodeId}：流程第 ${prog.stepIndex + 1} 步配方 #${step.recipeId} 不存在或未解锁，已跳过`);
-                    return { blocked: `流程第 ${prog.stepIndex + 1} 步配方不可用，已跳过` };
+                    return { blocked: `流程第 ${prog.stepIndex + 1} 步配方不存在或未解锁，等待调整` };
                 }
                 // 材料不足/不安全：原地等待（上游可能正在生产），不跳步
                 if (!jobAvailable(state, industry, job)) {
@@ -2725,11 +3291,11 @@
             return { blocked: '未配置加工流程（面板可配置流程或锁定单一配方）' };
         }
 
-        const stamina = liveStamina(state);
+        const stamina = Math.max(0, liveStamina(state) - (industry === 'crafting' ? CONFIG.crafting.staminaReserve : 0));
         const affordable = candidates.filter(job => Number(job.stamina_cost || 0) <= stamina);
         if (!affordable.length) {
             const minCost = Math.min(...candidates.map(job => Number(job.stamina_cost || 0)));
-            rememberStaminaNeed(state, minCost, `${INDUSTRY_NAMES[industry] || industry}任务`);
+            rememberStaminaNeed(state, minCost + (industry === 'crafting' ? CONFIG.crafting.staminaReserve : 0), `${INDUSTRY_NAMES[industry] || industry}任务`);
             return { blocked: `体力不足（当前约 ${stamina}/${state.player?.stamina_cap ?? '?'}）` };
         }
 
@@ -2741,6 +3307,11 @@
         const startItem = (pipeline && pipeItemId === '__off') ? null
             : slotTaskItem(state, industry, INDUSTRY_ADAPTERS[industry]?.id(node), 'start',
                 pipeItemId && pipeItemId !== '__off' ? { forcedId: pipeItemId } : {});
+        if (industry === 'crafting' && CONFIG.taskItems.enabled && CONFIG.crafting.useTaskItems && !CONFIG.crafting.partialTaskItems) {
+            const choice = pipeItemId || getOverride(nodeTaskItemKey(industry, nodeId));
+            const chosen = (state.task_items || []).find(item => sameId(taskItemRecordId(item), choice));
+            if (chosen?.timing === 'start' && !startItem) return { blocked: '指定开工道具不足或已预留，等待补充' };
+        }
         const durationMultiplier = taskItemDurationMultiplier(startItem);
         const scored = affordable.map((job, index) => {
             const hourly = jobHourlyValue(state, industry, job, ability, durationMultiplier);
@@ -2764,6 +3335,17 @@
         for (const industry of Object.keys(INDUSTRY_ADAPTERS)) {
             const base = Number(state.industry_rules?.[industry]?.character_base_ability || 0);
             for (const node of industryNodes(state, industry)) {
+                if (industry === 'crafting') {
+                    for (const out of [...(node.completed_results || []), ...(node.task_results || [])]) {
+                        if (sameId(out.item_id ?? out.item?.item_id, need.itemId) && Number(out.quality || 0) >= Number(need.minQuality || 0)) qty += Math.max(0, Number(out.quantity || 0));
+                    }
+                    const recipe = node.recipe || node.task_snapshot?.recipe;
+                    const future = Number(node.queued_count || 0) + (node.task_snapshot && !node.ready ? 1 : 0);
+                    if (recipe && future > 0 && !Number(need.minQuality || 0)) {
+                        for (const out of jobExpectedOutputs(recipe, 0, { conservative: true })) if (outputMatchesNeed(out, need)) qty += out.quantity * future;
+                    }
+                    continue;
+                }
                 if (node.empty || node.ready) continue;
                 const snapshot = node.task_snapshot;
                 const active = node.task || node.recipe || snapshot?.task || snapshot?.recipe || snapshot;
@@ -2781,17 +3363,31 @@
     async function collectReadyIndustries() {
         for (const industry of Object.keys(INDUSTRY_ADAPTERS)) {
             const adapter = INDUSTRY_ADAPTERS[industry];
-            // 加工即使被面板停掉也照常收取，避免已完成产物卡在站点里
-            if (industry !== 'crafting' && !adapter.config().enabled) continue;
-            const ids = industryNodes(runtime.state, industry).filter(node => node.ready && !node.empty).map(adapter.id);
+            if (!industryEnabled(industry) || !adapter.config().autoCollect) continue;
+            const ready = node => industry === 'crafting' ? craftCollectable(node) : node?.ready && !node.empty;
+            const ids = industryNodes(runtime.state, industry).filter(ready).map(adapter.id);
             for (const id of ids) {
                 const node = nodeById(runtime.state, industry, id);
-                if (!node?.ready || node.empty) continue;
+                if (!ready(node)) continue;
+                if (industry === 'crafting' && craftFlight(id)?.phase === 'uncertain') continue;
                 try {
-                    await collectSite(industry, id);
+                    const result = await collectSite(industry, id);
+                    if (industry === 'crafting' && craftFlight(id)) {
+                        const count = Number(result?.completed_count ?? node.completed_count ?? (node.ready ? 1 : 0));
+                        creditCraftFlight(id, count);
+                        const flight = craftFlight(id);
+                        const fresh = nodeById(runtime.state, industry, id);
+                        flight.observedCollected = Number(fresh?.collected_count || 0);
+                        saveCraftFlight(id, flight.credited >= flight.quantity ? null : flight);
+                    }
                     clearSkip(`fail:collect:${industry}:${id}`);
                     log(`${INDUSTRY_NAMES[industry] || industry}点 ${id}：已领取`);
                 } catch (e) {
+                    if (industry === 'crafting' && craftFlight(id) && (uncertainWrite(e) || e.code === 'aborted')) {
+                        const flight = craftFlight(id);
+                        flight.phase = 'uncertain'; flight.reason = '领取响应中断，请核对本批累计领取份数';
+                        saveCraftFlight(id, flight);
+                    }
                     if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:collect:${industry}:${id}`, `${INDUSTRY_NAMES[industry] || industry}点 ${id} 领取失败：${e.message}`);
                 }
@@ -2807,7 +3403,7 @@
             const plans = [];
             for (const industry of Object.keys(INDUSTRY_ADAPTERS)) {
                 const adapter = INDUSTRY_ADAPTERS[industry];
-                if (!industryEnabled(industry)) continue;
+                if (!industryEnabled(industry) || !adapter.config().autoStart) continue;
                 for (const node of industryNodes(state, industry)) {
                     if (!node.empty || node.task_snapshot) continue;
                     const id = adapter.id(node);
@@ -2833,19 +3429,15 @@
             plans.sort((a, b) => b.demand - a.demand || b.efficiency - a.efficiency || b.hourly - a.hourly);
             const plan = plans[0];
             try {
+                if (plan.industry === 'crafting') {
+                    if (!await startCraftPlan(plan)) failedNodes.add(`crafting:${plan.id}`);
+                    continue;
+                }
                 await startSite(plan.industry, plan.id, plan.adapter.payloadKey, jobId(plan.job), plan.taskItemId ?? '');
                 clearSkip(`fail:start:${plan.industry}:${plan.id}`);
                 const itemText = plan.taskItem
                     ? `，使用 ${plan.taskItem.name || '任务道具#' + plan.taskItemId}` : '';
-                let pipeText = '';
-                if (plan.pipeline) {
-                    // 批次在开工成功时计数；领取失败不影响流程进度
-                    const prog = advanceCraftPipeline(plan.pipeline.stationId, plan.pipeline.steps, plan.pipeline.stepIndex);
-                    const step = plan.pipeline.steps[plan.pipeline.stepIndex];
-                    pipeText = `（流程第 ${plan.pipeline.stepIndex + 1}/${plan.pipeline.steps.length} 步 · 第 ${prog.done[plan.pipeline.stepIndex]}/${step.times} 批${prog.finished ? '，流程完成' : ''}）`;
-                    if (prog.finished) log(`${INDUSTRY_NAMES[plan.industry]}点 ${plan.id}：加工流程已全部完成，面板可重置再来一轮`);
-                }
-                log(`${INDUSTRY_NAMES[plan.industry]}点 ${plan.id}：开工「${plan.job.name || '任务#' + jobId(plan.job)}」${itemText}${pipeText}`);
+                log(`${INDUSTRY_NAMES[plan.industry]}点 ${plan.id}：开工「${plan.job.name || '任务#' + jobId(plan.job)}」${itemText}`);
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:start:${plan.industry}:${plan.id}`, `${INDUSTRY_NAMES[plan.industry]}点 ${plan.id} 开工失败：${e.message}`);
@@ -2927,7 +3519,7 @@
         // 大物预留：只有打算搏斗时才预留；大物消耗 = 当前钓点单竿消耗（已与开发者确认）
         const bigReserve = bigCatchReserveEnabled() && cfg.bigCatch === 'fight' ? cost : 0;
         const need = cost * chain + reserve + bigReserve;
-        const cap = Number(runtime.state.player?.stamina_cap ?? Infinity);
+        const cap = Math.max(Number(runtime.state.player?.stamina_cap ?? Infinity), liveStamina(runtime.state));
         let plan = chain;
         let waitFull = false;
         if (cost > 0 && need > cap) {
@@ -2955,6 +3547,7 @@
         let castInterval = Number(cfg.castIntervalMs || 0);
         for (let i = 0; i < plan && running; i++) {
             if (i > 0 && castInterval > 0) await sleep(castInterval); // 服务器限制最小抛竿间隔
+            if (!running || !fishingEnabled()) break;
             const hold = reserve + (bigCatchSpent ? 0 : bigReserve);
             if (liveStamina(runtime.state) - cost < hold) break;
             try {
@@ -3014,7 +3607,7 @@
             const keep = Math.max(Math.max(0, Number(pond.steady_stock || 0)), Number(cfg.pondKeepStock || 0));
             // 捞鱼：只捞超出保留线的部分，捞鱼不消耗体力
             const surplus = stock - keep;
-            if (surplus > 0) {
+            if (cfg.autoHarvestPonds && surplus > 0) {
                 try {
                     await harvestPond(pond.pond_id, surplus);
                     clearSkip(`fail:harvest-pond:${pond.pond_id}`);
@@ -3030,7 +3623,7 @@
             const species = fresh.species_id != null
                 ? (runtime.state.aquatic.species || []).find(s => sameId(s.id, fresh.species_id))
                 : (runtime.state.aquatic.species || []).find(s => s.unlocked);
-            if (species && species.id != null && Number(species.owned_fry || 0) > 0) {
+            if (cfg.autoStockPonds && species && species.id != null && Number(species.owned_fry || 0) > 0) {
                 const freshStock = Math.max(0, Number(fresh.stock || 0));
                 const freshFry = (fresh.fry || []).reduce((sum, f) => sum + Number(f.count || 0), 0);
                 const capacity = Number(fresh.capacity || 0);
@@ -3052,43 +3645,211 @@
         }
     }
 
-    // 饲料槽：余量不足 feedKeepHours 时投料补足；优先单位品质分最低的饲料，保留量受 selling 与加工原料保护
-    // 饲料槽为水产/畜牧共用（state.aquatic.feed_slot），任一系统解锁即需要补料
+    const BALANCED_FEED_NAME = '均衡饲料';
+    const FEED_FILL_KEY = 'rlt-feed-filling';
+    function feedThresholds(slot) {
+        const capacity = Number(slot?.capacity);
+        const factor = CONFIG.feed.thresholdMode === 'percent' ? capacity / 100 : 1;
+        const low = Number(CONFIG.feed.low) * factor;
+        const target = Math.min(capacity, Number(CONFIG.feed.target) * factor);
+        return { low, target, valid: Number.isFinite(capacity) && capacity > 0 && Number.isFinite(low) &&
+            Number.isFinite(target) && low >= 0 && low < target && target <= capacity };
+    }
+    function balancedFeedEntry(state) {
+        return (state.shop || []).find(entry => (entry.item?.name ?? entry.name) === BALANCED_FEED_NAME &&
+            !entry.locked && entry.unlocked !== false && entry.id != null) || null;
+    }
+    function balancedFeedInputs(state) {
+        const entry = balancedFeedEntry(state);
+        return (state.aquatic?.feed_slot?.inputs || []).filter(input =>
+            input.item_id != null && Number(input.units) > 0 &&
+            (entry ? sameId(input.item_id, shopEntryItemId(entry)) : (input.item?.name ?? input.name) === BALANCED_FEED_NAME));
+    }
+    function feedFreeQuantity(state, input) {
+        const stacks = (state.inventory || []).filter(item => sameId(item.item_id, input.item_id));
+        const rows = reservedStacksForItem(state, stacks, craftingInputReserves(state), { dedicatedFeed: true });
+        return rows.filter(row => Number(row.item.quality || 0) === Number(input.quality || 0))
+            .reduce((sum, row) => sum + row.free, 0);
+    }
+    // 低水位触发后持续补到目标；购买和投入都读取最新 state，只消费指定饲料。
     async function doAquaticFeed() {
-        const cfg = CONFIG.aquatic;
-        const aq = runtime.state?.aquatic;
-        if (!cfg.enabled || !autoFeedEnabled() || !(aq?.unlocked || runtime.state?.livestock?.unlocked)) return;
-        const slot = aq?.feed_slot;
-        if (!slot || !Number(slot.hourly_rate)) return; // 没有消耗饲料的设施
-        let deficit = Number(slot.hourly_rate) * Number(cfg.feedKeepHours || 0) - Number(slot.units || 0);
-        if (deficit <= 0) return;
-        const inputs = [...(slot.inputs || [])]
-            .filter(i => i.item_id != null && Number(i.units) > 0)
-            .sort((a, b) => Number(a.unit_score || 0) - Number(b.unit_score || 0));
-        if (!inputs.length) {
-            logSkip('aquatic:no-feed', '饲料槽余量不足，但仓库中没有可投入的饲料');
-            return;
-        }
-        clearSkip('aquatic:no-feed');
-        const craftingReserves = craftingInputReserves(runtime.state);
-        for (const input of inputs) {
-            if (deficit <= 0) break;
-            const keep = configuredKeep(input.item_id, craftingReserves);
-            const available = Math.max(0, Number(input.quantity || 0) - keep);
-            const roomUnits = Number(slot.capacity || 0) - Number(runtime.state.aquatic?.feed_slot?.units || 0);
-            const count = Math.min(available, Math.floor(roomUnits / Number(input.units)),
-                Math.ceil(deficit / Number(input.units)));
-            if (count <= 0) continue;
+        const cfg = CONFIG.feed;
+        if (!autoFeedEnabled()) return;
+        let spent = 0;
+        let calibrated = false;
+        for (let attempt = 0; attempt < 12 && running && autoFeedEnabled(); attempt++) {
+            const state = runtime.state;
+            const slot = state.aquatic?.feed_slot;
+            if (!slot || !(state.aquatic?.unlocked || state.livestock?.unlocked)) return;
+            const bounds = feedThresholds(slot);
+            if (!bounds.valid) { logSkip('feed:bounds', '饲料上下限无效：请设置 0 ≤ 底限 < 填充目标 ≤ 容量'); return; }
+            clearSkip('feed:bounds');
+            if (Number(slot.units) >= bounds.target) { setOverride(FEED_FILL_KEY, ''); return; }
+            if (Number(slot.units) > bounds.low && getOverride(FEED_FILL_KEY) !== '1') return;
+            setOverride(FEED_FILL_KEY, '1');
+            const inputs = balancedFeedInputs(state);
+            if (inputs.length && getOverride('rlt-feed-pending-item')) setOverride('rlt-feed-pending-item', '');
+            const input = inputs.find(item => feedFreeQuantity(state, item) > 0 &&
+                Number(item.units) <= Number(slot.capacity) - Number(slot.units));
             try {
-                await depositFeed(input.item_id, Number(input.quality || 0), count);
-                clearSkip(`fail:feed:${input.item_id}:${input.quality || 0}`);
-                log(`饲料槽：投入 ${input.item?.name || input.item_id} ×${count}（约 ${Number(input.units) * count} 份）`);
-                deficit -= Number(input.units) * count;
+                if (input) {
+                    const count = Math.min(Math.floor(feedFreeQuantity(state, input)),
+                        Math.floor((Number(slot.capacity) - Number(slot.units)) / Number(input.units)),
+                        Math.ceil((bounds.target - Number(slot.units)) / Number(input.units)));
+                    await depositFeed(input.item_id, Number(input.quality || 0), count);
+                    log(`饲料槽：投入${BALANCED_FEED_NAME} ×${count}，余量 ${Math.floor(runtime.state.aquatic.feed_slot.units)} 份`);
+                    if (Number(runtime.state.aquatic?.feed_slot?.units) <= Number(slot.units)) return;
+                    continue;
+                }
+                if (!cfg.autoBuy) { logSkip('feed:stock', '均衡饲料库存不足或已预留，自动购买已关闭'); return; }
+                const entry = balancedFeedEntry(state);
+                const price = Number(entry?.price);
+                if (!entry || !Number.isFinite(price) || price < 0) {
+                    logSkip('feed:shop', '商店暂无可购买的“均衡饲料”，等待商品数据'); return;
+                }
+                const knownUnits = Number(inputs[0]?.units || 0);
+                if (knownUnits > Number(slot.capacity) - Number(slot.units)) {
+                    setOverride(FEED_FILL_KEY, '');
+                    logSkip('feed:room', '饲料槽剩余空间不足一份均衡饲料，等待消耗后再补'); return;
+                }
+                if (cfg.maxSpendPerTick <= 0 || playerCoins(state) < cfg.coinReserve) return;
+                const affordable = price > 0 ? Math.floor(Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent)) / price) : 99;
+                // 无库存时前端可能不提供每件份数：先买一件，待权威输入列表更新后再按量采购。
+                if (!knownUnits && (calibrated || sameId(getOverride('rlt-feed-pending-item'), shopEntryItemId(entry)))) { logSkip('feed:metadata', '已购入均衡饲料，但服务器未给出可投喂信息，暂停购买'); return; }
+                const needed = knownUnits > 0 ? Math.min(Math.floor((slot.capacity - slot.units) / knownUnits), Math.ceil((bounds.target - slot.units) / knownUnits)) : 1;
+                const count = Math.min(99, affordable, needed);
+                if (count <= 0) { logSkip('feed:budget', '均衡饲料购买达到本轮预算或金币保底，等待下一轮'); return; }
+                await buyItem(entry.id, count);
+                setOverride('rlt-feed-pending-item', knownUnits ? '' : String(shopEntryItemId(entry)));
+                spent += price * count;
+                calibrated = true;
+                log(`已购买${BALANCED_FEED_NAME} ×${count}（${price * count} 金币）`);
+                if (inventoryQty(runtime.state, shopEntryItemId(entry)) <= inventoryQty(state, shopEntryItemId(entry))) return;
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
-                logSkip(`fail:feed:${input.item_id}:${input.quality || 0}`, `饲料投入失败：${e.message}`);
-                break;
+                logSkip('feed:failed', `均衡饲料补充失败：${e.message}`); return;
             }
+        }
+    }
+
+    const SAILING_INTENT_KEY = 'rlt-sailing-intent';
+    function sailingConfiguredIds() {
+        try {
+            const ids = JSON.parse(CONFIG.sailing.partnerIds || '[]');
+            return Array.isArray(ids) ? [...new Set(ids.filter(id => typeof id === 'string' || typeof id === 'number').map(String))].slice(0, 3) : [];
+        } catch { return []; }
+    }
+    function outsidePartnerIds(state, includeReserved = true) {
+        const ids = new Set();
+        addPartnerIds(ids, state?.exploration?.active_run?.partner_ids);
+        addPartnerIds(ids, state?.sailing?.active_run?.partner_ids);
+        if (includeReserved && CONFIG.sailing.enabled && CONFIG.sailing.autoStart && CONFIG.sailing.reservePartners) addPartnerIds(ids, sailingConfiguredIds());
+        return ids;
+    }
+    function sailingPartners(state, route) {
+        const used = new Set([...outsidePartnerIds(state, false), ...aquaticAssignedPartnerIds(state), ...livestockAssignedPartnerIds(state)]);
+        const available = partner => partner && !partner.missing && !partner.locked &&
+            !used.has(String(partnerRecordId(partner))) &&
+            ['assigned_plot_slot', 'assigned_gathering_site_id', 'assigned_mining_site_id', 'assigned_crafting_station_id'].every(key => partner[key] == null);
+        const selected = sailingConfiguredIds();
+        if (selected.length) return selected.every(id => available((state.partners || []).find(p => sameId(partnerRecordId(p), id)))) ? selected : [];
+        if (!CONFIG.sailing.autoAssign) return [];
+        const industry = Number(route.required_voyages || 0) >= 3 ? 'exploration' : 'aquatic';
+        return (state.partners || []).filter(available).sort((a, b) => partnerAbility(b, industry) - partnerAbility(a, industry))
+            .slice(0, Math.min(3, Math.max(1, CONFIG.sailing.partySize))).map(partnerRecordId);
+    }
+    function sailingMaterialNeeds(state) {
+        const cfg = CONFIG.sailing, sail = state.sailing;
+        if (!cfg.enabled || !sail?.unlocked) return [];
+        const rows = [];
+        if (cfg.autoBuild && !sail.ship_built) rows.push(...(sail.construction?.materials || []));
+        if (cfg.autoStart) {
+            const supply = sail.supplies?.find(item => sameId(item.id, cfg.supplyId));
+            if (supply?.quantity > 0) rows.push(supply);
+        }
+        if (cfg.autoUpgrade && sail.ship_built) {
+            const upgrade = sail.upgrades?.find(item => item.level < Math.min(3, cfg.upgradeLimit));
+            if (upgrade) rows.push(upgrade);
+        }
+        return rows.filter(row => row.item_id != null && Number(row.quantity) > 0).map(row => ({
+            source: 'sailing', itemId: row.item_id, name: row.item_name || '', minQuality: 0, need: Number(row.quantity),
+        }));
+    }
+    function sailingInputsSafe(state, inputs) {
+        const totals = new Map();
+        for (const row of inputs) {
+            if (!(Number(row.quantity) > 0)) continue;
+            if (row.item_id == null) return false;
+            const key = String(row.item_id);
+            totals.set(key, (totals.get(key) || 0) + Number(row.quantity));
+        }
+        return [...totals].every(([id, quantity]) => safeUnspecifiedConsumeQty(state, id, '', { excludeSailing: true }) >= quantity);
+    }
+    async function doSailing() {
+        const cfg = CONFIG.sailing;
+        if (!cfg.enabled || !runtime.state.sailing?.unlocked) return;
+        let spent = 0;
+        const canSpend = cost => Number.isFinite(Number(cost)) && Number(cost) >= 0 &&
+            Number(cost) <= cfg.maxSpendPerTick - spent && playerCoins(runtime.state) - Number(cost) >= cfg.coinReserve;
+        let sail = runtime.state.sailing;
+        try {
+            if (sail.active_run) {
+                if (cfg.autoCollect && Number(sail.active_run.ready_at) <= serverNowSeconds()) {
+                    await mutate('/sailing/collect', { payload: { run_id: sail.active_run.run_id } });
+                    setOverride(SAILING_INTENT_KEY, '');
+                    log(`航海：已领取「${sail.active_run.route_name || '航程'}」收获`);
+                } else return;
+            }
+            sail = runtime.state.sailing;
+            if (sail.active_run) return;
+            if (readJson(SAILING_INTENT_KEY)) { logSkip('sailing:uncertain', '上次出航结果待核对，请在航海面板确认后继续'); return; }
+            if (!sail.ship_built) {
+                if (!cfg.autoBuild) return;
+                if (!sail.construction || !canSpend(sail.construction.coins) || !sailingInputsSafe(runtime.state, sail.construction.materials || [])) {
+                    logSkip('sailing:build', '建船材料不足、已预留或超出金币预算'); return;
+                }
+                const cost = Number(sail.construction.coins);
+                await mutate('/sailing/build', { payload: {} });
+                spent += cost; log('航海：初帆号已建造');
+                sail = runtime.state.sailing;
+                if (!sail.ship_built) return;
+            }
+            if (cfg.autoUpgrade) {
+                const upgrade = sail.upgrades?.find(item => item.level < Math.min(3, cfg.upgradeLimit) &&
+                    canSpend(item.coins) && sailingInputsSafe(runtime.state, [item]));
+                if (upgrade) {
+                    await mutate('/sailing/upgrade', { payload: { kind: upgrade.kind, expected_level: upgrade.level } });
+                    spent += Number(upgrade.coins); log(`航海：${upgrade.name || upgrade.kind}已改装`);
+                    sail = runtime.state.sailing;
+                }
+            }
+            if (!cfg.autoStart) return;
+            const route = sail.routes?.find(item => sameId(item.id, cfg.routeId) && item.unlocked);
+            if (!route) { logSkip('sailing:route', '请选择一条已解锁航线后自动出航'); return; }
+            const supply = sail.supplies?.find(item => sameId(item.id, cfg.supplyId));
+            if (!supply && cfg.supplyId !== 'none') { logSkip('sailing:supply', '指定航海补给当前不可用'); return; }
+            if (supply?.quantity > 0 && !sailingInputsSafe(runtime.state, [supply])) { logSkip('sailing:supply', '航海补给不足或已为其他用途预留'); return; }
+            if (!canSpend(route.coins)) { logSkip('sailing:budget', '出航费用超出本轮预算或金币保底'); return; }
+            const stamina = Number(route.stamina);
+            if (!Number.isFinite(stamina) || stamina < 0) return;
+            if (liveStamina(runtime.state) < stamina + cfg.staminaReserve) {
+                rememberStaminaNeed(runtime.state, stamina + cfg.staminaReserve, '航海'); return;
+            }
+            const partnerIds = sailingPartners(runtime.state, route);
+            if (!partnerIds.length) { logSkip('sailing:partners', '等待空闲航海伙伴（不会从其他生产岗位撤人）'); return; }
+            const payload = { route_id: route.id, partner_ids: partnerIds, supply_id: cfg.supplyId, request_id: crypto.randomUUID() };
+            setOverride(SAILING_INTENT_KEY, JSON.stringify(payload));
+            try {
+                await mutate('/sailing/start', { payload });
+                setOverride(SAILING_INTENT_KEY, '');
+                log(`航海：已出发前往「${route.name}」，${partnerIds.length} 名伙伴`);
+            } catch (error) {
+                if (!uncertainWrite(error) && !['aborted', 'story_active'].includes(error.code)) setOverride(SAILING_INTENT_KEY, '');
+                throw error;
+            }
+        } catch (error) {
+            if (shouldAbortTick(error)) throw error;
+            logSkip('sailing:failed', `航海操作失败：${error.message}`);
         }
     }
 
@@ -3149,7 +3910,6 @@
         clearSkip('aquatic:no-state');
         if (!aq.unlocked) return;
         await doAquaticPartners();
-        await doAquaticFeed();
         await doPonds();
         await doFishing(); // 垂钓放最后：只花各产业开工后剩下的体力
     }
@@ -3239,7 +3999,6 @@
             }
         }
         // 饲料槽水产/畜牧共用：水产未解锁但畜牧已解锁时也要补料（水产启用时 doAquatic 会再检查一次，余量够则不重复投）
-        await doAquaticFeed();
     }
 
     // ---------- 角色库扫描 ----------
@@ -3311,6 +4070,8 @@
             validateClientEnvironment();
             ensureStoryIdle(); // 剧情与奖励回写完成前，连本轮 state 基线都不提前接受
             const state = await getState();
+            reconcileCraftFlights(state);
+            await processCraftCancel();
             clearSkip('story:active');
             clearSkip('environment:paused');
             if (state.aquatic?.pending_big_catch) {
@@ -3332,6 +4093,8 @@
             await useConfiguredActiveTaskItems();
             await collectReadyPlots();
             await collectReadyIndustries();
+            await doAquaticFeed();
+            await doSailing();
             // 先把本轮新产物收入背包，再提交/承接委托，避免平白多等一轮。
             await doCommissions();
             // 成就奖励是免费的枫火，收了产物后顺手领取
@@ -3350,7 +4113,6 @@
             await doLivestock();
             // 水产排在各产业之后：伙伴先满足生产岗位，垂钓只花剩余的体力
             await doAquatic();
-            refreshConfigRows(runtime.state);
             const st = runtime.state;
             const staminaText = st?.player ? `体力${Math.floor(liveStamina(st))}/${st.player.stamina_cap ?? '?'}` : '';
             statusLine.textContent = `运行中 ${new Date().toLocaleTimeString()} · ${staminaText} · 金币${playerCoins(st)} · 库存≈${inventoryTotalValue(st)} · ${summarize(st)}`;
@@ -3385,6 +4147,10 @@
             log(`本轮已中止：${e.message}`);
         } finally {
             busy = false;
+            if (runtime.state) {
+                renderDashboard(runtime.state);
+                refreshConfigRows(runtime.state);
+            }
             if (wakeRequested) { // 面板操作请求了即时唤醒：本轮结束后立刻再跑一轮
                 wakeRequested = false;
                 delay = Math.min(delay, 300);
@@ -3466,5 +4232,7 @@
     toggleBtn.onclick = () => (running ? stop() : start());
 
     // 默认自动启动
-    start();
+    initializeDashboard();
+    refreshConfigRows(getPageStore('game')?.state || { inventory: [] });
+    if (CONFIG.ui.autoStart) start();
 })();

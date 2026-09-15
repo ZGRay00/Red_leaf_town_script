@@ -1,6 +1,10 @@
 *
 !红叶镇物语自动助手.user.js
 !red-leaf-town-helper.user.js
+!红叶镇助手-v4使用说明.md
+!tests/
+!tests/red-leaf-town-v4.test.cjs
+!tests/red-leaf-town-ui.cjs
 !.gitignore
 !.github/
 !.github/workflows/
