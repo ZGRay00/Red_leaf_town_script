@@ -78,7 +78,37 @@ async function main() {
         assert.equal(await evaluate(`(()=>{const e=document.querySelector('#rlt-auto-helper-panel'),r=e.getBoundingClientRect();return r.right<=innerWidth && r.left>=0 && r.top>=0 && r.bottom<=innerHeight && e.scrollWidth-e.clientWidth<=1})()`), true, name + ' mobile bounds');
     }
     await screenshot('rlt-v4-mobile');
+    // Mobile collapsed launcher: small hit area, touch drag and tap remain separate.
+    await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+    await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click();window.bottomAction=document.createElement('button');bottomAction.textContent='模拟游戏底部操作';bottomAction.style.cssText='position:fixed;right:8px;bottom:8px;width:180px;height:48px';document.body.appendChild(bottomAction)`);
+    const panelBox = () => evaluate(`(()=>{const r=document.querySelector('#rlt-auto-helper-panel').getBoundingClientRect();return {left:r.left,top:r.top,width:r.width,height:r.height,right:r.right,bottom:r.bottom}})()`);
+    let launcher = await panelBox();
+    assert.equal(launcher.width, 48); assert.equal(launcher.height, 48);
+    assert.equal(await evaluate(`document.elementFromPoint(innerWidth-90,innerHeight-32)===bottomAction`), true, 'bottom game action remains reachable');
+    const mobileCollapsed = await send('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync(path.join(__dirname, 'rlt-v4-mobile-collapsed.png'), Buffer.from(mobileCollapsed.data, 'base64'));
+    async function touch(type, x, y) {
+        await send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] });
+    }
+    await touch('touchStart', launcher.left + 24, launcher.top + 24);
+    await touch('touchMove', 120, 220); await touch('touchEnd');
+    assert.equal(await evaluate(`document.querySelector('#rlt-auto-helper-panel').classList.contains('rlt-collapsed')`), true, 'drag does not expand launcher');
+    launcher = await panelBox(); assert.ok(Math.abs(launcher.left - 96) < 2 && Math.abs(launcher.top - 196) < 2, 'launcher can move on touch screens');
+    await touch('touchStart', launcher.left + 24, launcher.top + 24); await touch('touchEnd');
+    await evaluate(`new Promise(resolve=>setTimeout(resolve,350))`);
+    assert.ok((await panelBox()).width > 300, 'tap expands launcher');
+    assert.equal(await evaluate(`getComputedStyle(document.querySelector('.rlt-config')).display!=='none'`), true);
+    await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click()`);
+    assert.deepEqual(await panelBox(), launcher, 'collapse restores launcher location');
+    for (const [width, height] of [[320, 568], [844, 390]]) {
+        await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: true });
+        const small = await panelBox(); assert.equal(small.width, 48); assert.equal(small.height, 48);
+        await evaluate(`document.querySelector('[aria-label="展开助手面板"]').click()`);
+        const expanded = await panelBox(); assert.ok(expanded.left >= 0 && expanded.top >= 0 && expanded.right <= width && expanded.bottom <= height);
+        await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click()`);
+    }
     assert.deepEqual(errors, []); console.log('Browser: lazy tabs, unique switches, focus/edit preservation, scroll memory, stable dashboard, graph/collapse toggles, desktop/mobile bounds and zero page errors passed.');
+    console.log('Mobile: 48px launcher, bottom action hit testing, touch drag/tap, position restoration and narrow/landscape bounds passed.');
     socket.close();
 }
 if (process.argv.includes('--prepare')) console.log(preview); else main().catch(e => { console.error(e); process.exit(1); });

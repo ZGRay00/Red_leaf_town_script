@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.1
+// @version      4.0.2
 // @description  红叶镇物语自动生产、批量加工流程、航海、均衡饲料补充与图形化管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.0.1';
+    const SCRIPT_VERSION = '4.0.2';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -966,12 +966,19 @@
         #rlt-auto-helper-panel.rlt-compact{padding:10px!important;font-size:12px!important}
         #rlt-auto-helper-panel.rlt-compact .rlt-group{padding:6px 9px}
         #rlt-auto-helper-panel .rlt-footer{font-size:10px;color:#91a18a;margin-top:12px}
-        @media(max-width:540px){#rlt-auto-helper-panel{right:8px!important;left:auto!important;bottom:8px!important;max-width:calc(100vw - 16px)!important;padding:11px!important;border-radius:14px!important}
+        @media(max-width:540px),(pointer:coarse){#rlt-auto-helper-panel{right:8px;bottom:calc(8px + env(safe-area-inset-bottom,0px));max-width:calc(100vw - 16px)!important;padding:11px!important;border-radius:14px!important}
         #rlt-auto-helper-panel .rlt-brand strong{font-size:16px}
         #rlt-auto-helper-panel .rlt-group select{font-size:11px!important}
         #rlt-auto-helper-panel .rlt-stats{gap:5px}
         #rlt-auto-helper-panel .rlt-stat{padding:7px}
-        #rlt-auto-helper-panel .rlt-stat strong{font-size:17px}}
+        #rlt-auto-helper-panel .rlt-stat strong{font-size:17px}
+        #rlt-auto-helper-panel.rlt-collapsed{width:48px;height:48px;padding:0!important;border-radius:50%!important;bottom:calc(80px + env(safe-area-inset-bottom,0px));box-shadow:0 3px 12px #0005}
+        #rlt-auto-helper-panel.rlt-collapsed .rlt-brand{width:100%;height:100%;gap:0}
+        #rlt-auto-helper-panel.rlt-collapsed .rlt-brand>div,#rlt-auto-helper-panel.rlt-collapsed .rlt-brand-icon{display:none}
+        #rlt-auto-helper-panel.rlt-collapsed .rlt-brand>button{width:100%;height:100%;margin:0;padding:0;background:transparent;border-radius:50%!important;font-size:0!important;touch-action:none;user-select:none;-webkit-user-select:none}
+        #rlt-auto-helper-panel.rlt-collapsed .rlt-brand>button::before{content:'🍁';font-size:25px;line-height:1}
+        #rlt-auto-helper-panel.rlt-collapsed .rlt-brand>button:focus-visible{outline-offset:-4px}}
+        #rlt-auto-helper-panel .rlt-toolbar+span{touch-action:none;user-select:none;-webkit-user-select:none}
         #rlt-auto-helper-panel .rlt-config{min-height:0;max-height:54vh;overflow:auto;scrollbar-width:thin;padding:2px}
         #rlt-auto-helper-panel .rlt-log{font-size:11px;white-space:pre-wrap;max-height:100px;flex-shrink:1;overflow:auto;border-top:1px solid var(--rlt-line);margin-top:10px;padding-top:8px;scrollbar-width:thin}
         #rlt-auto-helper-panel .rlt-toolbar button,#rlt-auto-helper-panel .rlt-brand>button{background:#8ead71;color:#17211b;border:0;font-weight:700;padding:4px 10px}
@@ -1692,18 +1699,23 @@
 
     // 收起/展开（记住选择）
     let collapsed = localStorage.getItem('rlt-helper-collapsed') === '1';
+    const panelPositions = { expanded: null, collapsed: null };
+    let ignoreCollapseClickUntil = 0;
     function applyCollapsed() {
         panel.classList.toggle('rlt-collapsed', collapsed);
         applyDashboardPage();
         collapseBtn.textContent = collapsed ? '+' : '—';
         collapseBtn.setAttribute('aria-expanded', String(!collapsed));
         collapseBtn.setAttribute('aria-label', collapsed ? '展开助手面板' : '收起助手面板');
+        collapseBtn.title = collapsed ? '点击展开，拖动可移动位置' : '收起助手面板';
     }
-    collapseBtn.onclick = () => {
+    collapseBtn.onclick = event => {
+        if (event?.detail && performance.now() < ignoreCollapseClickUntil) return;
         collapsed = !collapsed;
         localStorage.setItem('rlt-helper-collapsed', collapsed ? '1' : '0');
         applyCollapsed();
         refreshConfigRows(currentViewState());
+        restorePanelPosition();
     };
     applyCollapsed();
 
@@ -1714,30 +1726,54 @@
         panel.style.left = Math.max(0, Math.min(left, window.innerWidth - rect.width)) + 'px';
         panel.style.top = Math.max(0, Math.min(top, window.innerHeight - rect.height)) + 'px';
     }
-    statusLine.addEventListener('pointerdown', (e) => {
-        if (e.button !== 0) return;
+    function restorePanelPosition() {
+        panel.style.left = panel.style.top = panel.style.right = panel.style.bottom = '';
+        const position = panelPositions[collapsed ? 'collapsed' : 'expanded'];
+        if (position) {
+            panel.style.right = panel.style.bottom = 'auto';
+            clampPanelPosition(position.left, position.top);
+        }
+    }
+    function beginPanelDrag(e) {
+        if (e.button !== 0 || e.isPrimary === false) return;
         finishPanelDrag?.();
-        e.preventDefault();
+        ignoreCollapseClickUntil = 0;
         const rect = panel.getBoundingClientRect();
+        const touchLauncher = collapsed && e.currentTarget === collapseBtn && e.pointerType === 'touch';
         const dx = e.clientX - rect.left, dy = e.clientY - rect.top;
-        panel.style.right = 'auto';
-        panel.style.bottom = 'auto';
-        panel.style.left = rect.left + 'px';
-        panel.style.top = rect.top + 'px';
+        let moved = false;
         const move = (ev) => {
+            if (ev.pointerId !== e.pointerId) return;
+            if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 6) return;
+            moved = true;
+            ev.preventDefault();
+            panel.style.right = panel.style.bottom = 'auto';
             clampPanelPosition(ev.clientX - dx, ev.clientY - dy);
         };
-        const up = () => {
+        const up = ev => {
+            if (ev && ev.pointerId !== e.pointerId) return;
             window.removeEventListener('pointermove', move);
             window.removeEventListener('pointerup', up);
             window.removeEventListener('pointercancel', up);
             finishPanelDrag = null;
+            if (moved) {
+                const position = panel.getBoundingClientRect();
+                panelPositions[collapsed ? 'collapsed' : 'expanded'] = { left: position.left, top: position.top };
+                ignoreCollapseClickUntil = performance.now() + 400;
+            } else if (touchLauncher && ev?.type === 'pointerup' &&
+                       ev.clientX >= rect.left && ev.clientX <= rect.right && ev.clientY >= rect.top && ev.clientY <= rect.bottom) {
+                // 触摸轻点在松手时响应，不依赖浏览器延迟派发的兼容 click。
+                collapseBtn.click();
+                ignoreCollapseClickUntil = performance.now() + 400;
+            }
         };
         finishPanelDrag = up;
         window.addEventListener('pointercancel', up);
         window.addEventListener('pointermove', move);
         window.addEventListener('pointerup', up);
-    });
+    }
+    statusLine.addEventListener('pointerdown', beginPanelDrag);
+    collapseBtn.addEventListener('pointerdown', event => { if (collapsed) beginPanelDrag(event); });
     rosterBtn.onclick = async () => {
         try {
             const snapshot = await api('/state');
