@@ -57,7 +57,7 @@ function harness(initial = fixture(), entries = []) {
         craftFlight, saveCraftFlight, craftPipelineProgress, creditCraftFlight, reconcileCraftFlights, startCraftPlan, configuredCraftSteps,
         craftingInputReserves, inFlightIndustryGuaranteedQty, isPartnerIdle, sailingPartners, processCraftCancel, acceptState, slotTaskItem, managedPartnerSlots,
         renderDashboard, refreshConfigRows, panel, dashboard, tabBar, configBox,
-        start, stop, tick, sleep, wakeSoon,
+        start, stop, tick, sleep, wakeSoon, safeUnspecifiedConsumeQty, logBox,
         activity() { return { running, starting, busy, retryNotBefore }; },
         setRunning(value = true) { running = value; runtime.controller = value ? new AbortController() : null; } };`;
     let source = fs.readFileSync(sourcePath, 'utf8');
@@ -129,9 +129,75 @@ async function run() {
                 assert.equal(req.payload.shop_id, 'balanced-shop'); if (!item) { item = { item_id: 'balanced', name: '均衡饲料', quality: 0, quantity: 0 }; x.backend.inventory.push(item); }
                 item.quantity += req.payload.quantity; x.backend.player.coins -= req.payload.quantity * 5;
             } else { assert.equal(req.url.endsWith('/feed-slot/deposit'), true); assert.equal(req.payload.item_id, 'balanced'); slot.units += req.payload.count * 100; item.quantity -= req.payload.count; }
-            slot.inputs = [{ item_id: 'balanced', item: { name: '均衡饲料' }, quality: 0, quantity: item.quantity, units: 100 }]; return x.response();
+            slot.inputs = item.quantity > 0 ? [{ item_id: 'balanced', item: { name: '均衡饲料' }, quality: 0, quantity: item.quantity, units: 100 }] : []; return x.response();
         });
         await x.h.doAquaticFeed(); assert.equal(x.h.runtime.state.aquatic.feed_slot.units, 800); assert.equal(x.backend.player.coins, 19965); assert.equal(x.backend.inventory[0].quantity, 100);
+        assert.deepEqual(x.calls.filter(req => req.url.endsWith('/shop/buy')).map(req => req.payload.quantity), [1, 6]);
+        assert.deepEqual(x.calls.filter(req => req.url.endsWith('/feed-slot/deposit')).map(req => req.payload.count), [7]);
+    });
+    function batchFeedCase() {
+        const x = harness(); x.h.CONFIG.feed.enabled = true;
+        const unitsByQuality = { 0: 100, 3: 300 };
+        const updateInputs = () => {
+            x.backend.aquatic.feed_slot.inputs = x.backend.inventory.filter(item => item.item_id === 'balanced' && item.quantity > 0)
+                .map(item => ({ item_id: item.item_id, quality: item.quality || 0, quantity: item.quantity, units: unitsByQuality[item.quality || 0] }));
+        };
+        x.setResponder(req => {
+            const slot = x.backend.aquatic.feed_slot;
+            const quality = req.payload.quality || 0;
+            let item = x.backend.inventory.find(item => item.item_id === 'balanced' && (item.quality || 0) === quality);
+            if (req.url.endsWith('/shop/buy')) {
+                assert.equal(req.payload.shop_id, 'balanced-shop'); assert.ok(req.payload.quantity >= 1 && req.payload.quantity <= 99);
+                if (!item) { item = { item_id: 'balanced', quality: 0, quantity: 0 }; x.backend.inventory.push(item); }
+                item.quantity += req.payload.quantity; x.backend.player.coins -= 5 * req.payload.quantity;
+            } else {
+                assert.ok(req.url.endsWith('/feed-slot/deposit')); assert.equal(req.payload.item_id, 'balanced');
+                assert.ok(item.quantity >= req.payload.count && req.payload.count > 0);
+                item.quantity -= req.payload.count; slot.units += unitsByQuality[quality] * req.payload.count;
+                assert.ok(slot.units <= slot.capacity);
+            }
+            updateInputs(); return x.response();
+        });
+        return Object.assign(x, { updateInputs, purchases: () => x.calls.filter(req => req.url.endsWith('/shop/buy')).map(req => req.payload.quantity) });
+    }
+    await test('feed buys only the gap after accounting for inventory of different qualities', async () => {
+        const x = batchFeedCase(); x.backend.inventory.push({ item_id: 'balanced', quality: 3, quantity: 1 }); x.updateInputs(); x.sync();
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 3]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+    });
+    await test('feed inventory that already reaches the target requires no shopping', async () => {
+        const x = batchFeedCase(); x.backend.inventory.push({ item_id: 'balanced', quality: 0, quantity: 7 }); x.updateInputs(); x.sync();
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), []); assert.equal(x.calls.length, 1);
+    });
+    await test('feed batches respect budget and reuse observed units after stock disappears', async () => {
+        const x = batchFeedCase(); x.h.CONFIG.feed.maxSpendPerTick = 15;
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 2]); assert.equal(x.backend.aquatic.feed_slot.units, 400);
+        assert.equal(x.backend.aquatic.feed_slot.inputs.length, 0);
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 2, 3]); assert.equal(x.backend.aquatic.feed_slot.units, 700);
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 2, 3, 1]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+    });
+    await test('feed batch purchase preserves coin floor and deposits affordable stock', async () => {
+        const x = batchFeedCase(); x.h.CONFIG.feed.coinReserve = 19985;
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 2]); assert.equal(x.backend.player.coins, 19985); assert.equal(x.backend.aquatic.feed_slot.units, 400);
+    });
+    await test('feed splits large purchases into batches of at most 99', async () => {
+        const x = batchFeedCase(); Object.assign(x.h.CONFIG.feed, { thresholdMode: 'units', low: 100, target: 20000 });
+        x.backend.aquatic.feed_slot.capacity = 20000; x.sync();
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 99, 99]); assert.equal(x.backend.aquatic.feed_slot.units, 20000);
+    });
+    await test('feed deposits a partial batch before reaching the per-cycle work limit', async () => {
+        const x = batchFeedCase(); Object.assign(x.h.CONFIG.feed, { thresholdMode: 'units', low: 100, target: 200000, maxSpendPerTick: 10000 });
+        x.backend.aquatic.feed_slot.capacity = 200000; x.sync();
+        await x.h.doAquaticFeed(); assert.ok(x.backend.aquatic.feed_slot.units > 100); assert.ok(x.backend.aquatic.feed_slot.units < 200000);
+        assert.ok(x.calls.at(-1).url.endsWith('/feed-slot/deposit')); assert.ok(x.calls.length <= 12);
+    });
+    await test('feed batch toggle can retain single-item buying', async () => {
+        const x = batchFeedCase(); x.h.CONFIG.feed.batchBuy = false;
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 1, 1, 1, 1, 1, 1]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+    });
+    await test('feed does not keep buying when remaining capacity cannot fit a whole item', async () => {
+        const x = batchFeedCase(); Object.assign(x.h.CONFIG.feed, { thresholdMode: 'units', low: 100, target: 145 });
+        x.backend.aquatic.feed_slot.capacity = 145; x.sync();
+        await x.h.doAquaticFeed(); await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1]); assert.equal(x.backend.aquatic.feed_slot.units, 100);
     });
     await test('feed hysteresis and invalid bounds cause no purchase', async () => {
         const x = harness(); x.h.CONFIG.feed.enabled = true; x.h.runtime.state.aquatic.feed_slot.units = 400;
@@ -157,6 +223,65 @@ async function run() {
         x.backend.sailing.active_run = { run_id: 'old', ready_at: x.backend.server_time - 1, route_name: '芦苇湾', partner_ids: ['p1'] }; x.sync();
         x.setResponder(req => { if (req.url.endsWith('/collect')) { assert.equal(req.payload.run_id, 'old'); x.backend.sailing.active_run = null; } else { assert.deepEqual(req.payload.partner_ids, ['p1']); assert.equal(req.payload.route_id, 'reed_bay'); assert.match(req.payload.request_id, /^[\da-f-]{36}$/); } return x.response(); });
         await x.h.doSailing(); assert.equal(x.calls.length, 2);
+    });
+    function sailingSupplyCase(quantity = 4) {
+        const initial = fixture();
+        initial.inventory.push({ item_id: 'snack', name: '腌渍胡萝卜', quality: 1, quantity });
+        initial.sailing.supplies.push({ id: 'portable', name: '便携口粮', item_id: 'snack', item_name: '腌渍胡萝卜', quantity: 2, owned: quantity });
+        initial.partners = [{ partner_id: 'p1', name: '海风', tendencies: [] }];
+        const x = harness(initial);
+        Object.assign(x.h.CONFIG.sailing, { enabled: true, autoStart: true, routeId: 'reed_bay', supplyId: 'portable' });
+        x.setResponder(req => { assert.ok(req.url.endsWith('/sailing/start')); assert.equal(req.payload.supply_id, 'portable'); return x.response(); });
+        return x;
+    }
+    await test('sailing can consume 2 supplies from 4 or exactly 2 without the selling default keep', async () => {
+        for (const quantity of [4, 2]) {
+            const x = sailingSupplyCase(quantity);
+            await x.h.doSailing(); assert.equal(x.calls.length, 1, `stock ${quantity} must allow one departure`);
+            assert.equal(x.h.safeUnspecifiedConsumeQty(x.h.runtime.state, 'snack', '', { excludeSailing: true }), 0, 'selling still keeps its default reserve');
+        }
+    });
+    await test('sailing rejects actual supply shortage with inventory and requirement in the log', async () => {
+        const x = sailingSupplyCase(1);
+        await x.h.doSailing(); assert.equal(x.calls.length, 0);
+        assert.match(x.h.logBox.children[0].textContent, /库存 1，安全可用 1，需要 2/);
+    });
+    await test('sailing continues to protect explicitly configured inventory reserves', async () => {
+        const x = sailingSupplyCase(); x.h.CONFIG.selling.keepByItemId.snack = 3;
+        await x.h.doSailing(); assert.equal(x.calls.length, 0);
+        assert.match(x.h.logBox.children[0].textContent, /库存 4，安全可用 1，需要 2/);
+        x.h.CONFIG.selling.keepByItemId.snack = 2;
+        await x.h.doSailing(); assert.equal(x.calls.length, 1);
+    });
+    await test('sailing continues to protect commission and portal supplies', async () => {
+        for (const source of ['commission', 'portal']) {
+            const x = sailingSupplyCase();
+            if (source === 'commission') x.backend.commissions = { commission: { item_id: 'snack', quantity: 3, status: 'active' } };
+            else x.backend.portals = [{ unlocked: true, tributes: [{ item_id: 'snack', min_quality: 1, quantity: 3 }] }];
+            x.sync(); await x.h.doSailing(); assert.equal(x.calls.length, 0, source);
+        }
+    });
+    await test('sailing continues to protect materials for active crafting plans', async () => {
+        const x = sailingSupplyCase(); x.h.CONFIG.crafting.batchLimit = 1;
+        x.backend.crafting_stations[0].recipes[0].inputs = [{ item_id: 'snack', quantity: 3 }]; x.sync();
+        x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        await x.h.doSailing(); assert.equal(x.calls.length, 0);
+        assert.match(x.h.logBox.children[0].textContent, /库存 4，安全可用 1，需要 2/);
+    });
+    await test('sailing never trusts the displayed owned count over current inventory', async () => {
+        const x = sailingSupplyCase(1); x.backend.sailing.supplies[1].owned = 99; x.sync();
+        await x.h.doSailing(); assert.equal(x.calls.length, 0);
+    });
+    await test('ship construction and upgrades also skip the default selling reserve', async () => {
+        for (const operation of ['build', 'upgrade']) {
+            const x = sailingSupplyCase(2); Object.assign(x.h.CONFIG.sailing, { autoStart: false, autoBuild: true, autoUpgrade: true });
+            x.backend.sailing.ship_built = operation !== 'build';
+            x.backend.sailing.construction = { coins: 80, materials: [{ item_id: 'snack', quantity: 2 }] };
+            x.backend.sailing.upgrades = operation === 'upgrade' ? [{ kind: 'hull', level: 0, coins: 30, item_id: 'snack', quantity: 2 }] : [];
+            x.sync();
+            x.setResponder(req => { assert.ok(req.url.endsWith(`/sailing/${operation}`)); x.backend.sailing.ship_built = true; return x.response(); });
+            await x.h.doSailing(); assert.equal(x.calls.length, 1, operation);
+        }
     });
     await test('specified sailors reserved, busy party not substituted', async () => {
         const x = harness(); Object.assign(x.h.CONFIG.sailing, { enabled: true, autoStart: true, routeId: 'reed_bay', partnerIds: '["p1"]' });

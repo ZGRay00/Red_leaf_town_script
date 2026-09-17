@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.2
+// @version      4.0.3
 // @description  红叶镇物语自动生产、批量加工流程、航海、均衡饲料补充与图形化管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.0.2';
+    const SCRIPT_VERSION = '4.0.3';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -127,6 +127,7 @@
         feed: {
             enabled: false,          // 独立于水产总开关，仅投入商店的“均衡饲料”
             autoBuy: true,
+            batchBuy: true,          // 识别每件换算份数后，按缺口和预算批量购买
             thresholdMode: 'percent', // percent = 容量百分比，units = 饲料份数
             low: 20,
             target: 80,
@@ -467,6 +468,7 @@
         monotonicMsAtSync: 0,
         storyWasBusy: false,
         storyGraceUntil: 0,
+        feedPurchase: null, // 当前页面通过购买响应识别的饲料品质与换算量
     };
 
     // ---------- 运行生命周期状态 ----------
@@ -1146,7 +1148,7 @@
             ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
             ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
             ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '自动提交队列'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.repeatPipeline', '流程完成后循环'], ['crafting.batchLimit', '每次最多份数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
-            ['均衡饲料策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
+            ['均衡饲料策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买'], ['feed.batchBuy', '批量购买均衡饲料'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
             ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
             ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
         ];
@@ -2434,9 +2436,9 @@
         return reserves;
     }
 
-    function configuredKeep(itemId, craftingReserves = null) {
+    function configuredKeep(itemId, craftingReserves = null, { applyDefaultKeep = true } = {}) {
         const explicit = CONFIG.selling.keepByItemId?.[String(itemId)];
-        const inventoryKeep = Math.max(0, Number(explicit ?? CONFIG.selling.defaultKeep ?? 0));
+        const inventoryKeep = Math.max(0, Number(explicit ?? (applyDefaultKeep ? CONFIG.selling.defaultKeep : 0) ?? 0));
         const craftingKeep = Math.max(0, Number(craftingReserves?.get(String(itemId)) || 0));
         return Math.max(inventoryKeep, craftingKeep);
     }
@@ -2505,13 +2507,14 @@
     // 接单/加工接口不指定品质：按“服务器优先扣最高品质”的最坏情况计算仍可安全消耗多少。
     // applyKeep：是否套用 selling 的保留量（defaultKeep/keepByItemId）——售卖/接单场景要保留，
     // 加工投料场景不能保留，否则库存不足 defaultKeep 的合法原料会被误判为“材料不足”
-    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, excludeSailing = false } = {}) {
+    // 航海仅跳过默认售卖保留量；明确指定的保留量和加工预留仍然生效。
+    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, applyDefaultKeep = true, excludeSailing = false } = {}) {
         const stacks = (state.inventory || []).filter(i => itemId != null ? sameId(i.item_id, itemId) : i.name === name);
         if (!stacks.length) return 0;
         const needs = gatherNeeds(state).filter(n => (!excludeSailing || n.source !== 'sailing') && stacks.some(item => needMatchesItem(n, item)));
         const thresholds = new Set([0, ...needs.map(n => Number(n.minQuality || 0))]);
         const craftingReserves = reserveCraftingInputs ? craftingInputReserves(state) : null;
-        const keep = applyKeep ? configuredKeep(itemId, craftingReserves) : 0;
+        const keep = applyKeep ? configuredKeep(itemId, craftingReserves, { applyDefaultKeep }) : 0;
         let safe = Infinity;
         for (const q of thresholds) {
             const eligible = stacks.filter(i => Number(i.quality || 0) >= q)
@@ -3738,13 +3741,39 @@
         return rows.filter(row => Number(row.item.quality || 0) === Number(input.quality || 0))
             .reduce((sum, row) => sum + row.free, 0);
     }
+    function feedStockPlan(state, inputs, target) {
+        const slot = state.aquatic.feed_slot;
+        let missing = target - Number(slot.units), room = Number(slot.capacity) - Number(slot.units);
+        const deposits = [];
+        for (const input of inputs) {
+            if (missing <= 0) break;
+            const units = Number(input.units);
+            const count = Math.min(Math.floor(feedFreeQuantity(state, input)), Math.floor(room / units), Math.ceil(missing / units));
+            if (count <= 0) continue;
+            deposits.push({ input, count });
+            missing -= count * units; room -= count * units;
+        }
+        return { deposits, missing: Math.max(0, missing), room };
+    }
+    function identifyPurchasedFeed(before, after, itemId) {
+        const quantityAt = (state, quality) => (state.inventory || [])
+            .filter(item => sameId(item.item_id, itemId) && Number(item.quality || 0) === quality)
+            .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+        // 从实际购买响应识别品质与换算量，不能拿背包中另一品质的饲料来估算新购商品。
+        const candidates = balancedFeedInputs(after).filter(input => sameId(input.item_id, itemId) &&
+            quantityAt(after, Number(input.quality || 0)) > quantityAt(before, Number(input.quality || 0)));
+        return candidates.length === 1 ? { itemId, quality: Number(candidates[0].quality || 0), units: Number(candidates[0].units) } : null;
+    }
     // 低水位触发后持续补到目标；购买和投入都读取最新 state，只消费指定饲料。
     async function doAquaticFeed() {
         const cfg = CONFIG.feed;
         if (!CONFIG.feed.enabled) return;
         let spent = 0;
         let calibrated = false;
-        for (let attempt = 0; attempt < 12 && running && CONFIG.feed.enabled; attempt++) {
+        const build = detectedGameBuild();
+        let purchasedFeed = runtime.feedPurchase?.build === build ? runtime.feedPurchase : null;
+        const maxAttempts = 12;
+        for (let attempt = 0; attempt < maxAttempts && running && CONFIG.feed.enabled; attempt++) {
             const state = runtime.state;
             const slot = state.aquatic?.feed_slot;
             if (!slot || !(state.aquatic?.unlocked || state.livestock?.unlocked)) return;
@@ -3756,42 +3785,56 @@
             setOverride(FEED_FILL_KEY, '1');
             const inputs = balancedFeedInputs(state);
             if (inputs.length && getOverride('rlt-feed-pending-item')) setOverride('rlt-feed-pending-item', '');
-            const input = inputs.find(item => feedFreeQuantity(state, item) > 0 &&
-                Number(item.units) <= Number(slot.capacity) - Number(slot.units));
+            const plan = feedStockPlan(state, inputs, bounds.target);
             try {
-                if (input) {
-                    const count = Math.min(Math.floor(feedFreeQuantity(state, input)),
-                        Math.floor((Number(slot.capacity) - Number(slot.units)) / Number(input.units)),
-                        Math.ceil((bounds.target - Number(slot.units)) / Number(input.units)));
+                let blocked = null;
+                // 留出最后一次操作投入已买到的饲料，超大缺口留待下一轮继续。
+                if (plan.missing > 0 && cfg.autoBuy && (attempt < maxAttempts - 1 || !plan.deposits.length)) {
+                    const entry = balancedFeedEntry(state), price = Number(entry?.price);
+                    if (!entry || !Number.isFinite(price) || price < 0) {
+                        blocked = ['feed:shop', '商店暂无可购买的“均衡饲料”，等待商品数据'];
+                    } else {
+                        const itemId = shopEntryItemId(entry);
+                        const sameProduct = purchasedFeed && sameId(purchasedFeed.itemId, itemId) && sameId(purchasedFeed.shopId, entry.id);
+                        const knownInput = sameProduct
+                            ? inputs.find(input => Number(input.quality || 0) === purchasedFeed.quality) : null;
+                        if (knownInput) purchasedFeed.units = Number(knownInput.units);
+                        const knownUnits = sameProduct ? purchasedFeed.units : 0;
+                        const allowance = Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent));
+                        const affordable = cfg.maxSpendPerTick > 0 && playerCoins(state) >= cfg.coinReserve
+                            ? (price > 0 ? Math.floor(allowance / price) : 99) : 0;
+                        if (knownUnits > plan.room) {
+                            blocked = ['feed:room', '饲料槽剩余空间不足一份均衡饲料，等待消耗后再补'];
+                        } else if (!knownUnits && (calibrated || sameId(getOverride('rlt-feed-pending-item'), itemId))) {
+                            blocked = ['feed:metadata', '已购入均衡饲料，但服务器未给出可投喂信息，暂停购买'];
+                        } else {
+                            const needed = knownUnits > 0 ? Math.min(Math.floor(plan.room / knownUnits), Math.ceil(plan.missing / knownUnits)) : 1;
+                            const count = Math.min(cfg.batchBuy ? 99 : 1, affordable, needed);
+                            if (count > 0) {
+                                await buyItem(entry.id, count);
+                                const observed = identifyPurchasedFeed(state, runtime.state, itemId);
+                                purchasedFeed = observed ? { ...observed, shopId: entry.id, build } : null;
+                                runtime.feedPurchase = purchasedFeed; // 页面内复用；刷新或游戏构建变化后重新识别。
+                                setOverride('rlt-feed-pending-item', purchasedFeed ? '' : String(itemId));
+                                spent += price * count; calibrated = true;
+                                log(`已购买${BALANCED_FEED_NAME} ×${count}（${price * count} 金币）`);
+                                if (inventoryQty(runtime.state, itemId) <= inventoryQty(state, itemId)) return;
+                                continue; // 先补足可用库存，再合并投料；始终用购买响应重新计算缺口。
+                            }
+                            blocked = ['feed:budget', '均衡饲料购买达到本轮预算或金币保底，等待下一轮'];
+                        }
+                    }
+                } else if (plan.missing > 0 && !cfg.autoBuy) blocked = ['feed:stock', '均衡饲料库存不足或已预留，自动购买已关闭'];
+                // 预算不足或购买不可用时，先投入现有可用库存，不要求整批买齐才投料。
+                if (plan.deposits.length) {
+                    const { input, count } = plan.deposits[0];
                     await depositFeed(input.item_id, Number(input.quality || 0), count);
                     log(`饲料槽：投入${BALANCED_FEED_NAME} ×${count}，余量 ${Math.floor(runtime.state.aquatic.feed_slot.units)} 份`);
                     if (Number(runtime.state.aquatic?.feed_slot?.units) <= Number(slot.units)) return;
                     continue;
                 }
-                if (!cfg.autoBuy) { logSkip('feed:stock', '均衡饲料库存不足或已预留，自动购买已关闭'); return; }
-                const entry = balancedFeedEntry(state);
-                const price = Number(entry?.price);
-                if (!entry || !Number.isFinite(price) || price < 0) {
-                    logSkip('feed:shop', '商店暂无可购买的“均衡饲料”，等待商品数据'); return;
-                }
-                const knownUnits = Number(inputs[0]?.units || 0);
-                if (knownUnits > Number(slot.capacity) - Number(slot.units)) {
-                    setOverride(FEED_FILL_KEY, '');
-                    logSkip('feed:room', '饲料槽剩余空间不足一份均衡饲料，等待消耗后再补'); return;
-                }
-                if (cfg.maxSpendPerTick <= 0 || playerCoins(state) < cfg.coinReserve) return;
-                const affordable = price > 0 ? Math.floor(Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent)) / price) : 99;
-                // 无库存时前端可能不提供每件份数：先买一件，待权威输入列表更新后再按量采购。
-                if (!knownUnits && (calibrated || sameId(getOverride('rlt-feed-pending-item'), shopEntryItemId(entry)))) { logSkip('feed:metadata', '已购入均衡饲料，但服务器未给出可投喂信息，暂停购买'); return; }
-                const needed = knownUnits > 0 ? Math.min(Math.floor((slot.capacity - slot.units) / knownUnits), Math.ceil((bounds.target - slot.units) / knownUnits)) : 1;
-                const count = Math.min(99, affordable, needed);
-                if (count <= 0) { logSkip('feed:budget', '均衡饲料购买达到本轮预算或金币保底，等待下一轮'); return; }
-                await buyItem(entry.id, count);
-                setOverride('rlt-feed-pending-item', knownUnits ? '' : String(shopEntryItemId(entry)));
-                spent += price * count;
-                calibrated = true;
-                log(`已购买${BALANCED_FEED_NAME} ×${count}（${price * count} 金币）`);
-                if (inventoryQty(runtime.state, shopEntryItemId(entry)) <= inventoryQty(state, shopEntryItemId(entry))) return;
+                if (blocked) logSkip(...blocked);
+                return;
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
                 logSkip('feed:failed', `均衡饲料补充失败：${e.message}`); return;
@@ -3842,6 +3885,10 @@
             source: 'sailing', itemId: row.item_id, name: row.item_name || '', minQuality: 0, need: Number(row.quantity),
         }));
     }
+    function sailingAvailableQty(state, itemId) {
+        if (itemId == null) return 0;
+        return safeUnspecifiedConsumeQty(state, itemId, '', { excludeSailing: true, applyDefaultKeep: false });
+    }
     function sailingInputsSafe(state, inputs) {
         const totals = new Map();
         for (const row of inputs) {
@@ -3850,7 +3897,7 @@
             const key = String(row.item_id);
             totals.set(key, (totals.get(key) || 0) + Number(row.quantity));
         }
-        return [...totals].every(([id, quantity]) => safeUnspecifiedConsumeQty(state, id, '', { excludeSailing: true }) >= quantity);
+        return [...totals].every(([id, quantity]) => sailingAvailableQty(state, id) >= quantity);
     }
     async function doSailing() {
         const cfg = CONFIG.sailing;
@@ -3895,7 +3942,16 @@
             if (!route) { logSkip('sailing:route', '请选择一条已解锁航线后自动出航'); return; }
             const supply = sail.supplies?.find(item => sameId(item.id, cfg.supplyId));
             if (!supply && cfg.supplyId !== 'none') { logSkip('sailing:supply', '指定航海补给当前不可用'); return; }
-            if (supply?.quantity > 0 && !sailingInputsSafe(runtime.state, [supply])) { logSkip('sailing:supply', '航海补给不足或已为其他用途预留'); return; }
+            if (supply?.quantity > 0) {
+                const available = sailingAvailableQty(runtime.state, supply.item_id);
+                if (supply.item_id == null) { logSkip('sailing:supply', '航海补给缺少物品信息，请刷新游戏后重试'); return; }
+                if (available < Number(supply.quantity)) {
+                    const owned = inventoryQty(runtime.state, supply.item_id);
+                    logSkip('sailing:supply', `航海补给「${supply.item_name || supply.name}」不足：库存 ${owned}，安全可用 ${available}，需要 ${supply.quantity}（已保护委托、传送门、加工计划和指定保留量）`);
+                    return;
+                }
+            }
+            clearSkip('sailing:supply');
             if (!canSpend(route.coins)) { logSkip('sailing:budget', '出航费用超出本轮预算或金币保底'); return; }
             const stamina = Number(route.stamina);
             if (!Number.isFinite(stamina) || stamina < 0) return;
