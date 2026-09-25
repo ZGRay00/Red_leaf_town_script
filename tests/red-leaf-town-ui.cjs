@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const { fixture, sourcePath } = require('./red-leaf-town-v4.test.cjs');
 const preview = path.join(__dirname, 'red-leaf-town-preview.html');
 const state = fixture(), now = state.server_time;
+state.inventory.push({ item_id: 'pumpkin', name: '南瓜', quality: 0, quantity: 30 }, { item_id: 'grain_feed', name: '谷物饲料', quality: 0, quantity: 20 });
+state.aquatic.feed_slot.inputs = [{ item_id: 'pumpkin', item: { name: '南瓜' }, quality: 0, quantity: 30, units: 30 }, { item_id: 'grain_feed', item: { name: '谷物饲料' }, quality: 0, quantity: 20, units: 90 }];
 state.plots = [{ slot: 0, empty: false, ready: false, ready_at: now + 240, planted_at: now - 360, crop: { name: '南瓜' } }];
 state.crops = [{ id: 'pumpkin', name: '南瓜', seed_item_id: 'pumpkin_seed' }];
 state.partners = [{ partner_id: 'p1', name: '海风', tendencies: [{ industry: 'aquatic', effective_ability: 45 }] }, { partner_id: 'p2', name: '晨曦' }, { partner_id: 'p3', name: '林间' }];
@@ -39,7 +41,16 @@ async function main() {
         if (['crafting', 'feed', 'sailing'].includes(name)) await screenshot('rlt-v4-' + name);
     }
     // Real browser interaction: a module switch must update its ARIA state and persisted setting.
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="crafting"]').click()`);
+    assert.equal(await evaluate(`document.querySelector('[aria-label="缺料自动加工"]').getAttribute('aria-checked')`), 'true');
+    await evaluate(`document.querySelector('[aria-label="缺料自动加工"]').click()`);
+    assert.equal(await evaluate(`window.__rltPreview.CONFIG.crafting.autoCraftInputs`), false);
+    await evaluate(`document.querySelector('[aria-label="缺料自动加工"]').click()`);
     await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click()`);
+    assert.deepEqual(await evaluate(`Array.from(document.querySelector('select[aria-label="投喂物品"]').options).map(o=>o.value)`), ['', 'pumpkin', 'grain_feed']);
+    await evaluate(`(()=>{const e=document.querySelector('select[aria-label="投喂物品"]');e.value='pumpkin';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.itemId`), 'pumpkin');
+    assert.equal(await evaluate(`JSON.parse(localStorage.getItem('rlt-setting:feed.itemId'))`), 'pumpkin');
     await evaluate(`Array.from(document.querySelectorAll('[role="switch"]')).find(e=>e.getAttribute('aria-label')==='自动补充饲料').click()`);
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.enabled`), true);
     assert.equal(await evaluate(`document.querySelector('[aria-label="自动补充饲料"]').getAttribute('aria-checked')`), 'true');

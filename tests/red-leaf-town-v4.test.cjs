@@ -52,8 +52,8 @@ function harness(initial = fixture(), entries = []) {
             calls.push(request); if (!responder) throw new Error(`Unexpected network: ${url}`); return responder(request);
         },
     };
-    const exposure = `window.__test = { CONFIG, runtime, setSetting, getOverride, setOverride, liveStamina, staminaWaitSeconds, nextDelay,
-        doAquaticFeed, doSailing, balancedFeedInputs, feedThresholds, craftBatchSize, collectReadyIndustries, startEmptyIndustries,
+    const exposure = `window.__test = { CONFIG, chooseCropTarget, gatherNeeds, needShortage, runtime, setSetting, getOverride, setOverride, liveStamina, staminaWaitSeconds, nextDelay,
+        doAquaticFeed, doSailing, feedInputs, feedThresholds, feedPurchaseSnapshot, identifyPurchasedFeed, craftBatchSize, collectReadyIndustries, startEmptyIndustries,
         craftFlight, saveCraftFlight, craftPipelineProgress, creditCraftFlight, reconcileCraftFlights, startCraftPlan, configuredCraftSteps,
         craftingInputReserves, inFlightIndustryGuaranteedQty, isPartnerIdle, sailingPartners, processCraftCancel, acceptState, slotTaskItem, managedPartnerSlots,
         renderDashboard, refreshConfigRows, panel, dashboard, tabBar, configBox,
@@ -135,12 +135,14 @@ async function run() {
         assert.deepEqual(x.calls.filter(req => req.url.endsWith('/shop/buy')).map(req => req.payload.quantity), [1, 6]);
         assert.deepEqual(x.calls.filter(req => req.url.endsWith('/feed-slot/deposit')).map(req => req.payload.count), [7]);
     });
-    function batchFeedCase() {
+    function batchFeedCase({ duplicateInputs = false, hideInputs = () => false } = {}) {
         const x = harness(); x.h.CONFIG.feed.enabled = true;
         const unitsByQuality = { 0: 100, 3: 300 };
         const updateInputs = () => {
             x.backend.aquatic.feed_slot.inputs = x.backend.inventory.filter(item => item.item_id === 'balanced' && item.quantity > 0)
                 .map(item => ({ item_id: item.item_id, quality: item.quality || 0, quantity: item.quantity, units: unitsByQuality[item.quality || 0] }));
+            if (duplicateInputs) x.backend.aquatic.feed_slot.inputs.push(...structuredClone(x.backend.aquatic.feed_slot.inputs));
+            if (hideInputs()) x.backend.aquatic.feed_slot.inputs = [];
         };
         x.setResponder(req => {
             const slot = x.backend.aquatic.feed_slot;
@@ -198,6 +200,50 @@ async function run() {
         const x = batchFeedCase(); Object.assign(x.h.CONFIG.feed, { thresholdMode: 'units', low: 100, target: 145 });
         x.backend.aquatic.feed_slot.capacity = 145; x.sync();
         await x.h.doAquaticFeed(); await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1]); assert.equal(x.backend.aquatic.feed_slot.units, 100);
+    });
+    await test('feed calibration deduplicates repeated input rows and fills the target in one cycle', async () => {
+        const x = batchFeedCase({ duplicateInputs: true });
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 6]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+        assert.equal(x.calls.filter(req => req.url.endsWith('/deposit')).reduce((sum, req) => sum + req.payload.count, 0), 7);
+    });
+    await test('feed calibration preserves a numeric baseline when the old inventory object changes', () => {
+        const { h } = harness(), state = fixture();
+        state.inventory.push({ item_id: 'balanced', quality: 0, quantity: 2 });
+        const before = h.feedPurchaseSnapshot(state, 'balanced');
+        state.inventory.at(-1).quantity = 3;
+        state.aquatic.feed_slot.inputs = [{ item_id: 'balanced', quality: 0, quantity: 3, units: 100 }];
+        const found = h.identifyPurchasedFeed(before, state, 'balanced', 1);
+        assert.equal(found.quality, 0); assert.equal(found.units, 100); assert.equal(before.inventory.get(0), 2);
+    });
+    await test('feed input quantity can confirm a purchase when the inventory delta is unavailable', () => {
+        const { h } = harness(), state = fixture();
+        state.inventory.push({ item_id: 'balanced', quality: 0, quantity: 1 });
+        const before = h.feedPurchaseSnapshot(state, 'balanced');
+        state.aquatic.feed_slot.inputs = [{ item_id: 'balanced', quality: 0, quantity: 1, units: 100 }];
+        assert.equal(h.identifyPurchasedFeed(before, state, 'balanced', 1).units, 100);
+    });
+    await test('feed resumes bulk buying after delayed input metadata without another calibration purchase', async () => {
+        let hidden = true;
+        const x = batchFeedCase({ hideInputs: () => hidden });
+        await x.h.doAquaticFeed(); await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1]);
+        assert.equal(x.h.runtime.feedPurchase.quality, 0); assert.equal(x.h.runtime.feedPurchase.units, 0);
+        hidden = false; x.updateInputs(); x.sync();
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 6]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+        assert.equal(x.h.getOverride('rlt-feed-pending-item'), null);
+    });
+    await test('feed recovers a legacy pending marker when usable input metadata becomes available', async () => {
+        const x = batchFeedCase(); x.backend.inventory.push({ item_id: 'balanced', quality: 0, quantity: 1 });
+        x.updateInputs(); x.sync(); x.h.setOverride('rlt-feed-pending-item', 'balanced');
+        await x.h.doAquaticFeed(); assert.deepEqual(x.purchases(), [1, 5]); assert.equal(x.backend.aquatic.feed_slot.units, 800);
+    });
+    await test('feed conflicting quality or conversion information cannot calibrate a bulk purchase', () => {
+        const { h } = harness(), state = fixture(), before = h.feedPurchaseSnapshot(state, 'balanced');
+        state.inventory.push({ item_id: 'balanced', quality: 0, quantity: 1 });
+        state.aquatic.feed_slot.inputs = [{ item_id: 'balanced', quality: 3, quantity: 1, units: 300 }];
+        assert.equal(h.identifyPurchasedFeed(before, state, 'balanced', 1), null);
+        state.aquatic.feed_slot.inputs = [{ item_id: 'balanced', quality: 0, quantity: 1, units: 100 }, { item_id: 'balanced', quality: 0, quantity: 1, units: 200 }];
+        assert.equal(h.feedInputs(state, 'balanced').length, 0);
+        assert.equal(h.identifyPurchasedFeed(before, state, 'balanced', 1).units, 0);
     });
     await test('feed hysteresis and invalid bounds cause no purchase', async () => {
         const x = harness(); x.h.CONFIG.feed.enabled = true; x.h.runtime.state.aquatic.feed_slot.units = 400;
