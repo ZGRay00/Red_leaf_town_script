@@ -25,8 +25,8 @@ function branch(root, name) {
         descendants(node.children[0]).some(child => child.className === 'rlt-material-name' && child.textContent === name));
 }
 function fixture() {
-    return { title: '营养饲料', quantity: 2, status: 'crafting', statusLabel: '先加工谷物饲料', preview: false,
-        root: { key: 'nutrition', kind: 'recipe', name: '营养饲料', required: 2, status: 'crafting', statusLabel: '等待材料', children: [
+    return { title: '营养饲料', quantity: 2, phase: 'planning', status: 'crafting', statusLabel: '先加工谷物饲料', preview: false,
+        root: { key: 'nutrition', kind: 'recipe', name: '营养饲料', required: 2, outputPerCraft: 3, outputQuantity: 6, stamina: 8, status: 'crafting', statusLabel: '等待材料', children: [
             { key: 'nutrition/grain', kind: 'material', name: '谷物饲料', required: 8, available: 2, pending: 1, planned: 2, missing: 3,
                 stock: 9, protected: 4, otherAllocated: 3, protections: [{ name: '每日委托', quantity: 4, minQuality: 2 }],
                 status: 'crafting', statusLabel: '需要加工', children: [
@@ -50,7 +50,7 @@ test('the entire tree starts closed and does not calculate a plan before opening
 test('tree rows display provided quantities without recalculating supplies or shortages', () => {
     const x = view(fixture()), section = x.make({}, { station_id: 'mill' }); toggle(section, true);
     const content = text(section);
-    for (const expected of ['先加工谷物饲料', '加工份数 2', '需 8', '库存供给 2', '在途 1', '计划供给 2', '待补 3', '背包总量 9', '受保护 4', '其他分支已分配 3', '每日委托：4（品质 ≥ 2）', '谷仓加工台']) {
+    for (const expected of ['先加工谷物饲料', '加工次数 2', '每次至少产出 3', '合计至少产出 6', '体力 8', '需 8', '库存供给 2', '在途 1', '计划供给 2', '待补 3', '背包总量 9', '受保护 4', '其他分支已分配 3', '每日委托：4（品质 ≥ 2）', '谷仓加工台']) {
         assert.ok(content.includes(expected), expected);
     }
     assert.ok(content.includes('库存供给 6')); assert.ok(content.includes('待补 0'));
@@ -75,7 +75,7 @@ test('section and individual branch choices survive state refreshes independentl
 });
 
 test('missing root displays explanatory state instead of an empty tree', () => {
-    const x = view({ statusLabel: '加工已暂停', note: '选择配方后可以查看材料。', root: null, preview: true });
+    const x = view({ phase: 'planning', statusLabel: '加工已暂停', note: '选择配方后可以查看材料。', root: null, preview: true });
     const section = x.make({}, { station_id: 'mill' }); toggle(section, true);
     assert.ok(text(section).includes('加工已暂停')); assert.ok(text(section).includes('选择配方后可以查看材料。'));
     assert.ok(text(section).includes('当前用料预览'));

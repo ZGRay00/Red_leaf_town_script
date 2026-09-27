@@ -25,6 +25,7 @@ function setup({ stations, items = {}, rootStation = 'kitchen', rootRecipe = 'me
     x.h.CONFIG.crafting.batchLimit = batchLimit;
     x.h.setOverride(`rlt-node-job:crafting:${rootStation}`, rootRecipe);
     x.h.setOverride(`rlt-craft-lock-times:${rootStation}`, String(times));
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, rootStation), true);
     attachBackend(x);
     return x;
 }
@@ -172,9 +173,8 @@ test('an unconfigured idle station can supply another station without gaining ro
     assert.equal(x.starts().at(-1).url.endsWith('/kitchen/start'), true);
 });
 
-test('paused and explicitly closed stations cannot be borrowed for intermediate production', async () => {
+test('explicitly closed stations cannot be borrowed for intermediate production', async () => {
     for (const entries of [
-        [['rlt-craft-paused:mill', '1']],
         [['rlt-node-job:crafting:mill', '__off']],
         [['rlt-node-job:crafting:mill', '__off_keep']],
     ]) {
@@ -189,6 +189,7 @@ test('another running pipeline is not overridden by intermediate crafting', asyn
         stations: [station('kitchen', [recipe('meal', { flour: 1 })]), station('mill', [recipe('flour', { wheat: 1 }), recipe('oil', { sesame: 1 })])],
         items: { wheat: 1 }, entries: [['rlt-craft-pipe:mill', JSON.stringify(steps)], ['rlt-craft-pipe-run:mill', '1']],
     });
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
     await x.step(); assert.equal(x.calls.length, 0);
     assert.equal(x.h.getOverride('rlt-craft-pipe:mill'), JSON.stringify(steps));
 });
@@ -225,28 +226,34 @@ test('intermediate queue respects batchLimit even when the root needs more units
     assert.equal(x.backend.inventory.find(row => row.item_id === 'meal').quantity, 1);
 });
 
-test('intermediate production leaves the configured stamina reserve untouched', async () => {
+test('insufficient whole-route stamina leaves the reserve and all inputs untouched', async () => {
     const x = setup({ stations: [station('kitchen', [recipe('meal', { flour: 5 }), recipe('flour', { wheat: 1 })])], items: { wheat: 5 } });
     x.backend.player.stamina = 8; x.sync(); x.h.CONFIG.crafting.staminaReserve = 4;
     await x.step();
-    assert.deepEqual(x.starts().map(row => [row.payload.recipe_id, row.payload.quantity]), [['flour', 2]]);
-    assert.equal(x.backend.player.stamina, 4);
+    assert.equal(x.starts().length, 0);
+    assert.equal(x.backend.player.stamina, 8);
+    assert.equal(x.backend.inventory.find(row => row.item_id === 'wheat').quantity, 5);
 });
 
-test('the root batch is reduced when only a smaller complete chain is feasible', async () => {
+test('a finite root waits for its full material chain instead of reducing its target', async () => {
     const x = setup({ stations: [station('kitchen', [recipe('meal', { flour: 1 }), recipe('flour', { wheat: 1 })])], items: { wheat: 2 }, times: 5, batchLimit: 5 });
     await x.drain();
-    assert.deepEqual(x.starts().map(row => [row.payload.recipe_id, row.payload.quantity]), [['flour', 2], ['meal', 2]]);
-    assert.equal(x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')).done[0], 2);
+    assert.equal(x.starts().length, 0);
+    assert.equal(x.backend.inventory.find(row => row.item_id === 'wheat').quantity, 2);
+    x.backend.inventory.find(row => row.item_id === 'wheat').quantity = 5; x.sync();
+    await x.drain();
+    assert.deepEqual(x.starts().map(row => [row.payload.recipe_id, row.payload.quantity]), [['flour', 5], ['meal', 5]]);
+    assert.equal(x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')).done[0], 5);
 });
 
 test('stopping the root pipeline after a child starts prevents further child queues', async () => {
     const x = setup({ stations: [station('kitchen', [recipe('meal', { mash: 1 }), recipe('mash', { flour: 1 }), recipe('flour', { wheat: 1 })])], items: { wheat: 1 } });
+    x.h.stopCraftRun('kitchen');
     x.h.setOverride('rlt-node-job:crafting:kitchen', '');
     x.h.setOverride('rlt-craft-pipe:kitchen', JSON.stringify([{ recipeId: 'meal', times: 1 }]));
-    x.h.setOverride('rlt-craft-pipe-run:kitchen', '1');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'kitchen'), true);
     await x.step(); assert.equal(x.starts().length, 1);
-    x.h.setOverride('rlt-craft-pipe-run:kitchen', '0');
+    x.h.stopCraftRun('kitchen');
     await x.collect(); await x.step();
     assert.equal(x.starts().length, 1);
     assert.equal(x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')).done[0], 0);
@@ -267,6 +274,7 @@ test('infeasible first root does not reserve raw materials needed by a feasible 
     });
     x.h.setOverride('rlt-node-job:crafting:bakery', 'bread');
     x.h.setOverride('rlt-craft-lock-times:bakery', '1');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'bakery'), true);
     await x.drain();
     assert.deepEqual(x.starts().map(row => row.payload.recipe_id), ['flour', 'bread']);
 });
@@ -278,6 +286,7 @@ test('two roots cannot each count the same intermediate in flight toward their d
     });
     x.h.setOverride('rlt-node-job:crafting:bakery', 'bread');
     x.h.setOverride('rlt-craft-lock-times:bakery', '1');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'bakery'), true);
     await x.step(); await x.step();
     assert.deepEqual(x.starts().map(row => row.payload.recipe_id), ['flour']);
     await x.collect(); await x.drain();
@@ -313,10 +322,11 @@ test('alternative intermediate recipes are tried when the first producer has mis
 
 test('a root pipeline task item is reserved for the root rather than its intermediate recipe', async () => {
     const x = setup({ stations: [station('kitchen', [recipe('meal', { flour: 1 }), recipe('flour', { wheat: 1 })])], items: { wheat: 1 } });
+    x.h.stopCraftRun('kitchen');
     x.backend.task_items = [{ id: 'lucky', name: 'lucky', timing: 'start', quantity: 1, eligible_industries: ['crafting'] }]; x.sync();
     x.h.setOverride('rlt-node-job:crafting:kitchen', '');
     x.h.setOverride('rlt-craft-pipe:kitchen', JSON.stringify([{ recipeId: 'meal', times: 1, taskItemId: 'lucky' }]));
-    x.h.setOverride('rlt-craft-pipe-run:kitchen', '1');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'kitchen'), true);
     await x.step(); assert.equal(x.starts()[0].payload.task_item_id, '');
     await x.collect(); await x.step(); assert.equal(x.starts().at(-1).payload.task_item_id, 'lucky');
 });
@@ -398,7 +408,8 @@ test('current recursive materials and later pipeline materials have additive res
     });
     x.h.setOverride('rlt-node-job:crafting:kitchen', '');
     x.h.setOverride('rlt-craft-pipe:kitchen', JSON.stringify([{ recipeId: 'meal', times: 1 }, { recipeId: 'cereal', times: 1 }]));
-    x.h.setOverride('rlt-craft-pipe-run:kitchen', '1');
+    x.h.stopCraftRun('kitchen');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'kitchen'), true);
     x.h.CONFIG.selling.defaultKeep = 0;
     assert.equal(x.h.craftingInputReserves(x.h.runtime.state).get('wheat'), 2);
     assert.equal(x.h.safeUnspecifiedConsumeQty(x.h.runtime.state, 'wheat'), 0);

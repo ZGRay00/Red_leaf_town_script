@@ -4,7 +4,11 @@ const { fixture, harness } = require('./red-leaf-town-v4.test.cjs');
 
 function plan(x) {
     const node = x.h.runtime.state.crafting_stations[0];
-    return { id: 'mill', node, job: node.recipes[0] };
+    x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+    x.h.setOverride('rlt-craft-lock-times:mill', '1');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
+    return { id: 'mill', node, job: node.recipes[0], runId: x.h.craftRun('mill').id,
+        pipeline: { steps: x.h.configuredCraftSteps('mill'), stepIndex: 0, done: [0] } };
 }
 function story(x) {
     return x.context.document.querySelector().__vue_app__._context.config.globalProperties.$pinia._s.get('story');

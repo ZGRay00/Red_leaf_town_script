@@ -10,8 +10,15 @@ state.crops = [{ id: 'pumpkin', name: '南瓜', seed_item_id: 'pumpkin_seed' }];
 state.partners = [{ partner_id: 'p1', name: '海风', tendencies: [{ industry: 'aquatic', effective_ability: 45 }] }, { partner_id: 'p2', name: '晨曦' }, { partner_id: 'p3', name: '林间' }];
 state.sailing.active_run = { run_id: 'demo', route_name: '芦苇湾', started_at: now - 1500, ready_at: now + 2100, partner_ids: ['p1'] };
 Object.assign(state.crafting_stations[0], { empty: false, ready: false, completed_count: 2, queued_count: 5, collected_count: 0, queue_total: 8, queue_remaining_seconds: 320, recipe: state.crafting_stations[0].recipes[0], task_snapshot: { recipe_id: 'flour', ready_at: now + 30, started_at: now - 30 } });
-state.crafting_stations.push({ ...structuredClone(state.crafting_stations[0]), station_id: 'kitchen', definition: { name: '小镇厨房' } });
-const source = fs.readFileSync(sourcePath, 'utf8').replace('if (CONFIG.ui.autoStart) start();', 'window.__rltPreview = { runtime, refreshConfigRows, renderDashboard, setSetting, getOverride, start, stop, CONFIG }; runtime.state = window.fixtureState; renderDashboard(runtime.state);');
+state.crafting_stations.push({ ...structuredClone(state.crafting_stations[0]), station_id: 'kitchen', definition: { name: '小镇厨房' },
+    empty: true, ready: false, completed_count: 0, queued_count: 0, collected_count: 0, queue_total: 0,
+    queue_remaining_seconds: 0, recipe: null, task_snapshot: null });
+const source = fs.readFileSync(sourcePath, 'utf8').replace('if (CONFIG.ui.autoStart) start();', `window.__rltPreview = {
+    runtime, refreshConfigRows, renderDashboard, setSetting, getOverride, start, stop, CONFIG,
+    craftRun, startCraftRun, stopCraftRun, configuredCraftSteps, craftPipelineProgress, advanceCraftPipeline, finishCraftRun
+};
+setOverride('rlt-node-job:crafting:kitchen', 'flour'); setOverride('rlt-craft-lock-times:kitchen', '3');
+runtime.state = window.fixtureState; renderDashboard(runtime.state);`);
 fs.writeFileSync(preview, `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>红叶镇助手预览</title><style>body{background:#e8eddf;color:#324535;font:18px system-ui;margin:45px}h1{font-size:28px}p{font-size:14px;color:#6c7c62}</style><div id="app"><h1>红叶镇物语</h1><p>助手界面离线预览 · 模拟状态</p></div><script>localStorage.clear();window.fixtureState=${JSON.stringify(state)};document.querySelector('#app').__vue_app__={_context:{config:{globalProperties:{$pinia:{_s:new Map([['story',{cue(){},active:false,queue:[]}],['game',{state:window.fixtureState,refresh(){}}]])}}}}};window.fetch=async()=>{throw new Error('Preview must not access game network')};</script><script>${source.replace(/<\/script/gi, '<\\/script')}</script></html>`, 'utf8');
 
 async function main() {
@@ -57,9 +64,55 @@ async function main() {
     await evaluate(`document.querySelector('[aria-label="自动补充饲料"]').focus();document.activeElement.click()`);
     assert.equal(await evaluate(`document.activeElement.getAttribute('aria-label')`), '自动补充饲料');
     assert.equal(await evaluate(`document.activeElement.getAttribute('aria-checked')`), 'false');
-    await evaluate(`document.querySelector('.rlt-tabs [data-page="crafting"]').click();document.querySelector('[data-focus-key="craft:kitchen:submit"]').focus();document.activeElement.click()`);
-    assert.equal(await evaluate(`document.activeElement.dataset.focusKey`), 'craft:kitchen:submit');
-    assert.equal(await evaluate(`document.activeElement.getAttribute('aria-checked')`), 'false');
+    // A configured idle station must wait for an explicit click. Trusted mouse/keyboard
+    // activation must preserve focus when the card is rebuilt and retain the same run on resume.
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="crafting"]').click()`);
+    const craftButton = '[data-focus-key="craft:kitchen:execute"]';
+    async function craftControl() {
+        return evaluate(`(()=>{const api=window.__rltPreview,e=document.querySelector('${craftButton}');return {
+            label:e.textContent,disabled:e.disabled,focusKey:document.activeElement?.dataset.focusKey,
+            run:api.craftRun('kitchen'),done:api.craftPipelineProgress('kitchen',api.configuredCraftSteps('kitchen')).done
+        }})()`);
+    }
+    async function clickCraftControl() {
+        const point = await evaluate(`(()=>{const e=document.querySelector('${craftButton}');e.scrollIntoView({block:'center'});e.focus();
+            const r=e.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}})()`);
+        await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', clickCount: 1 });
+        await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', clickCount: 1 });
+    }
+    let craft = await craftControl();
+    assert.equal(craft.label, '执行一次'); assert.equal(craft.disabled, false); assert.equal(craft.run, null);
+    assert.deepEqual(craft.done, [0]);
+    assert.equal(await evaluate(`document.querySelector('[data-focus-key="craft:mill:execute"]').disabled`), true, 'a manual active queue cannot authorize a new run');
+    await clickCraftControl();
+    craft = await craftControl();
+    assert.equal(craft.label, '停止本轮'); assert.equal(craft.focusKey, 'craft:kitchen:execute');
+    assert.equal(craft.run.status, 'running'); assert.ok(craft.run.id);
+    const craftRunId = craft.run.id;
+    assert.equal(await evaluate(`JSON.parse(localStorage.getItem('rlt-craft-run-once:kitchen')).id`), craftRunId);
+    // Simulate a collected portion while keeping this preview offline; the lifecycle suite
+    // separately exercises actual start/collect requests and completion accounting.
+    await evaluate(`(()=>{const api=window.__rltPreview;api.advanceCraftPipeline('kitchen',api.configuredCraftSteps('kitchen'),0,1);api.refreshConfigRows(api.runtime.state)})()`);
+    await clickCraftControl();
+    craft = await craftControl();
+    assert.equal(craft.label, '继续本轮'); assert.equal(craft.run.status, 'stopped'); assert.equal(craft.run.id, craftRunId);
+    assert.equal(craft.focusKey, 'craft:kitchen:execute'); assert.deepEqual(craft.done, [1]);
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'char', text: '\r', unmodifiedText: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    craft = await craftControl();
+    assert.equal(craft.label, '停止本轮'); assert.equal(craft.run.status, 'running'); assert.equal(craft.run.id, craftRunId);
+    assert.equal(craft.focusKey, 'craft:kitchen:execute'); assert.deepEqual(craft.done, [1]);
+    await evaluate(`(()=>{const api=window.__rltPreview;api.advanceCraftPipeline('kitchen',api.configuredCraftSteps('kitchen'),0,2);api.finishCraftRun('kitchen');api.refreshConfigRows(api.runtime.state)})()`);
+    craft = await craftControl();
+    assert.equal(craft.label, '再执行一次'); assert.equal(craft.run.status, 'completed'); assert.deepEqual(craft.done, [3]);
+    assert.equal(craft.focusKey, 'craft:kitchen:execute');
+    await clickCraftControl();
+    craft = await craftControl();
+    assert.equal(craft.label, '停止本轮'); assert.equal(craft.run.status, 'running'); assert.notEqual(craft.run.id, craftRunId);
+    assert.deepEqual(craft.done, [0]); assert.equal(craft.focusKey, 'craft:kitchen:execute');
+    await clickCraftControl();
+    assert.equal((await craftControl()).run.status, 'stopped');
     await evaluate(`document.querySelector('.rlt-tabs [data-page="sailing"]').click();for(let n=1;n<=3;n++){const e=document.querySelector('select[aria-label="伙伴 '+n+'"]');e.focus();e.value='p'+n;e.dispatchEvent(new Event('change',{bubbles:true}))}`);
     assert.deepEqual(await evaluate(`JSON.parse(window.__rltPreview.CONFIG.sailing.partnerIds)`), ['p1', 'p2', 'p3']);
     assert.equal(await evaluate(`document.querySelector('select[aria-label="伙伴 2"] option[value="p1"]').disabled`), true);
@@ -118,7 +171,7 @@ async function main() {
         const expanded = await panelBox(); assert.ok(expanded.left >= 0 && expanded.top >= 0 && expanded.right <= width && expanded.bottom <= height);
         await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click()`);
     }
-    assert.deepEqual(errors, []); console.log('Browser: lazy tabs, unique switches, focus/edit preservation, scroll memory, stable dashboard, graph/collapse toggles, desktop/mobile bounds and zero page errors passed.');
+    assert.deepEqual(errors, []); console.log('Browser: one-shot execution/stop/resume with trusted mouse and keyboard, run identity/progress, lazy tabs, unique switches, focus/edit preservation, scroll memory, stable dashboard, graph/collapse toggles, desktop/mobile bounds and zero page errors passed.');
     console.log('Mobile: 48px launcher, bottom action hit testing, touch drag/tap, position restoration and narrow/landscape bounds passed.');
     socket.close();
 }

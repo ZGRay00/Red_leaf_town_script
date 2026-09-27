@@ -55,6 +55,7 @@ function harness(initial = fixture(), entries = []) {
     const exposure = `window.__test = { CONFIG, chooseCropTarget, gatherNeeds, needShortage, runtime, setSetting, getOverride, setOverride, liveStamina, staminaWaitSeconds, nextDelay,
         doAquaticFeed, doSailing, feedInputs, feedThresholds, feedPurchaseSnapshot, identifyPurchasedFeed, craftBatchSize, collectReadyIndustries, startEmptyIndustries,
         craftFlight, saveCraftFlight, craftPipelineProgress, creditCraftFlight, reconcileCraftFlights, startCraftPlan, configuredCraftSteps,
+        startCraftRun, stopCraftRun, craftRun, craftPipelineRunning,
         craftingInputReserves, inFlightIndustryGuaranteedQty, isPartnerIdle, sailingPartners, processCraftCancel, acceptState, slotTaskItem, managedPartnerSlots,
         renderDashboard, refreshConfigRows, panel, dashboard, tabBar, configBox,
         start, stop, tick, sleep, wakeSoon, safeUnspecifiedConsumeQty, logBox,
@@ -91,14 +92,18 @@ async function run() {
     });
     await test('batch start sends quantity without crediting completion', async () => {
         const x = harness(), node = x.h.runtime.state.crafting_stations[0], steps = [{ recipeId: 'flour', times: 6 }];
+        x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify(steps));
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         x.setResponder(req => { assert.equal(req.payload.quantity, 6); Object.assign(x.backend.crafting_stations[0], { empty: false, queue_total: 6, queued_count: 5, completed_count: 0, collected_count: 0, recipe: node.recipes[0], task_snapshot: { ready_at: x.backend.server_time + 60, recipe_id: 'flour' } }); return x.response(); });
-        await x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0], pipeline: { steps, stepIndex: 0, done: [0] } });
+        await x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0], runId: x.h.craftRun('mill').id, pipeline: { steps, stepIndex: 0, done: [0] } });
         assert.equal(x.h.craftPipelineProgress('mill', steps).done[0], 0); assert.equal(x.h.craftFlight('mill').quantity, 6);
     });
     await test('partial collection credits actual quantity once', async () => {
         const x = harness(), steps = [{ recipeId: 'flour', times: 6 }];
+        x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify(steps));
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         Object.assign(x.backend.crafting_stations[0], { empty: false, ready: false, completed_count: 2, queued_count: 3, collected_count: 0, recipe: x.backend.crafting_stations[0].recipes[0] }); x.sync();
-        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 6, credited: 0, observedCollected: 0, recipeId: 'flour', steps, stepIndex: 0 });
+        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 6, credited: 0, observedCollected: 0, recipeId: 'flour', runId: x.h.craftRun('mill').id, steps, stepIndex: 0 });
         x.setResponder(() => { Object.assign(x.backend.crafting_stations[0], { completed_count: 0, collected_count: 2 }); return x.response({ completed_count: 2 }); });
         await x.h.collectReadyIndustries(); x.h.reconcileCraftFlights(x.h.runtime.state);
         assert.equal(x.calls.length, 1); assert.equal(x.h.craftPipelineProgress('mill', steps).done[0], 2);
@@ -110,14 +115,19 @@ async function run() {
     });
     await test('ambiguous start pauses station across reload', async () => {
         const x = harness(), node = x.h.runtime.state.crafting_stations[0];
+        x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         x.setResponder(req => { if (req.url.endsWith('/state')) return { ok: true, json: async () => ({ data: structuredClone(x.backend) }) }; throw new Error('lost connection'); });
-        await assert.rejects(x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0] })); assert.equal(x.h.craftFlight('mill').phase, 'uncertain');
+        await assert.rejects(x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0], runId: x.h.craftRun('mill').id,
+            pipeline: { steps: x.h.configuredCraftSteps('mill'), stepIndex: 0, done: [0] } })); assert.equal(x.h.craftFlight('mill').phase, 'uncertain');
         const y = harness(fixture(), [...x.storage]); y.h.reconcileCraftFlights(y.h.runtime.state); assert.equal(y.h.craftFlight('mill').phase, 'uncertain');
     });
     await test('cancel retains completed portions and no premature credit', async () => {
         const x = harness(), node = x.backend.crafting_stations[0], steps = [{ recipeId: 'flour', times: 6 }];
+        x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify(steps));
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         Object.assign(node, { empty: false, recipe: node.recipes[0], task_snapshot: { ready_at: 1000, recipe_id: 'flour' }, completed_count: 2, queued_count: 3 }); x.sync();
-        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 6, credited: 0, observedCollected: 0, recipeId: 'flour', steps, stepIndex: 0 }); x.h.runtime.cancelCraft = { id: 'mill', recipeId: 'flour', readyAt: 1000 };
+        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 6, credited: 0, observedCollected: 0, recipeId: 'flour', runId: x.h.craftRun('mill').id, steps, stepIndex: 0 }); x.h.runtime.cancelCraft = { id: 'mill', recipeId: 'flour', readyAt: 1000 };
         x.setResponder(() => { Object.assign(node, { task_snapshot: null, ready: true, queued_count: 0 }); return x.response(); });
         await x.h.processCraftCancel(); assert.equal(x.h.craftFlight('mill').quantity, 2); assert.equal(x.h.craftPipelineProgress('mill', steps).done[0], 0);
     });
@@ -311,6 +321,7 @@ async function run() {
         const x = sailingSupplyCase(); x.h.CONFIG.crafting.batchLimit = 1;
         x.backend.crafting_stations[0].recipes[0].inputs = [{ item_id: 'snack', quantity: 3 }]; x.sync();
         x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         await x.h.doSailing(); assert.equal(x.calls.length, 0);
         assert.match(x.h.logBox.children[0].textContent, /库存 4，安全可用 1，需要 2/);
     });
@@ -343,17 +354,22 @@ async function run() {
         const { h } = harness(), p = { partner_id: 'p1' }; h.runtime.state.sailing.active_run = { partner_ids: ['p1'] }; assert.equal(h.isPartnerIdle(p), false);
         h.runtime.state.sailing.active_run = null; h.runtime.state.exploration.active_run = { partner_ids: ['p1'] }; assert.equal(h.isPartnerIdle(p), false);
     });
-    await test('disabled submissions and paused stations never start jobs', async () => {
+    await test('disabled submissions and stopped runs never start jobs', async () => {
         const x = harness(); x.h.CONFIG.gathering.enabled = x.h.CONFIG.mining.enabled = false;
-        x.h.setOverride('rlt-node-job:crafting:mill', 'flour'); x.h.CONFIG.crafting.autoStart = false;
-        await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0); x.h.CONFIG.crafting.autoStart = true; x.h.setOverride('rlt-craft-paused:mill', '1');
+        x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
+        x.h.CONFIG.crafting.autoStart = false;
+        await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0); x.h.CONFIG.crafting.autoStart = true; x.h.stopCraftRun('mill');
         await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0);
     });
     await test('full queue collection completes step and releases next step', async () => {
         const x = harness(), steps = [{ recipeId: 'flour', times: 3 }, { recipeId: 'bread', times: 2 }];
         const node = x.backend.crafting_stations[0];
+        node.recipes.push({ ...node.recipes[0], id: 'bread', name: 'bread' }); x.sync();
+        x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify(steps));
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         Object.assign(node, { empty: false, ready: true, completed_count: 3, collected_count: 0 }); x.sync();
-        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 3, credited: 0, observedCollected: 0, recipeId: 'flour', steps, stepIndex: 0 });
+        x.h.saveCraftFlight('mill', { phase: 'active', quantity: 3, credited: 0, observedCollected: 0, recipeId: 'flour', runId: x.h.craftRun('mill').id, steps, stepIndex: 0 });
         x.setResponder(() => { Object.assign(node, { empty: true, ready: false, completed_count: 0 }); return x.response({ completed_count: 3 }); });
         await x.h.collectReadyIndustries(); assert.equal(x.h.craftFlight('mill'), null);
         assert.equal(x.h.craftPipelineProgress('mill', steps).stepIndex, 1); assert.equal(x.h.craftPipelineProgress('mill', steps).done[0], 3);
@@ -414,6 +430,7 @@ async function run() {
     });
     await test('reserves refresh on settings change and keep cache for identical writes', () => {
         const { h } = harness(); h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        assert.equal(h.startCraftRun(h.runtime.state, 'mill'), true);
         const first = h.craftingInputReserves(h.runtime.state); assert.ok(first.size > 0);
         assert.equal(h.setOverride('rlt-node-job:crafting:mill', 'flour'), false);
         assert.equal(h.craftingInputReserves(h.runtime.state), first);
@@ -496,8 +513,11 @@ async function run() {
     });
     await test('aborted crafting submission retains its uncertain queue journal', async () => {
         const x = harness(), node = x.h.runtime.state.crafting_stations[0];
+        x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+        assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
         x.setResponder(() => { x.h.stop(); throw new DOMException('Stopped after request was sent', 'AbortError'); });
-        await assert.rejects(x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0] }), error => error.code === 'aborted');
+        await assert.rejects(x.h.startCraftPlan({ id: 'mill', node, job: node.recipes[0], runId: x.h.craftRun('mill').id,
+            pipeline: { steps: x.h.configuredCraftSteps('mill'), stepIndex: 0, done: [0] } }), error => error.code === 'aborted');
         assert.equal(x.h.craftFlight('mill').phase, 'uncertain');
         assert.equal(x.h.runtime.stateUncertain, true);
     });

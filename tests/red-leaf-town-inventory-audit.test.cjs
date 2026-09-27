@@ -28,6 +28,19 @@ test('two portals share inventory once and unmet combined demand outranks crop p
     assert.equal(x.h.chooseCropTarget(x.h.runtime.state, { slot: 0 }).crop.id, 'wheat');
 });
 
+test('natural stamina recovery preserves the identity and shared stock allocation of existing needs', () => {
+    const state = productionState([['wheat', 1]], [[tribute('wheat', 1)], [tribute('wheat', 1)]]);
+    state.player.stamina = 50;
+    const x = harness(state), snapshot = x.h.runtime.state;
+    const needs = x.h.gatherNeeds(snapshot, { productionOnly: true });
+    assert.deepEqual([...needs].map(need => x.h.needShortage(snapshot, need)), [0, 1]);
+    x.h.runtime.serverMsAtSync += 60000;
+    assert.equal(x.h.liveStamina(snapshot), 51);
+    assert.deepEqual([...needs].map(need => x.h.needShortage(snapshot, need)), [0, 1]);
+    assert.equal(x.h.gatherNeeds(snapshot, { productionOnly: true }), needs);
+    assert.equal(x.h.chooseCropTarget(snapshot, { slot: 0 }).crop.id, 'wheat');
+});
+
 test('in-flight crop yield is allocated once across multiple production needs', () => {
     const state = productionState([], [[tribute('wheat', 2)], [tribute('wheat', 2)]]);
     state.plots = [{ slot: 0, empty: false, crop: state.crops[0] }];
@@ -80,9 +93,7 @@ function busyRoot({ times = 2, quantity = 1, credited = 0, futureStep = false, b
     const state = fixture();
     state.inventory = [{ item_id: 'wheat', name: 'wheat', quantity: 5, quality: 0 }, { item_id: 'corn', name: 'corn', quantity: 5, quality: 0 }];
     const jobs = [recipe('meal', { flour: 1 }), recipe('flour', { wheat: 1 }), recipe('cereal', { paste: 1 }), recipe('paste', { corn: 1 })];
-    state.crafting_stations = [{ station_id: 'mill', empty: false, ready: false, recipes: jobs, recipe: jobs[0],
-        queue_total: quantity, queued_count: quantity - credited - 1, completed_count: 0, collected_count: credited,
-        task_snapshot: { recipe_id: 'meal', ready_at: state.server_time + 60 }, assigned_partner_ids: [] },
+    state.crafting_stations = [{ station_id: 'mill', empty: true, ready: false, recipes: jobs, assigned_partner_ids: [] },
     { station_id: 'spare', empty: true, ready: false, recipes: [jobs[1]], assigned_partner_ids: [] }];
     const x = harness(state);
     x.h.CONFIG.crafting.autoCraftInputs = true;
@@ -91,8 +102,13 @@ function busyRoot({ times = 2, quantity = 1, credited = 0, futureStep = false, b
     const steps = [{ recipeId: 'meal', times }];
     if (futureStep) steps.push({ recipeId: 'cereal', times: 1 });
     x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify(steps));
-    x.h.setOverride('rlt-craft-pipe-run:mill', '1');
-    x.h.saveCraftFlight('mill', { phase: 'active', recipeId: 'meal', quantity, credited: 0, observedCollected: credited, steps, stepIndex: 0 });
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
+    Object.assign(x.backend.crafting_stations[0], { empty: false, recipe: jobs[0],
+        queue_total: quantity, queued_count: quantity - credited - 1, completed_count: 0, collected_count: credited,
+        task_snapshot: { recipe_id: 'meal', ready_at: state.server_time + 60 } });
+    x.sync();
+    x.h.saveCraftFlight('mill', { phase: 'active', recipeId: 'meal', quantity, credited: 0, observedCollected: credited,
+        runId: x.h.craftRun('mill').id, steps, stepIndex: 0 });
     if (credited) x.h.creditCraftFlight('mill', credited);
     return x;
 }
@@ -125,8 +141,8 @@ test('future pipeline steps keep direct materials without recursively expanding 
     assert.equal(reserves.get('corn') || 0, 0);
 });
 
-test('pausing future submissions releases the active root next-batch recursive reservation', () => {
+test('stopping a run releases the active root next-batch recursive reservation', () => {
     const x = busyRoot();
-    x.h.setOverride('rlt-craft-paused:mill', '1');
+    x.h.stopCraftRun('mill');
     assert.equal(x.h.craftingInputReserves(x.h.runtime.state).get('wheat') || 0, 0);
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.2.0
+// @version      4.3.0
 // @description  红叶镇物语自动生产、递归补料与材料树、航海、自选饲料补充与可拖动管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.2.0';
+    const SCRIPT_VERSION = '4.3.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -84,7 +84,7 @@
         },
 
         crafting: {
-            enabled: true,            // 加工总开关默认值；面板「加工启停」开关优先（本地记忆）。站点需在面板配置流程或锁定配方才会开工
+            enabled: true,            // 加工总开关；配置目标后需点击本站「执行一次」，完成本轮后停止
             autoCollect: true,
             autoStart: true,
             batchEnabled: true,
@@ -93,7 +93,6 @@
             staminaReserve: 0,
             useTaskItems: true,
             partialTaskItems: true,   // 道具不足时仅队列前段使用，仍遵守道具保留量
-            repeatPipeline: false,
             recipeId: null,           // 指定配方 id；null = 按面板流程/锁定配方执行
             autoAssignPartner: true,  // 自动派驻/优化协助伙伴
         },
@@ -177,7 +176,7 @@
             defaultKeep: 5,           // 白名单物品默认至少保留数量
             maxUnitsPerTick: 20,      // 单轮最多卖出数量
             protectLockedPortals: true,
-            protectCraftingInputs: true, // 为实际运行的加工目标保留近期原料，包含当前步骤下一批的递归用料
+            protectCraftingInputs: true, // 保留当前步骤全部待做次数的递归用料，以及后续步骤近期原料
             protectExplorationGear: true, // 永不售卖探索装备（武器/饰品）与探索道具（库存中带 equipment/delve_use 字段），即使误入白名单
         },
 
@@ -308,11 +307,46 @@
         setOverride(craftPipelineProgKey(stationId), '');
     }
 
-    // 流程启停：默认停止，面板「开始」后置 '1'；停止不清进度，开始后从当前进度继续
-    const craftPipelineRunKey = stationId => `rlt-craft-pipe-run:${stationId}`;
-    const craftPipelineRunning = stationId => getOverride(craftPipelineRunKey(stationId)) === '1';
+    // 新版每次点击只授权一轮；不沿用旧版允许提交/自动循环开关的开工权限。
+    const craftRunKey = stationId => `rlt-craft-run-once:${stationId}`;
+    function craftRun(id) { return readJson(craftRunKey(id)); }
+    function craftPipelineRunning(id) {
+        const run = craftRun(id), steps = configuredCraftSteps(id);
+        return run?.version === 1 && run.status === 'running' && steps.length > 0 && run.sig === craftPipelineSig(steps);
+    }
+    function stopCraftRun(id) {
+        const run = craftRun(id);
+        if (!run || run.status !== 'running') return false;
+        setOverride(craftRunKey(id), JSON.stringify({ ...run, status: 'stopped' }));
+        return true;
+    }
+    function finishCraftRun(id) {
+        const run = craftRun(id), steps = configuredCraftSteps(id);
+        if (!run || run.status === 'completed' || !steps.length || run.sig !== craftPipelineSig(steps) ||
+            !craftPipelineProgress(id, steps).finished) return;
+        setOverride(craftRunKey(id), JSON.stringify({ ...run, status: 'completed', endedAt: Date.now() }));
+        log(`加工点 ${id}：本轮已全部领取，自动停止；再次加工请点击「再执行一次」`);
+    }
+    function craftRunHasQueue(state, id) {
+        const node = nodeById(state, 'crafting', id);
+        return !node || !node.empty || !!node.task_snapshot || !!craftFlight(id) ||
+            (state.crafting_stations || []).some(station => sameId(craftFlight(station.station_id)?.dependencyFor?.stationId, id));
+    }
+    function startCraftRun(state, id) {
+        if (busy || nodeJobClosed('crafting', id) || craftRunHasQueue(state, id) || craftPipelineRunning(id)) return false;
+        const node = nodeById(state, 'crafting', id), steps = configuredCraftSteps(id);
+        if (!steps.length || steps.some(step => !Number.isSafeInteger(step.times) || step.times < 1 ||
+            !(node.recipes || []).some(recipe => sameId(jobId(recipe), step.recipeId) && recipe.unlocked !== false))) return false;
+        const sig = craftPipelineSig(steps), previous = craftRun(id), progress = craftPipelineProgress(id, steps);
+        const resume = previous?.version === 1 && previous.status === 'stopped' && previous.sig === sig && !progress.finished && !progress.legacy;
+        if (!resume) resetCraftPipeline(id);
+        setOverride(craftRunKey(id), JSON.stringify(resume ? { ...previous, status: 'running' } :
+            { version: 1, id: crypto.randomUUID(), sig, status: 'running', startedAt: Date.now() }));
+        setOverride(`rlt-craft-paused:${id}`, '');
+        return true;
+    }
 
-    // 锁定配方批次数：0/未设置 = 不限；设 N = 做满 N 批后停工（与流程共用进度存储，靠签名区分模式）
+    // 锁定配方每轮次数：至少 1 次；旧版 0/未设置的不限模式按 1 次处理，点击才执行。
     const craftLockTimesKey = stationId => `rlt-craft-lock-times:${stationId}`;
 
     const craftFlightKey = id => `rlt-craft-flight:${id}`;
@@ -322,11 +356,16 @@
     function craftFlight(id) { return readJson(craftFlightKey(id)); }
     function saveCraftFlight(id, value) { setOverride(craftFlightKey(id), value ? JSON.stringify(value) : ''); }
     function configuredCraftSteps(id) {
-        const selected = nodeJobOverride('crafting', id);
+        let selected = nodeJobOverride('crafting', id);
         if (selected === NODE_JOB_OFF_RELEASE || selected === NODE_JOB_OFF_KEEP) return [];
-        if (selected == null) return craftPipelineSteps(id);
-        const times = Math.max(0, Math.floor(Number(getOverride(craftLockTimesKey(id))) || 0));
-        return times ? [{ recipeId: selected, times, taskItemId: '' }] : [];
+        if (selected == null) {
+            const steps = craftPipelineSteps(id);
+            if (steps.length) return steps;
+            selected = CONFIG.crafting.recipeId;
+        }
+        if (selected == null) return [];
+        const times = Math.max(1, Math.floor(Number(getOverride(craftLockTimesKey(id))) || 1));
+        return [{ recipeId: selected, times, taskItemId: '' }];
     }
     function craftCollectable(node) {
         return !!node && (Number(node.completed_count || 0) > 0 || (!node.empty && node.ready));
@@ -336,9 +375,10 @@
         if (!flight) return;
         const amount = Math.min(Math.max(0, count), flight.quantity - flight.credited);
         if (amount <= 0) return;
-        if (flight.steps?.length) advanceCraftPipeline(id, flight.steps, flight.stepIndex, amount);
+        if (flight.steps?.length && (!flight.runId || craftRun(id)?.id === flight.runId)) advanceCraftPipeline(id, flight.steps, flight.stepIndex, amount);
         flight.credited += amount;
         saveCraftFlight(id, flight);
+        finishCraftRun(id);
     }
     // 服务端队列计数用于恢复刷新/手动领取；不能确认归属或结果时只暂停这个站点。
     function reconcileCraftFlights(state) {
@@ -368,9 +408,11 @@
                 saveCraftFlight(id, flight);
             } else saveCraftFlight(id, flight);
         }
+        for (const node of state.crafting_stations || []) finishCraftRun(node.station_id);
     }
     function craftBatchSize(state, node, plan) {
         const cfg = CONFIG.crafting;
+        if (plan.requiredStamina != null && plan.requiredStamina > liveStamina(state)) return 0;
         let count = cfg.batchEnabled ? Math.min(99, Math.max(1, Math.floor(cfg.batchLimit))) : 1;
         if (plan.maxQuantity != null) count = Math.min(count, plan.maxQuantity);
         if (plan.pipeline) count = Math.min(count, plan.pipeline.steps[plan.pipeline.stepIndex].times - plan.pipeline.done[plan.pipeline.stepIndex]);
@@ -401,18 +443,31 @@
             (!isControlFlowError(error) && (isFatalTickError(error) || error?.code === 'invalid_state'));
     }
     async function startCraftPlan(plan) {
+        const plannedState = runtime.state;
+        const rootId = plan.dependencyFor?.stationId ?? plan.id;
+        const authorized = () => !!plan.runId && craftRun(rootId)?.id === plan.runId && craftPipelineRunning(rootId) &&
+            CONFIG.crafting.enabled && CONFIG.crafting.autoStart && !nodeJobClosed('crafting', plan.id);
+        if (!authorized()) return false;
+        const fresh = nodeById(runtime.state, 'crafting', plan.id);
+        if (!fresh?.empty || fresh.task_snapshot || craftFlight(plan.id)) return false;
         const quantity = craftBatchSize(runtime.state, plan.node, plan);
         if (!quantity) return false;
-        if (plan.resetRootProgress != null) resetCraftPipeline(plan.resetRootProgress);
         const flight = {
             phase: 'submitting', recipeId: jobId(plan.job), quantity, credited: 0, observedCollected: 0,
             steps: plan.pipeline?.steps || [], stepIndex: plan.pipeline?.stepIndex ?? 0,
             taskItemChoice: plan.pipeline?.taskItemId || null,
             dependencyFor: plan.dependencyFor || null,
+            runId: plan.runId,
         };
         saveCraftFlight(plan.id, flight); // 写前保存，刷新和网络结果不确定时不会重复开工。
         try {
-            await startSite('crafting', plan.id, 'recipe_id', flight.recipeId, plan.taskItemId ?? '', quantity);
+            await startSite('crafting', plan.id, 'recipe_id', flight.recipeId, plan.taskItemId ?? '', quantity, () => {
+                const current = nodeById(runtime.state, 'crafting', plan.id);
+                // 等待权威状态同步期间整条材料链可能已变化；丢弃旧计划，下一轮重新完整计算。
+                if (runtime.state !== plannedState || !authorized() || !current?.empty || current.task_snapshot || craftBatchSize(runtime.state, current, plan) < quantity) {
+                    throw new ApiError('本轮已停止或加工条件已变化，未提交队列', { code: 'aborted' });
+                }
+            });
             flight.phase = 'active';
             saveCraftFlight(plan.id, flight);
             log(`加工点 ${plan.id}：已提交「${plan.job.name || flight.recipeId}」×${quantity}${flight.dependencyFor ? `，为「${flight.dependencyFor.name}」补料（不计目标进度）` : '，领取后累计流程进度'}`);
@@ -438,6 +493,7 @@
         const request = runtime.cancelCraft;
         if (!request) return;
         runtime.cancelCraft = null;
+        stopCraftRun(craftFlight(request.id)?.dependencyFor?.stationId ?? request.id);
         const node = nodeById(runtime.state, 'crafting', request.id);
         const recipeId = node?.recipe?.id ?? node?.task_snapshot?.recipe_id;
         if (!node || node.empty || taskReadyAt(node) !== request.readyAt || !sameId(recipeId, request.recipeId)) {
@@ -745,7 +801,7 @@
     }
 
     // 官网写接口返回 { state, result }；state 是唯一真相源，禁止手工猜测库存/体力/任务状态。
-    async function mutate(path, { method = 'POST', payload, cue } = {}) {
+    async function mutate(path, { method = 'POST', payload, cue, beforeWrite } = {}) {
         try {
             if (!running || !runtime.controller || runtime.controller.signal.aborted) {
                 throw new ApiError('操作已停止', { code: 'aborted' });
@@ -754,6 +810,7 @@
             validateClientEnvironment(); // 每次写入前复检，消除 tick 预检后的桥接/构建竞态窗口
             ensureStoryIdle();
             if (!running || runtime.controller?.signal.aborted) throw new ApiError('操作已停止', { code: 'aborted' });
+            beforeWrite?.();
             runtime.actionCount += 1;
             if (runtime.actionCount > CONFIG.maxActionsPerTick) {
                 throw new ApiError(`单轮操作超过 ${CONFIG.maxActionsPerTick} 次，已触发安全保护`, { code: 'action_limit' });
@@ -811,9 +868,9 @@
     const sellItem = (itemId, qty, quality = 0) =>
         mutate(`/inventory/${itemId}/sell`, { payload: { quantity: qty, quality }, cue: 'action:sell' });
     const siteUrl = (industry, siteId) => `/${industry}/${industry === 'crafting' ? 'stations' : 'sites'}/${siteId}`;
-    const startSite = (industry, siteId, payloadKey, id, taskItemId = '', quantity = 1) =>
+    const startSite = (industry, siteId, payloadKey, id, taskItemId = '', quantity = 1, beforeWrite) =>
         mutate(`${siteUrl(industry, siteId)}/start`, {
-            payload: { [payloadKey]: id, task_item_id: taskItemId || '', ...(industry === 'crafting' ? { quantity } : {}) }, cue: `action:start_${industry}`,
+            payload: { [payloadKey]: id, task_item_id: taskItemId || '', ...(industry === 'crafting' ? { quantity } : {}) }, cue: `action:start_${industry}`, beforeWrite,
         });
     const collectSite = (industry, siteId) => mutate(`${siteUrl(industry, siteId)}/collect`, {
         cue: `action:collect_${industry}`,
@@ -1010,6 +1067,12 @@
         #rlt-auto-helper-panel .rlt-material-amounts{display:flex;gap:2px 9px;flex-wrap:wrap;min-width:0;margin-top:4px;font-size:10px;color:var(--rlt-muted);font-variant-numeric:tabular-nums}
         #rlt-auto-helper-panel .rlt-material-amounts>span{max-width:100%;overflow-wrap:anywhere}
         #rlt-auto-helper-panel .rlt-material-note{font-size:10px;color:var(--rlt-muted);margin:4px 0 0;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-craft-actions{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 6px}
+        #rlt-auto-helper-panel .rlt-craft-actions button{padding:7px 12px;border:1px solid var(--rlt-line);font-weight:600}
+        #rlt-auto-helper-panel .rlt-craft-primary{flex:1;background:#8ead71;color:#17211b}
+        #rlt-auto-helper-panel .rlt-craft-stop{flex:1;background:#354238;color:#eef3e9}
+        #rlt-auto-helper-panel .rlt-craft-cancel{background:transparent;color:#e5b3a1;border-color:#876759!important}
+        #rlt-auto-helper-panel .rlt-craft-state{margin:6px 0;font-size:12px;overflow-wrap:anywhere}
         @media(max-width:380px){#rlt-auto-helper-panel .rlt-material-tree{padding:6px}#rlt-auto-helper-panel .rlt-material-row{padding:6px}#rlt-auto-helper-panel .rlt-material-name{flex-basis:90px}}
         #rlt-auto-helper-panel.rlt-no-graphs .rlt-meter,#rlt-auto-helper-panel.rlt-no-graphs .rlt-voyage{display:none}
         #rlt-auto-helper-panel.rlt-collapsed{width:48px;height:48px;padding:0!important;border-radius:50%!important;box-shadow:0 3px 12px #0005}
@@ -1198,7 +1261,7 @@
             ['农场开关', 'production', [['farming.enabled', '农场总开关'], ['farming.autoCollect', '自动收获'], ['farming.autoPlant', '自动种植'], ['farming.autoBuySeeds', '自动买种'], ['farming.autoSellForSeeds', '卖出余料凑种子钱'], ['farming.autoAssignPartner', '农场伙伴派驻']]],
             ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
             ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
-            ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '自动提交队列'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.repeatPipeline', '流程完成后循环'], ['crafting.batchLimit', '每次最多份数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
+            ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '执行已启动的本轮'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.batchLimit', '每次最多提交次数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
             ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买所选物品'], ['feed.batchBuy', '批量购买所选物品'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
             ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
             ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
@@ -1220,7 +1283,8 @@
             }
             if (page === 'crafting') {
                 appendSetting(body, state, 'crafting.autoCraftInputs', '缺料自动加工');
-                body.appendChild(uiElement('p', 'rlt-note', '逐级检查材料链，缺基础原料时中止本次补料。可借用未运行目标的站点，补料不计目标进度；已提交队列仍会继续，关闭总开关也会暂停领取。'));
+                body.appendChild(uiElement('p', 'rlt-note', '配置后点击本站「执行一次」才开工；本轮全部步骤领取完成后自动停止，不循环。每次加工可能产出多件物品，目标填写的是执行配方的次数。体力按当前步骤全部待做路线检查，单次提交受批量上限限制。'));
+                body.appendChild(uiElement('p', 'rlt-note', '停止本轮只停止后续开工，已提交队列继续并可自动领取；取消队列会损失当前一份投入。旧版不限次数按本轮 1 次处理，旧循环设置不再生效。关闭加工总开关也会暂停领取。'));
             }
             configBox.appendChild(group);
         }
@@ -1277,7 +1341,12 @@
                 amount('在途', material.pending);
                 if (Number(material.planned) > 0) amount('计划供给', material.planned);
                 amount('待补', material.missing);
-            } else amount('加工份数', material.required);
+            } else {
+                amount(material.kind === 'queue' ? '已提交待领次数' : '加工次数', material.required);
+                if (material.outputPerCraft != null) amount('每次至少产出', material.outputPerCraft);
+                if (material.outputQuantity != null) amount('合计至少产出', material.outputQuantity);
+                if (material.stamina != null) amount('体力', material.stamina);
+            }
             row.append(head, amounts);
             if (material.note) row.appendChild(uiElement('p', 'rlt-material-note', material.note));
             if (branch) {
@@ -1315,7 +1384,7 @@
                 body.appendChild(uiElement('p', 'rlt-material-note', '选择加工配方后显示所需材料。'));
                 return;
             }
-            if (tree.preview) body.appendChild(uiElement('p', 'rlt-material-note', '当前用料预览'));
+            if (tree.preview && tree.phase === 'planning') body.appendChild(uiElement('p', 'rlt-material-note', '当前用料预览'));
             if (tree.statusLabel && tree.statusLabel !== tree.note) {
                 const status = uiElement('span', 'rlt-material-status', tree.statusLabel);
                 status.dataset.status = tree.status || 'unchecked';
@@ -1346,29 +1415,41 @@
         const progress = craftPipelineProgress(id, steps);
         const total = steps.reduce((sum, step) => sum + step.times, 0);
         const done = progress.done.reduce((sum, value) => sum + value, 0);
-        const card = workCard(node.definition?.name || `加工点 ${id}`,
-            flight?.phase === 'uncertain' ? '需要核对' : node.empty ? '空闲' : `${Number(node.completed_count || 0)} 份可领取`,
+        const active = craftPipelineRunning(id), run = craftRun(id);
+        const matchingRun = run?.sig === craftPipelineSig(steps);
+        const completed = steps.length > 0 && progress.finished;
+        const resume = matchingRun && run.status === 'stopped' && !completed && !progress.legacy;
+        const queued = craftRunHasQueue(state, id), ready = Number(node.completed_count || 0);
+        const stateLabel = flight?.phase === 'uncertain' ? '需要核对' : ready > 0 ? `${ready} 次已完成可领取` :
+            !node.empty ? (flight?.dependencyFor ? '补料加工中' : '目标加工中') : completed ? '本轮已完成' :
+            active ? '本轮执行中' : resume ? '本轮已停止' : '等待执行';
+        const card = workCard(node.definition?.name || `加工点 ${id}`, stateLabel,
             total ? done / total * 100 : null,
-            total ? `流程已领取 ${done} / ${total} 份` : '锁定配方可设置总份数，0 为持续生产');
-        if (!node.empty) card.appendChild(uiElement('p', 'rlt-note', `队列 ${node.queue_total || flight?.quantity || 1} 份 · 待加工 ${node.queued_count || 0} 份 · 剩余约 ${durationLabel(node.queue_remaining_seconds || Math.max(0, taskReadyAt(node) - serverNowSeconds()))}`));
-        if (flight?.dependencyFor) card.appendChild(uiElement('p', 'rlt-note', `正在为「${flight.dependencyFor.name}」加工材料，领取后继续原目标；补料不计入目标份数。`));
-        const materialStatus = craftProductionSchedule(state).statuses.get(String(id));
-        if (materialStatus) card.appendChild(uiElement('p', 'rlt-note', materialStatus));
-        card.appendChild(makeCraftMaterialTree(state, node));
-        const paused = getOverride(`rlt-craft-paused:${id}`) === '1';
-        card.appendChild(makeToggleRow(state, '本站允许提交', '只控制后续开工，已提交的队列继续执行', !paused, () => setOverride(`rlt-craft-paused:${id}`, paused ? '' : '1'), `craft:${id}:submit`));
-        if (progress.legacy) card.appendChild(uiElement('p', 'rlt-warning', '旧版以开工次数计数，请在本站空闲时重置为新版领取进度。'));
-        if (steps.length) {
-            const reset = uiElement('button', '', '重置本站进度');
-            reset.disabled = !!flight || !node.empty || busy;
-            reset.onclick = () => {
-                const fresh = nodeById(runtime.state || state, 'crafting', id);
-                if (busy || !fresh?.empty || craftFlight(id)) return;
-                if (!window.confirm('将已领取进度归零，下次从头执行当前配置。是否重置？')) return;
-                resetCraftPipeline(id); reset.blur(); wakeSoon(); refreshConfigRows(runtime.state || state);
-            };
-            card.appendChild(reset);
-        }
+            total ? `本轮已领取 ${done} / ${total} 次${steps.length > 1 && !completed ? ` · 第 ${progress.stepIndex + 1}/${steps.length} 步` : ''}` : '请先配置本轮配方和加工次数');
+        if (!node.empty) card.appendChild(uiElement('p', 'rlt-note', `本队列 ${node.queue_total || flight?.quantity || 1} 次 · 尚未开始 ${node.queued_count || 0} 次 · 剩余约 ${durationLabel(node.queue_remaining_seconds || Math.max(0, taskReadyAt(node) - serverNowSeconds()))}`));
+        if (flight?.dependencyFor) card.appendChild(uiElement('p', 'rlt-note', `正在为「${flight.dependencyFor.name}」补料；补料不计目标进度。`));
+        const controls = uiElement('div', 'rlt-craft-actions');
+        const execute = uiElement('button', active ? 'rlt-craft-stop' : 'rlt-craft-primary', active ? '停止本轮' : resume ? '继续本轮' : completed ? '再执行一次' : '执行一次');
+        execute.dataset.focusKey = `craft:${id}:execute`;
+        execute.setAttribute('aria-label', `加工点 ${node.definition?.name || id}：${execute.textContent}`);
+        execute.disabled = !active && (busy || queued || !steps.length || nodeJobClosed('crafting', id));
+        execute.title = active ? '立即停止后续开工；已提交队列继续执行并可领取' :
+            queued ? '请先领取或核对现有队列，再开始本轮' : resume ? '从本轮已领取进度继续，完成后停止' : '按当前配置执行完整一轮，全部领取后停止；不自动循环';
+        execute.onclick = () => {
+            const currentState = currentViewState();
+            if (craftPipelineRunning(id)) {
+                stopCraftRun(id); log(`加工点 ${id}：本轮后续开工已停止，已提交队列仍会继续`);
+            } else if (startCraftRun(currentState, id)) {
+                log(`加工点 ${id}：已安排一次加工流程，全部领取后自动停止${!running ? '；请启动助手以执行' : ''}`);
+            } else log(`加工点 ${id}：未开始，请先检查配置或等待现有队列领取完毕`);
+            wakeSoon(); refreshConfigRows(currentState);
+        };
+        controls.appendChild(execute);
+        card.appendChild(controls);
+        let materialStatus = craftProductionSchedule(state).statuses.get(String(id));
+        if (active && (!running || !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart)) materialStatus = !running ? '本轮已安排，等待启动助手' : '本轮已安排，等待开启加工总开关和本轮执行';
+        if (materialStatus) card.appendChild(uiElement('p', 'rlt-craft-state', materialStatus));
+        if (progress.legacy) card.appendChild(uiElement('p', 'rlt-warning', '旧版进度仅供核对；队列结束后点击执行一次，将按当前配置开启新轮。'));
         if (flight?.phase === 'uncertain') {
             card.appendChild(uiElement('p', 'rlt-warning', flight.reason || '请核对游戏中的加工状态'));
             const actions = uiElement('div', 'rlt-actions');
@@ -1404,17 +1485,18 @@
             }
         }
         if (!node.empty && node.task_snapshot && Number(node.queued_count || 0) >= 0) {
-            const cancel = uiElement('button', '', '取消本站队列');
+            const cancel = uiElement('button', 'rlt-craft-cancel', '取消当前队列');
             cancel.disabled = !running || busy;
             cancel.onclick = () => {
                 if (!running || busy) return;
                 if (!window.confirm('取消会损失当前一份的投入；未开始部分退回，已完成产物保留。本站后续提交会暂停。是否继续？')) return;
                 runtime.cancelCraft = { id, recipeId: node.recipe?.id ?? node.task_snapshot?.recipe_id, readyAt: taskReadyAt(node) };
-                setOverride(`rlt-craft-paused:${id}`, '1');
+                stopCraftRun(flight?.dependencyFor?.stationId ?? id);
                 wakeSoon(); cancel.disabled = true;
             };
-            card.appendChild(cancel);
+            controls.appendChild(cancel);
         }
+        card.appendChild(makeCraftMaterialTree(state, node));
         return card;
     }
     function renderSailingSettings(state) {
@@ -1624,28 +1706,27 @@
 
     function ensureCraftConfigEditable(stationId) {
         const state = currentViewState(), node = nodeById(state, 'crafting', stationId);
-        if (node?.empty && !node.task_snapshot && !craftFlight(stationId)) return true;
+        if (node?.empty && !craftRunHasQueue(state, stationId) && !craftPipelineRunning(stationId)) return true;
         // 聚焦时保留的旧控件可能跨过自动开工；保存前以当前队列复检，拒绝后恢复持久化值。
         if (configBox.contains(document.activeElement)) document.activeElement.blur();
         lastConfigState = null;
         refreshConfigRows(state);
-        log('加工队列已变化，当前配方和份数暂不可修改，请待队列结束后调整');
+        log('本轮正在运行或仍有队列，请先停止本轮并领取现有队列，再调整配方和次数');
         return false;
     }
 
-    // 加工流程编辑器（每站最多 4 步：配方 × 份数；循环由设置控制）：
+    // 加工流程编辑器（每轮最多 4 步：配方 × 执行次数；只由站点卡片启动一轮）：
     // 步骤留空即忽略；改配方或份数重置进度，只改道具不重置
     function makeCraftPipelineRows(state, node, stationId) {
         const recipes = INDUSTRY_ADAPTERS.crafting.jobs(node);
         if (!recipes.length) return null;
         const steps = craftPipelineSteps(stationId);
-        const prog = craftPipelineProgress(stationId, steps);
-        const editLocked = !!craftFlight(stationId) || !node.empty || !!node.task_snapshot;
+        const editLocked = craftRunHasQueue(state, stationId) || craftPipelineRunning(stationId);
         const frag = document.createElement('div');
 
         const title = document.createElement('div');
-        title.textContent = '流程（最多 4 步，按领取份数推进）：';
-        title.title = '配置后需点下方「开始」才执行；按顺序执行：当前步领满份数才推进下一步；缺材料会原地等待；每步可单独选开工道具（跟随站点道具行/不使用/指定道具，切换不影响进度）；改配方/份数自动重置进度';
+        title.textContent = '本轮流程（最多 4 步，全部领取后停止）：';
+        title.title = '配置后点击本站卡片「执行一次」；按领取次数依次完成各步。每步可单独指定道具；配方和次数变化后需重新点击执行。';
         title.style.cssText = 'margin-top:4px;opacity:.8';
         frag.appendChild(title);
 
@@ -1694,8 +1775,8 @@
             ], steps[i]?.taskItemId || null, '站点道具');
             itemSel.onchange = save;
             const count = makeNumberInput(steps[i]?.times ?? 1, {
-                min: 1, width: '38px', placeholder: '份数',
-                title: '份数：该步累计领取多少份后推进下一步',
+                min: 1, width: '54px', placeholder: '次数',
+                title: '本步骤执行配方的次数；实际产物件数取决于每次产量',
                 onchange: save,
             });
             select.disabled = itemSel.disabled = count.disabled = editLocked;
@@ -1705,48 +1786,7 @@
             frag.appendChild(row);
         }
 
-        const statusRow = document.createElement('div');
-        statusRow.style.cssText = 'margin-top:4px;display:flex;align-items:center;gap:6px;opacity:.85';
-        const flowRunning = craftPipelineRunning(stationId);
-        const status = document.createElement('span');
-        const stationBusy = steps.length > 0 && node && !node.empty;
-        const stepName = idx => recipes.find(r => sameId(jobId(r), steps[idx]?.recipeId))?.name || `#${steps[idx]?.recipeId}`;
-        const progText = prog.finished ? '' :
-            `第 ${prog.stepIndex + 1}/${steps.length} 步「${stepName(prog.stepIndex)}」 · 第 ${Math.min(prog.done[prog.stepIndex] + 1, steps[prog.stepIndex].times)}/${steps[prog.stepIndex].times} 份`;
-        if (prog.legacy) status.textContent = '旧版开工进度：请待队列结束后重置，改用领取计数';
-        else if (!steps.length) status.textContent = '未配置自动流程；现有队列仍可自动领取';
-        else if (stationBusy) status.textContent = `${flowRunning ? '流程运行中' : '暂停后续提交'} · 累计已领取 ${prog.done.reduce((a, b) => a + b, 0)} / ${steps.reduce((sum, step) => sum + step.times, 0)} 份`;
-        else if (prog.finished) status.textContent = `流程已完成（${steps.length} 步），点开始再跑一轮`;
-        else status.textContent = `${flowRunning ? '运行中' : '已停止'} · 待开工 ${progText}`;
-        statusRow.appendChild(status);
-        if (steps.length) {
-            const runBtn = document.createElement('button');
-            runBtn.textContent = flowRunning ? '停止' : '开始';
-            runBtn.dataset.focusKey = `craft:${stationId}:run`;
-            runBtn.setAttribute('aria-label', `本站流程${flowRunning ? '停止' : '开始'}`);
-            runBtn.disabled = !flowRunning && prog.finished && (editLocked || busy);
-            runBtn.title = flowRunning ? '暂停流程（进度保留，可随时继续）' :
-                (prog.finished ? '重置进度并从头再跑一轮' : '从当前进度开始执行流程');
-            runBtn.style.cssText = `padding:0 8px;cursor:pointer;border:none;border-radius:4px;font:11px monospace;background:${flowRunning ? '#555f52' : '#8ead71'};color:${flowRunning ? '#e8e0cf' : '#17211b'}`;
-            runBtn.onclick = () => {
-                if (flowRunning) {
-                    setOverride(craftPipelineRunKey(stationId), '0');
-                    log(`加工点 ${stationId}：流程已停止（进度保留）`);
-                } else {
-                    const current = craftPipelineProgress(stationId, craftPipelineSteps(stationId));
-                    if (current.finished) {
-                        if (busy || craftFlight(stationId) || !nodeById(runtime.state || state, 'crafting', stationId)?.empty) return;
-                        resetCraftPipeline(stationId);
-                    }
-                    setOverride(craftPipelineRunKey(stationId), '1');
-                    log(`加工点 ${stationId}：流程已启动`);
-                }
-                wakeSoon(); // 立即唤醒主循环，不必等下一轮轮询
-                refreshConfigRows(runtime.state || state);
-            };
-            statusRow.appendChild(runBtn);
-        }
-        frag.appendChild(statusRow);
+        frag.appendChild(uiElement('p', 'rlt-note', editLocked ? '请先停止本轮并领取队列，再修改流程。' : '保存配置后，在本站卡片点击「执行一次」。'));
         return frag;
     }
 
@@ -1805,19 +1845,19 @@
                     wakeSoon();
                 };
                 if (industry === 'crafting') {
-                    select.disabled = !!craftFlight(id) || !node.empty || !!node.task_snapshot;
-                    const lockTimes = makeNumberInput(Number(getOverride(craftLockTimesKey(id))) || 0, {
-                        min: 0, width: '48px', placeholder: '不限',
-                        title: '锁定配方的批次数：留空/0 = 不限；设 N = 做满 N 批后停工（改一下数字即可重跑）',
+                    select.disabled = craftRunHasQueue(state, id) || craftPipelineRunning(id);
+                    const lockTimes = makeNumberInput(Math.max(1, Number(getOverride(craftLockTimesKey(id))) || 1), {
+                        min: 1, width: '60px', placeholder: '次数',
+                        title: '本轮加工次数：点击执行一次后做满 N 次并停止，不自动循环',
                         onchange: n => {
                             if (!ensureCraftConfigEditable(id)) return;
-                            setOverride(craftLockTimesKey(id), n > 0 ? String(n) : '');
-                            log(`加工点 ${nodeName}：锁定配方批次数${n > 0 ? `设为 ${n}` : '不限'}`);
+                            setOverride(craftLockTimesKey(id), String(n));
+                            log(`加工点 ${nodeName}：本轮加工次数设为 ${n}，点击执行后生效`);
                             wakeSoon();
                         },
                     });
                     row.appendChild(lockTimes);
-                    lockTimes.disabled = !!craftFlight(id) || !node.empty || !!node.task_snapshot;
+                    lockTimes.disabled = craftRunHasQueue(state, id) || craftPipelineRunning(id);
                     lockTimes.hidden = nodeJobOverride('crafting', id) == null || nodeJobClosed('crafting', id);
                 }
                 body.appendChild(row);
@@ -2418,13 +2458,20 @@
 
     // ---------- 需求、在途产量与安全库存 ----------
 
-    // 按快照与配置修订缓存；改流程/保留量后，即使状态未刷新也重新计算需求
+    // 按快照与配置修订缓存；自然恢复只清加工相关结果，保留共享需求对象的身份。
     const stateMemo = new WeakMap();
     function memoizedForState(state, key, compute) {
         let bucket = stateMemo.get(state);
+        const stamina = liveStamina(state);
         if (!bucket || bucket.revision !== settingsRevision) {
             bucket = { revision: settingsRevision };
             stateMemo.set(state, bucket);
+        }
+        if (bucket.stamina !== stamina) {
+            for (const cachedKey of Object.keys(bucket)) {
+                if (cachedKey === 'craftDependencySchedule' || cachedKey === 'craftingReserves' || cachedKey.startsWith('craftMaterialTree:')) delete bucket[cachedKey];
+            }
+            bucket.stamina = stamina;
         }
         if (!(key in bucket)) bucket[key] = compute();
         return bucket[key];
@@ -2636,7 +2683,7 @@
         return ids;
     }
 
-    // 按实际启用流程各步骤的下一段队列预留原料；已提交给服务器的部分不重复预留。
+    // 仅为已点击运行的本轮保留材料；已提交给服务器的部分不重复预留。
     function craftingInputReserves(state) {
         return memoizedForState(state, 'craftingReserves', () => craftingInputReservesUncached(state));
     }
@@ -2647,18 +2694,19 @@
         const schedule = craftProductionSchedule(state);
         for (const station of state.crafting_stations || []) {
             const id = station.station_id;
-            if (nodeJobClosed('crafting', id) || getOverride(`rlt-craft-paused:${id}`) === '1') continue;
+            if (!craftPipelineRunning(id) || nodeJobClosed('crafting', id)) continue;
             const steps = configuredCraftSteps(id), progress = craftPipelineProgress(id, steps), flight = craftFlight(id);
-            const selected = nodeJobOverride('crafting', id) ?? CONFIG.crafting.recipeId;
             const wanted = new Map(), currentWanted = new Map();
-            if (steps.length && (selected != null || craftPipelineRunning(id))) {
+            if (steps.length) {
                 steps.forEach((step, index) => {
-                    const queued = !flight?.dependencyFor && flight?.stepIndex === index ? Math.max(0, flight.quantity - flight.credited) : 0;
+                    const queued = !flight?.dependencyFor && flight?.phase === 'active' && flight.stepIndex === index &&
+                        sameId(flight.recipeId, step.recipeId) && craftPipelineSig(flight.steps || []) === craftPipelineSig(steps)
+                        ? Math.max(0, flight.quantity - flight.credited) : 0;
                     const count = Math.max(0, Math.min(CONFIG.crafting.batchEnabled ? CONFIG.crafting.batchLimit : 1, step.times - progress.done[index] - queued));
                     wanted.set(String(step.recipeId), (wanted.get(String(step.recipeId)) || 0) + count);
                     if (index === progress.stepIndex) currentWanted.set(String(step.recipeId), (currentWanted.get(String(step.recipeId)) || 0) + count);
                 });
-            } else if (selected != null) { wanted.set(String(selected), 1); currentWanted.set(String(selected), 1); }
+            }
             const stationReserves = new Map(), currentReserves = new Map();
             for (const recipe of station.recipes || []) {
                 if (recipe.unlocked === false) continue;
@@ -3546,29 +3594,21 @@
 
     // 当前用户目标与补料队列分开：辅助配方不改下拉选择，不推进根目标的领取进度。
     function craftTarget(node, { preview = false } = {}) {
-        const id = node.station_id, selected = nodeJobOverride('crafting', id);
-        if (nodeJobClosed('crafting', id) || (!preview && getOverride(`rlt-craft-paused:${id}`) === '1')) return { blocked: '本站后续提交已暂停' };
+        const id = node.station_id;
+        if (nodeJobClosed('crafting', id)) return { blocked: '本站已关闭' };
         if (craftFlight(id)?.phase === 'uncertain') return { blocked: '本站队列结果待核对' };
         const steps = configuredCraftSteps(id);
-        let pipeline = null, wanted = selected ?? CONFIG.crafting.recipeId, resetRootProgress = null;
-        if (steps.length) {
-            if (!preview && selected == null && !craftPipelineRunning(id)) return { blocked: '流程未启动' };
-            let progress = craftPipelineProgress(id, steps);
-            if (progress.legacy) return { blocked: '旧版进度请在空闲时重置后继续' };
-            if (progress.finished) {
-                if (selected != null || !CONFIG.crafting.repeatPipeline) return { blocked: '加工目标已完成' };
-                if (!node.empty || craftFlight(id)) return { blocked: '等待本批队列结算' };
-                progress = { stepIndex: 0, done: steps.map(() => 0) };
-                resetRootProgress = id;
-            }
-            const step = steps[progress.stepIndex];
-            wanted = step.recipeId;
-            pipeline = { stationId: id, steps, stepIndex: progress.stepIndex, done: progress.done, taskItemId: step.taskItemId || '' };
-        }
-        if (wanted == null) return { blocked: '未配置加工目标' };
+        if (!steps.length) return { blocked: '请先配置本轮配方和加工次数' };
+        const run = craftRun(id), progress = craftPipelineProgress(id, steps);
+        if (progress.finished) return { blocked: '本轮已全部领取，点击「再执行一次」才会重新加工', completed: true };
+        if (!preview && !craftPipelineRunning(id)) return { blocked: run?.status === 'stopped' && run.sig === craftPipelineSig(steps)
+            ? '本轮已停止，等待点击继续' : '目标已配置，等待点击「执行一次」' };
+        if (progress.legacy) return { blocked: '旧版进度待确认；队列结束后点击「执行一次」开始新轮' };
+        const step = steps[progress.stepIndex], wanted = step.recipeId;
+        const pipeline = { stationId: id, steps, stepIndex: progress.stepIndex, done: progress.done, taskItemId: step.taskItemId || '' };
         const job = (node.recipes || []).find(recipe => sameId(jobId(recipe), wanted));
         if (!job || job.unlocked === false) return { blocked: `目标配方 #${wanted} 不存在或未解锁` };
-        return { node, id, job, pipeline, resetRootProgress };
+        return { node, id, job, pipeline, runId: craftPipelineRunning(id) ? run.id : null };
     }
 
     function craftRecipeInputs(recipe) {
@@ -3582,10 +3622,16 @@
         }
         return [...inputs.values()];
     }
+    function craftRecipeOutputId(recipe) {
+        // 库存条目与嵌入物品定义可能使用不同 ID 字段；仅接受明确字段，不用配方 ID 或名称推测。
+        const id = recipe?.item_id ?? recipe?.item?.item_id ?? recipe?.produce?.item_id ??
+            recipe?.produce_item_id ?? recipe?.output_item_id ?? recipe?.item?.id ?? recipe?.produce?.id;
+        return id == null ? null : String(id);
+    }
     function craftRecipeOutput(recipe) {
         // 随机产物不能保证补齐；仅用配方明确给出的单一产物及最低数量。
         if (!recipe || recipe.outputs?.length) return null;
-        const id = recipe.item_id ?? recipe.item?.item_id ?? recipe.produce?.item_id;
+        const id = craftRecipeOutputId(recipe);
         const quantity = Number(recipe.yield_min ?? recipe.produce_quantity ?? recipe.output_quantity);
         return id != null && Number.isSafeInteger(quantity) && quantity > 0 ? { id: String(id), quantity } : null;
     }
@@ -3609,18 +3655,21 @@
         if (!node) return null;
         return memoizedForState(state, `craftMaterialTree:${node.station_id}`, () => {
             const id = String(node.station_id), target = craftTarget(node, { preview: true });
-            const preview = !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart ||
-                getOverride(`rlt-craft-paused:${id}`) === '1' ||
-                (nodeJobOverride('crafting', id) == null && configuredCraftSteps(id).length > 0 && !craftPipelineRunning(id));
+            const preview = !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart || !craftPipelineRunning(id);
             const schedule = preview && target.job
                 ? craftProductionScheduleUncached(state, { previewStationId: id }) : craftProductionSchedule(state);
             const trace = schedule.trees.get(id);
             const statusLabel = schedule.statuses.get(id) || target.blocked || '等待加工目标';
             const tree = { title: target.job?.name || node.definition?.name || `加工点 ${id}`,
-                quantity: trace?.quantity || 0, preview, status: 'waiting', statusLabel, note: '', root: null };
+                quantity: trace?.quantity || 0, goal: trace?.goal || null, phase: trace?.phase || (target.completed ? 'completed' : 'planning'), preview,
+                status: target.completed ? 'ready' : 'waiting', statusLabel, note: '', root: null, stamina: trace?.stamina || null };
             const notes = [];
-            if (preview) notes.push('仅预览本站下一批用料；启动后会按最新库存和其他站点目标重新分配。');
+            if (preview && tree.phase === 'planning') notes.push('用料预览；点击执行后按最新库存重新检查。');
             if (trace) {
+                const goal = trace.goal;
+                if (goal?.finite) {
+                    notes.push(`${goal.stepCount > 1 ? `第 ${goal.stepIndex + 1} 步` : '本轮目标'} ${goal.total} 次 · 已领取 ${goal.collected} · 已提交待领取 ${goal.committed}${trace.phase === 'committed' ? '。' : ` · 待开工 ${goal.remaining}。单次最多提交 ${goal.batchLimit} 次，材料和体力按全部待开工次数检查。`}`);
+                }
                 const rows = new Map([...trace.rows].map(([key, row]) => [key, { ...row, children: [] }]));
                 for (const row of rows.values()) {
                     if (row.parent == null) tree.root = row;
@@ -3635,21 +3684,32 @@
                 };
                 if (tree.root) summarize(tree.root);
                 tree.status = trace.feasible ? tree.root?.status || 'waiting' : 'blocked';
-                if (!trace.feasible) {
+                if (trace.stamina?.missing > 0) {
+                    tree.status = 'waiting';
+                    if (tree.root) { tree.root.status = 'waiting'; tree.root.statusLabel = '等待整条路线体力'; }
+                } else if (!trace.feasible) {
                     if (tree.root) { tree.root.status = 'blocked'; tree.root.statusLabel = '材料检查未通过'; }
-                    notes.push(`本次按 ${trace.quantity} 份检查未通过，不提交补料；原因见上方状态及材料分支。`);
+                    notes.push(`本次按 ${trace.quantity} 次检查未通过，不提交补料；原因见上方状态及材料分支。`);
                 }
                 else if (trace.reserveOnly) {
                     tree.status = 'waiting';
-                    notes.push('显示当前步骤尚未提交的下一批用料；已提交队列的投入不重复计算。');
+                    notes.push(goal?.remaining === 0 ? '当前目标已全部提交，体力和材料已在提交时支付；领取后结束本步骤。' : '本站队列运行中，下方为尚未提交部分的需求。');
+                }
+                if (tree.stamina && trace.phase !== 'committed') {
+                    const budget = tree.stamina;
+                    notes.push(`待做路线消耗 ${budget.cost} 体力${budget.reserve ? ` + 保底 ${budget.reserve}` : ''}${budget.reserved ? ` + 其他目标预留 ${budget.reserved}` : ''}；当前 ${budget.current}${budget.missing ? `，还差 ${budget.missing}` : '，足够'}。已提交部分不重复计费，不预支自然恢复。`);
                 }
                 const plan = [...schedule.plans.values()].find(value => sameId(value.dependencyFor?.stationId ?? value.id, id));
+                if (plan) {
+                    const quantity = craftBatchSize(state, plan.node, plan);
+                    if (quantity > 0) notes.push(`下一次提交「${plan.job.name || jobId(plan.job)}」×${quantity} 次，扣除 ${Number(plan.job.stamina_cost || 0) * quantity} 体力。`);
+                }
                 if (plan && plan.requiredStamina > liveStamina(state)) {
                     tree.status = 'waiting'; tree.statusLabel = `等待体力恢复至 ${plan.requiredStamina} 后继续加工`;
                 }
                 if (trace.truncated) notes.push('材料树仅展示前 160 个节点，后续分支已省略；展示上限不改变加工检查范围。');
-                notes.push('库存供给、在途和计划供给均为本分支分配量；待补是仍需加工或补充的数量。');
-            } else if (target.blocked) tree.status = 'blocked';
+                if (trace.phase !== 'committed') notes.push('库存、在途与计划供给均按分支分配；待补为尚缺物品件数。');
+            } else if (target.blocked && !target.completed) tree.status = 'blocked';
             tree.note = notes.join(' ');
             return tree;
         });
@@ -3707,7 +3767,7 @@
             growthRoom.set(id, Math.max(0, ceiling - safe));
         }
         // 所有根目标共享账本，已分给一条链的库存/在途产物不能被另一条链重复使用。
-        // 树只记录实际搜索分支；随账本回溯，失败的替代配方不会混入最终展示。
+        // 可行树随账本回溯，失败的替代配方不会混入；无可用站点时另做只读路线诊断。
         // 限制的是展示条目，达到上限不会改变生产搜索或库存分配。
         const traceLimit = 160, materialInfo = new Map();
         const info = input => {
@@ -3731,12 +3791,17 @@
             traceUpdate(context, key, { status: 'blocked', statusLabel: '受阻', note: message });
             const error = new Error(message);
             error.materialTrace = new Map(context.trace); error.traceTruncated = context.traceTruncated;
+            if (context.diagnostic) {
+                context.diagnosticBlocks.push({ key, message });
+                error.materialContext = context;
+            }
             throw error;
         };
-        let ledger = { actual, pending, protectedDebt, growthRoom, virtual: new Map(), used: new Map(), operations: [], trace: new Map(), traceTruncated: false };
+        let ledger = { actual, pending, protectedDebt, growthRoom, virtual: new Map(), used: new Map(), stamina: 0, operations: [], trace: new Map(), traceTruncated: false };
         const clone = value => ({ actual: new Map(value.actual), pending: new Map(value.pending), protectedDebt: new Map(value.protectedDebt),
             growthRoom: new Map(value.growthRoom), virtual: new Map(value.virtual), used: new Map(value.used), operations: [...value.operations],
-            trace: new Map(value.trace), traceTruncated: value.traceTruncated });
+            stamina: value.stamina, trace: new Map(value.trace), traceTruncated: value.traceTruncated,
+            diagnostic: value.diagnostic, diagnosticBlocks: [...(value.diagnosticBlocks || [])] });
         for (const node of nodes) {
             if (previewStationId != null && !sameId(node.station_id, previewStationId)) continue;
             let visits = 0;
@@ -3744,23 +3809,49 @@
             if (!target.job) { result.statuses.set(rootId, target.blocked); continue; }
             const reserveOnly = (!node.empty || flight) && !flight?.dependencyFor;
             const baseLimit = cfg.batchEnabled ? Math.min(99, Math.max(1, Math.floor(cfg.batchLimit))) : 1;
-            const queued = reserveOnly && target.pipeline && flight?.steps?.length &&
+            const queued = reserveOnly && target.pipeline && flight?.phase === 'active' && flight.steps?.length &&
                 sameId(flight.recipeId, jobId(target.job)) && flight.stepIndex === target.pipeline.stepIndex &&
                 craftPipelineSig(flight.steps) === craftPipelineSig(target.pipeline.steps)
                 ? Math.max(0, flight.quantity - flight.credited) : 0;
-            const limit = target.pipeline ? Math.min(baseLimit, target.pipeline.steps[target.pipeline.stepIndex].times - target.pipeline.done[target.pipeline.stepIndex] - queued) : baseLimit;
-            if (limit <= 0) { result.statuses.set(rootId, '等待本站队列完成并领取'); continue; }
-            let chosen = null, reason = '', failedTrace = null, chosenQuantity = 0, failedQuantity = 0, failedTruncated = false;
-            const canBorrow = candidate => {
+            const total = target.pipeline.steps[target.pipeline.stepIndex].times;
+            const collected = Math.min(total, target.pipeline.done[target.pipeline.stepIndex]);
+            const committed = Math.min(Math.max(0, total - collected), queued);
+            const goal = { finite: true, total, collected, committed,
+                remaining: Math.max(0, total - collected - committed), batchLimit: baseLimit,
+                stepIndex: target.pipeline.stepIndex, stepCount: target.pipeline.steps.length };
+            // 有限目标的分析范围与单次请求上限分开：10 次目标始终检查剩余全部次数，不随体力降成 6 次。
+            const limit = goal.remaining;
+            if (limit === 0) {
+                const key = `/recipe:${node.station_id}:${jobId(target.job)}`;
+                const output = craftRecipeOutput(target.job);
+                result.trees.set(rootId, { quantity: 0, goal, phase: 'committed', rows: new Map([[key, { key, parent: null, kind: 'queue',
+                    name: target.job.name || String(jobId(target.job)), required: committed,
+                    ...(output ? { outputPerCraft: output.quantity, outputQuantity: output.quantity * committed } : {}),
+                    status: 'waiting', statusLabel: '已提交，等待领取', note: '这部分已开工，不再重复投入体力和材料。' }]]),
+                    feasible: true, reserveOnly: true, stamina: { cost: 0, reserved: 0, reserve: 0, required: 0, current: liveStamina(state), missing: 0 } });
+                result.statuses.set(rootId, '等待本站队列完成并领取'); continue;
+            }
+            let chosen = null, reason = '', failedTrace = null, chosenQuantity = 0, failedQuantity = 0, failedTruncated = false, stamina = null, failedUsed = null;
+            let needsStationDiagnosis = false;
+            const staminaBudget = context => {
+                const reserve = Math.max(0, Number(cfg.staminaReserve) || 0), current = liveStamina(state);
+                const cost = context.stamina - ledger.stamina, required = context.stamina + reserve;
+                return { cost, reserved: ledger.stamina, reserve, required, current, missing: Math.max(0, required - current) };
+            };
+            const borrowBlock = candidate => {
                 const id = String(candidate.station_id);
-                if (nodeJobClosed('crafting', id) || (getOverride(`rlt-craft-paused:${id}`) === '1' && !sameId(id, previewStationId)) || craftFlight(id)?.phase === 'uncertain') return false;
+                const name = candidate.definition?.name || id;
+                if (nodeJobClosed('crafting', id)) return `加工站「${name}」已关闭`;
+                if (craftFlight(id)?.phase === 'uncertain') return `加工站「${name}」的队列结果待核对`;
                 // 允许同站先补原料；其他站只借用未承担用户目标的站点。
-                if (id === rootId) return true;
+                if (id === rootId) return '';
                 const selected = nodeJobOverride('crafting', id) ?? cfg.recipeId;
                 const steps = configuredCraftSteps(id), progress = craftPipelineProgress(id, steps);
-                const activeSteps = steps.length && craftPipelineRunning(id) && (!progress.finished || cfg.repeatPipeline);
+                const activeSteps = steps.length && craftPipelineRunning(id) && !progress.finished;
                 // 配方暂时不可用或旧进度待核对，也不能把用户正在运行的目标当作空闲站。
-                return !targets.get(id)?.job && selected == null && !activeSteps;
+                if (selected != null) return `加工站「${name}」已锁定其他加工目标，不能借用`;
+                if (targets.get(id)?.job || activeSteps) return `加工站「${name}」有独立加工流程，不能借用`;
+                return '';
             };
             const requireItem = (context, input, quantity, path, key, accept) => {
                 if (++visits > 20000 || path.size > 64 || !Number.isSafeInteger(quantity)) fail(context, key, '材料链过于复杂或数量无效，已停止自动补料');
@@ -3781,11 +3872,21 @@
                 if (uncertain.has(input.id)) fail(context, key, `${input.name} 的在途加工结果待核对`);
                 if ((context.growthRoom.get(input.id) ?? Infinity) < missing) fail(context, key, `${input.name} 受高品质需求预留限制，已中止本次补料`);
                 if (path.has(input.id)) fail(context, key, `检测到循环配方：${input.name}，已停止自动补料`);
-                const producers = nodes.flatMap(station => (station.recipes || []).filter(recipe => recipe.unlocked !== false &&
-                    craftRecipeOutput(recipe)?.id === input.id).map(recipe => ({ node: station, job: recipe })))
-                    .filter(candidate => canBorrow(candidate.node))
-                    .sort((a, b) => Number(!a.node.empty) - Number(!b.node.empty) || Number(String(b.node.station_id) === rootId) - Number(String(a.node.station_id) === rootId));
-                if (!producers.length) fail(context, key, `缺少 ${input.name} ×${missing}：没有可用加工配方或站点，已中止本次补料`);
+                const known = nodes.flatMap(station => (station.recipes || []).filter(recipe =>
+                    craftRecipeOutputId(recipe) === input.id).map(recipe => ({ node: station, job: recipe })));
+                const valid = known.filter(candidate => craftRecipeOutput(candidate.job));
+                const unavailable = candidate => candidate.job.unlocked === false ? `配方「${candidate.job.name || jobId(candidate.job)}」尚未解锁` : borrowBlock(candidate.node);
+                if (valid.some(unavailable)) needsStationDiagnosis = true;
+                const producers = valid.filter(candidate => context.diagnostic || !unavailable(candidate))
+                    .sort((a, b) => Number(!!unavailable(a)) - Number(!!unavailable(b)) || Number(!a.node.empty) - Number(!b.node.empty) || Number(String(b.node.station_id) === rootId) - Number(String(a.node.station_id) === rootId));
+                if (!producers.length) {
+                    const sameName = nodes.some(station => (station.recipes || []).some(recipe => craftRecipeOutputId(recipe) == null &&
+                        (recipe.item?.name ?? recipe.produce?.name ?? recipe.name) === input.name));
+                    const detail = valid.length ? [...new Set(valid.map(unavailable))].join('；') : known.length ?
+                        '已找到配方，但产物数量不完整或为随机产物，无法确认可补齐数量' : sameName ?
+                        '发现同名配方但产物编号/数量不完整，无法确认' : '未找到该物品的加工配方，需先补充基础材料或解锁对应配方';
+                    fail(context, key, `缺少 ${input.name} ×${missing}：${detail}`);
+                }
                 let failure;
                 for (const producer of producers) {
                     const attempt = clone(context), output = craftRecipeOutput(producer.job);
@@ -3794,6 +3895,12 @@
                         const nextPath = new Set(path); nextPath.add(input.id);
                         traceUpdate(attempt, key, { statusLabel: '加工补齐', note: debt > 0 ? `还需先满足受保护需求 ${debt} 件；本配方每份至少产出 ${output.quantity} 件` : `本配方每份至少产出 ${output.quantity} 件` });
                         return expand(attempt, producer.node, producer.job, batches, nextPath, true, key, produced => {
+                            // 诊断中的受阻路线不产生可复用产物；它的库存分配也仅存在于这份临时账本。
+                            const blocked = produced.diagnosticBlocks?.find(row => row.key.startsWith(`${key}/`));
+                            if (context.diagnostic && blocked) {
+                                traceUpdate(produced, key, { status: 'blocked', statusLabel: '路线受阻', note: blocked.message });
+                                return accept(produced, false);
+                            }
                             const usable = Math.min(produced.growthRoom.get(input.id) ?? Infinity, batches * output.quantity - debt);
                             produced.protectedDebt.set(input.id, 0);
                             produced.growthRoom.set(input.id, (produced.growthRoom.get(input.id) ?? Infinity) - usable);
@@ -3801,52 +3908,99 @@
                             // 后续兄弟分支不可行时也回退到这里，尝试本材料的另一条配方。
                             return accept(produced, false);
                         });
-                    } catch (error) { failure = error; }
+                    } catch (error) {
+                        // 材料可行但体力不足时保留最低消耗的完整路线，供等待与展示使用。
+                        if (!failure?.stamina || (error.stamina && error.stamina.required < failure.stamina.required)) failure = error;
+                    }
                 }
                 throw failure;
             };
             const expand = (context, station, recipe, quantity, path, dependency, parent = null, accept = value => value) => {
                 const key = `${parent || ''}/recipe:${station.station_id}:${jobId(recipe)}`;
+                const stationBlock = context.diagnostic && dependency ?
+                    (recipe.unlocked === false ? `配方「${recipe.name || jobId(recipe)}」尚未解锁` : borrowBlock(station)) : '';
                 traceAdd(context, { key, parent, kind: 'recipe', name: recipe.name || String(jobId(recipe)), required: quantity,
                     status: 'waiting', statusLabel: '检查材料', note: `加工站：${station.definition?.name || station.station_id}` });
+                if (!Number.isSafeInteger(quantity) || quantity <= 0) fail(context, key, '加工次数无效，已停止自动补料');
+                const output = craftRecipeOutput(recipe);
+                if (output) traceUpdate(context, key, { outputPerCraft: output.quantity, outputQuantity: output.quantity * quantity });
+                if (stationBlock) context.diagnosticBlocks.push({ key, message: stationBlock });
                 const inputs = craftRecipeInputs(recipe);
                 if (!inputs) fail(context, key, `「${recipe.name || jobId(recipe)}」材料数据不完整`);
                 for (const input of inputs) traceAdd(context, { key: `${key}/item:${input.id}`, parent: key, kind: 'material',
                     itemId: input.id, name: input.name, required: input.quantity * quantity, ...info(input),
                     status: 'unchecked', statusLabel: '待检查', note: '' });
-                const staminaCost = Number(recipe.stamina_cost || 0) + cfg.staminaReserve;
-                if (staminaCost > Math.max(Number(state.player?.stamina_cap ?? Infinity), liveStamina(state))) fail(context, key, `「${recipe.name || jobId(recipe)}」单次体力超过可用上限`);
+                const staminaCost = Number(recipe.stamina_cost ?? 0) * quantity;
+                if (!Number.isFinite(staminaCost) || staminaCost < 0) fail(context, key, `「${recipe.name || jobId(recipe)}」体力数据无效`);
+                traceUpdate(context, key, { stamina: staminaCost });
                 const nextInput = (index, current, ready) => {
                     if (index < inputs.length) {
                         const input = inputs[index];
-                        return requireItem(current, input, input.quantity * quantity, path, `${key}/item:${input.id}`, (next, inputReady) => nextInput(index + 1, next, ready && inputReady));
+                        try {
+                            return requireItem(current, input, input.quantity * quantity, path, `${key}/item:${input.id}`, (next, inputReady) => nextInput(index + 1, next, ready && inputReady));
+                        } catch (error) {
+                            if (!current.diagnostic || !error.materialContext) throw error;
+                            return nextInput(index + 1, error.materialContext, false);
+                        }
                     }
-                    traceUpdate(current, key, { status: ready ? 'ready' : 'waiting', statusLabel: ready ? '材料齐备' : '等待材料' });
-                    current.operations.push({ node: station, id: station.station_id, job: recipe, maxQuantity: quantity, materialReady: ready,
-                        pipeline: dependency ? null : target.pipeline, resetRootProgress: target.resetRootProgress,
+                    const blocked = current.diagnosticBlocks?.find(row => row.key === key || row.key.startsWith(`${key}/`));
+                    traceUpdate(current, key, blocked ? { status: 'blocked', statusLabel: stationBlock ? '站点不可用' : '材料受阻',
+                        note: `加工站：${station.definition?.name || station.station_id}；${stationBlock || blocked.message}` } :
+                        { status: ready ? 'ready' : 'waiting', statusLabel: ready ? '材料齐备' : '等待材料' });
+                    if (!current.diagnostic) current.operations.push({ node: station, id: station.station_id, job: recipe, maxQuantity: quantity, materialReady: ready,
+                        pipeline: dependency ? null : target.pipeline, runId: target.runId,
                         dependencyFor: dependency ? { stationId: target.id, recipeId: jobId(target.job), name: target.job.name || String(jobId(target.job)) } : null });
+                    current.stamina += staminaCost;
                     return accept(current);
                 };
                 return nextInput(0, context, true);
             };
-            // 保留原来的按库存分批行为：下一批做不满时降低份数；连一份都不可行则整条链零提交。
-            for (let quantity = limit; quantity >= 1 && visits < 20000; quantity--) {
+            // 只检查完整待做量，不能因当前材料或体力不足而悄悄缩小用户目标。
+            {
+                const quantity = limit;
                 const attempt = clone(ledger); attempt.operations = []; attempt.trace = new Map(); attempt.traceTruncated = false;
                 try {
                     const output = craftRecipeOutput(target.job);
-                    chosen = expand(attempt, node, target.job, quantity, new Set(output ? [output.id] : []), false);
+                    chosen = expand(attempt, node, target.job, quantity, new Set(output ? [output.id] : []), false, null, complete => {
+                        const budget = staminaBudget(complete);
+                        if (budget.missing > 0) {
+                            const cap = Number(state.player?.stamina_cap ?? Infinity);
+                            const error = new Error(`当前目标剩余 ${quantity} 次的整条路线需 ${budget.required} 体力（加工 ${budget.cost} + 保底 ${budget.reserve}${budget.reserved ? ` + 其他目标预留 ${budget.reserved}` : ''}），当前 ${budget.current}，还差 ${budget.missing}${budget.required > cap ? '；超过自然恢复上限，需调小目标、补充体力或中间材料' : '，等待恢复后再开工'}`);
+                            error.stamina = budget; error.materialUsed = new Map(complete.used);
+                            error.materialTrace = new Map(complete.trace); error.traceTruncated = complete.traceTruncated;
+                            throw error;
+                        }
+                        return complete;
+                    });
+                    stamina = staminaBudget(chosen);
                     chosenQuantity = quantity;
-                    break;
-                } catch (error) { reason = error.message; failedTrace = error.materialTrace || attempt.trace; failedQuantity = quantity; failedTruncated = error.traceTruncated || attempt.traceTruncated; }
+                } catch (error) { reason = error.message; failedTrace = error.materialTrace || attempt.trace; failedQuantity = quantity; failedTruncated = error.traceTruncated || attempt.traceTruncated; stamina = error.stamina || null; failedUsed = error.materialUsed || null; }
             }
-            result.trees.set(rootId, { quantity: chosenQuantity || failedQuantity, rows: chosen?.trace || failedTrace || new Map(),
-                truncated: chosen ? chosen.traceTruncated : failedTruncated, feasible: !!chosen, reserveOnly: !!reserveOnly });
-            if (!chosen) { result.statuses.set(rootId, reason || '材料链过于复杂，已停止本次补料'); continue; }
+            if (!chosen && !stamina && needsStationDiagnosis) {
+                // 真实执行搜索失败后，借用同一递归器展示已知路线。诊断账本始终丢弃，不预留库存或提交任务。
+                const diagnostic = clone(ledger);
+                diagnostic.operations = []; diagnostic.trace = new Map(); diagnostic.traceTruncated = false;
+                diagnostic.diagnostic = true; diagnostic.diagnosticBlocks = []; visits = 0;
+                try {
+                    const output = craftRecipeOutput(target.job);
+                    const inspected = expand(diagnostic, node, target.job, failedQuantity || 1, new Set(output ? [output.id] : []), false);
+                    failedTrace = inspected.trace; failedTruncated = inspected.traceTruncated;
+                } catch (error) {
+                    failedTrace = error.materialTrace || diagnostic.trace;
+                    failedTruncated = error.traceTruncated || diagnostic.traceTruncated;
+                }
+            }
+            result.trees.set(rootId, { quantity: chosenQuantity || failedQuantity, goal, rows: chosen?.trace || failedTrace || new Map(),
+                truncated: chosen ? chosen.traceTruncated : failedTruncated, feasible: !!chosen, reserveOnly: !!reserveOnly, stamina });
+            if (!chosen) {
+                if (stamina && failedUsed) result.rootReserves.set(rootId, new Map([...failedUsed].map(([id, count]) => [id, count - (ledger.used.get(id) || 0)])));
+                result.statuses.set(rootId, reason || '材料链过于复杂，已停止本次补料'); continue;
+            }
             result.rootReserves.set(rootId, new Map([...chosen.used].map(([id, count]) => [id, count - (ledger.used.get(id) || 0)])));
             ledger = chosen;
-            // 根队列运行时只保护当前步骤下一批的递归原料，不提交辅助队列。
+            // 根队列运行时保护当前步骤尚未提交部分的递归原料，不提交辅助队列。
             // 后续流程步骤仍由 craftingInputReserves 保留直接材料，完成本步骤后才递归展开。
-            if (reserveOnly) { result.statuses.set(rootId, '等待本站队列完成并领取，已预留下一批材料'); continue; }
+            if (reserveOnly) { result.statuses.set(rootId, '等待本站队列完成并领取，已预留待做目标材料'); continue; }
             if (previewStationId != null) { result.statuses.set(rootId, '材料检查完成，启动后按最新库存安排加工'); continue; }
             const available = chosen.operations.find(operation => operation.materialReady && operation.node.empty &&
                 !operation.node.task_snapshot && !craftFlight(operation.id) && !result.plans.has(String(operation.id)));
@@ -3863,7 +4017,7 @@
                     result.statuses.set(rootId, '指定开工道具不足、不可用或已预留'); continue;
                 }
             }
-            const required = Number(available.job.stamina_cost || 0) + cfg.staminaReserve;
+            const required = stamina.required;
             available.requiredStamina = required;
             const partner = assignedPartner(state, available.node);
             const ability = Number(state.industry_rules?.crafting?.character_base_ability || 0) + (partner ? partnerAbility(partner, 'crafting') : 0);
@@ -3883,7 +4037,11 @@
     function pickJob(state, industry, node) {
         if (industry === 'crafting') {
             const schedule = craftProductionSchedule(state), plan = schedule.plans.get(String(node.station_id));
-            if (!plan) return { blocked: schedule.statuses.get(String(node.station_id)) || '等待目标材料或加工站空闲' };
+            if (!plan) {
+                const budget = schedule.trees.get(String(node.station_id))?.stamina;
+                if (budget?.missing > 0) rememberStaminaNeed(state, budget.required, `完整加工路线 ${node.station_id}`);
+                return { blocked: schedule.statuses.get(String(node.station_id)) || '等待目标材料或加工站空闲' };
+            }
             if (plan.requiredStamina > liveStamina(state)) {
                 rememberStaminaNeed(state, plan.requiredStamina, `加工 ${plan.job.name || jobId(plan.job)}`);
                 return { blocked: '体力不足，等待恢复后继续加工材料链' };

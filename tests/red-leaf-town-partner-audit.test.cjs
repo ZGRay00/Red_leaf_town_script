@@ -126,12 +126,12 @@ function taskItemCase({ pipeline = false, choice = 'required-item', items = [], 
     x.h.CONFIG.crafting.useTaskItems = useItems;
     if (pipeline) {
         x.h.setOverride('rlt-craft-pipe:mill', JSON.stringify([{ recipeId: 'flour', times: 1, taskItemId: choice }]));
-        x.h.setOverride('rlt-craft-pipe-run:mill', '1');
     } else {
         x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
         x.h.setOverride('rlt-craft-lock-times:mill', '1');
         x.h.setOverride('rlt-node-task-item:crafting:mill', choice);
     }
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
     x.setResponder(request => {
         assert.ok(request.url.endsWith('/start'));
         const node = x.backend.crafting_stations[0];
@@ -196,7 +196,7 @@ for (const controlKind of ['pipeline', 'recipe', 'limit']) {
             x.h.tabBar.children.find(button => button.dataset.page === 'crafting').onclick();
             const findControl = () => descendants(x.h.configBox).find(node => controlKind === 'recipe'
                 ? node.tagName === 'SELECT'
-                : node.tagName === 'INPUT' && node.style.cssText === `width:${controlKind === 'pipeline' ? 38 : 48}px;flex:none`);
+                : node.tagName === 'INPUT' && !node.hidden && (controlKind === 'pipeline' ? /本步骤|该步累计/.test(node.title) : node.type === 'number'));
             const control = findControl(), savedValue = control.value;
             assert.equal(control.disabled, false);
             x.context.document.activeElement = control;

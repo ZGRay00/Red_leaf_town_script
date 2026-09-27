@@ -7,6 +7,10 @@
 !tests/
 !tests/red-leaf-town-v4.test.cjs
 !tests/red-leaf-town-crafting-dependencies.test.cjs
+!tests/red-leaf-town-crafting-stamina.test.cjs
+!tests/red-leaf-town-crafting-target.test.cjs
+!tests/red-leaf-town-crafting-once.test.cjs
+!tests/red-leaf-town-crafting-output.test.cjs
 !tests/red-leaf-town-material-tree.test.cjs
 !tests/red-leaf-town-material-tree-ui.test.cjs
 !tests/red-leaf-town-panel-ui.cjs

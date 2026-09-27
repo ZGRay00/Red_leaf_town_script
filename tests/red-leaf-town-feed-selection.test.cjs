@@ -84,7 +84,9 @@ test('selected feed also protects explicit keep, tributes and configured craftin
     const x = harness(state); Object.assign(x.h.CONFIG.feed, { enabled: true, itemId: 'pumpkin', autoBuy: false });
     x.h.CONFIG.crafting.batchLimit = 1;
     x.h.CONFIG.selling.keepByItemId.pumpkin = 6;
-    x.h.setOverride('rlt-node-job:crafting:mill', 'flour'); depositResponder(x);
+    x.h.setOverride('rlt-node-job:crafting:mill', 'flour');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'mill'), true);
+    depositResponder(x);
     await x.h.doAquaticFeed();
     assert.equal(x.calls[0].payload.count, 8); // 4 tribute + max(6 explicit, 8 recipe) remain.
     assert.equal(x.backend.inventory.find(item => item.item_id === 'pumpkin').quantity, 12);
