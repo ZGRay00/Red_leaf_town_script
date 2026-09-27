@@ -12,8 +12,8 @@ function treeHarness(state) {
     };
     try {
         const x = harness(state);
-        x.tree = (stationId = 'kitchen') => x.context.window.__materialTreeAudit.craftMaterialTree(
-            x.h.runtime.state, x.h.runtime.state.crafting_stations.find(node => node.station_id === stationId));
+        x.tree = (stationId = 'kitchen', options = {}) => x.context.window.__materialTreeAudit.craftMaterialTree(
+            x.h.runtime.state, x.h.runtime.state.crafting_stations.find(node => node.station_id === stationId), options);
         x.schedule = () => x.context.window.__materialTreeAudit.craftProductionSchedule(x.h.runtime.state);
         return x;
     } finally { fs.readFileSync = originalRead; }
@@ -62,6 +62,16 @@ function find(tree, kind, name) {
 function signature(x) {
     return JSON.stringify({ storage: [...x.storage], runtime: x.h.runtime, calls: x.calls,
         progress: x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')) });
+}
+function recordCompletedRun(x, id = 'kitchen') {
+    const steps = x.h.configuredCraftSteps(id), runId = x.h.craftRun(id).id;
+    steps.forEach((step, stepIndex) => {
+        x.h.saveCraftFlight(id, { phase: 'active', quantity: step.times, credited: 0, observedCollected: 0,
+            runId, recipeId: step.recipeId, steps, stepIndex });
+        x.h.creditCraftFlight(id, step.times);
+        x.h.saveCraftFlight(id, null);
+    });
+    assert.equal(x.h.craftRun(id).status, 'completed');
 }
 
 test('material tree follows all levels and the quantity multipliers selected by the real planner', () => {
@@ -429,4 +439,95 @@ test('hitting the search complexity cap reports the actual attempted batch and r
     assert.match(tree.statusLabel, /复杂|无效/);
     assert.ok(flatten(tree.root).length <= 161);
     assert.equal(x.calls.length, 0);
+});
+
+test('a completed three-of-three target previews the next full round without resetting or authorizing it', async () => {
+    const x = setup({ jobs: [recipe('meal', { flour: 2 }), recipe('flour', { wheat: 1 }, 2)], items: { wheat: 3 }, times: 3 });
+    recordCompletedRun(x);
+    const normal = x.tree(), actualSchedule = x.schedule(), before = signature(x), logCount = x.h.logBox.children.length;
+    assert.equal(normal.phase, 'completed'); assert.equal(normal.root, null);
+    const next = x.tree('kitchen', { freshRun: true });
+    assert.equal(next.preview, true); assert.equal(next.quantity, 3); assert.equal(next.root.required, 3);
+    assert.equal(next.goal.collected, 0); assert.equal(next.goal.committed, 0); assert.equal(next.goal.remaining, 3);
+    assert.equal(next.stamina.cost, 6);
+    assert.equal(find(next, 'material', 'flour').required, 6);
+    assert.equal(find(next, 'recipe', 'flour').required, 3);
+    assert.equal(find(next, 'material', 'wheat').required, 3);
+    assert.equal(signature(x), before); assert.equal(x.h.logBox.children.length, logCount);
+    assert.equal(x.schedule(), actualSchedule); assert.equal(x.schedule().plans.size, 0);
+    assert.equal(x.tree(), normal, 'fresh preview must not replace the cached completed view');
+    await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0);
+    assert.deepEqual([...x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')).done], [3]);
+});
+
+test('a completed multi-step pipeline previews its first step without changing any saved step progress', async () => {
+    const x = setup({ jobs: [recipe('meal', { flour: 1 }), recipe('flour', { wheat: 1 }), recipe('jam', { berry: 1 })],
+        items: { wheat: 3, berry: 2 }, times: 3 });
+    x.h.stopCraftRun('kitchen');
+    x.h.setOverride('rlt-node-job:crafting:kitchen', '');
+    x.h.setOverride('rlt-craft-pipe:kitchen', JSON.stringify([{ recipeId: 'meal', times: 3 }, { recipeId: 'jam', times: 2 }]));
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'kitchen'), true);
+    recordCompletedRun(x);
+    const before = signature(x), next = x.tree('kitchen', { freshRun: true });
+    assert.equal(next.root.name, 'meal'); assert.equal(next.quantity, 3);
+    assert.equal(next.goal.stepIndex, 0); assert.equal(next.goal.stepCount, 2); assert.equal(next.goal.collected, 0);
+    assert.equal(next.stamina.cost, 6);
+    assert.deepEqual([...x.h.craftPipelineProgress('kitchen', x.h.configuredCraftSteps('kitchen')).done], [3, 2]);
+    assert.equal(signature(x), before);
+    await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0);
+});
+
+test('fresh preview can inspect legacy progress without silently migrating or clearing it', async () => {
+    const x = setup({ jobs: [recipe('meal', { wheat: 1 })], items: { wheat: 3 }, times: 3 });
+    x.h.stopCraftRun('kitchen');
+    const steps = x.h.configuredCraftSteps('kitchen');
+    x.h.setOverride('rlt-craft-pipe-prog:kitchen', JSON.stringify({ sig: JSON.stringify(steps.map(step => ({ recipeId: step.recipeId, times: step.times }))), done: [2] }));
+    assert.equal(x.h.craftPipelineProgress('kitchen', steps).legacy, true);
+    const before = signature(x), next = x.tree('kitchen', { freshRun: true });
+    assert.equal(next.quantity, 3); assert.equal(next.goal.collected, 0); assert.equal(next.stamina.cost, 3);
+    assert.equal(find(next, 'material', 'wheat').required, 3);
+    assert.equal(signature(x), before); assert.equal(x.h.craftPipelineProgress('kitchen', steps).legacy, true);
+    await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0);
+});
+
+test('a stopped resumable run keeps its remaining preview separate from a hypothetical fresh round', async () => {
+    const x = setup({ jobs: [recipe('meal', { wheat: 1 })], items: { wheat: 3 }, times: 3 });
+    const steps = x.h.configuredCraftSteps('kitchen');
+    x.h.saveCraftFlight('kitchen', { phase: 'active', quantity: 1, credited: 0, observedCollected: 0,
+        runId: x.h.craftRun('kitchen').id, recipeId: 'meal', steps, stepIndex: 0 });
+    x.h.creditCraftFlight('kitchen', 1); x.h.saveCraftFlight('kitchen', null); x.h.stopCraftRun('kitchen');
+    const before = signature(x), remaining = x.tree(), next = x.tree('kitchen', { freshRun: true });
+    assert.equal(remaining.quantity, 2); assert.equal(remaining.goal.collected, 1); assert.equal(remaining.stamina.cost, 2);
+    assert.equal(next.quantity, 3); assert.equal(next.goal.collected, 0); assert.equal(next.stamina.cost, 3);
+    assert.equal(x.tree(), remaining); assert.equal(x.tree('kitchen', { freshRun: true }), next);
+    assert.equal(signature(x), before);
+    await x.h.startEmptyIndustries(); assert.equal(x.calls.length, 0);
+});
+
+test('a fresh preview of a completed root does not reserve supplies away from another running root', () => {
+    const x = setup({ stations: [station('kitchen', [recipe('meal', { wheat: 1 })]), station('bakery', [recipe('bread', { wheat: 1 })])],
+        items: { wheat: 3 }, times: 3 });
+    recordCompletedRun(x);
+    x.h.setOverride('rlt-node-job:crafting:bakery', 'bread'); x.h.setOverride('rlt-craft-lock-times:bakery', '3');
+    assert.equal(x.h.startCraftRun(x.h.runtime.state, 'bakery'), true);
+    const real = x.schedule(), before = signature(x);
+    assert.equal(real.plans.get('bakery').maxQuantity, 3); assert.equal(real.reserves.get('wheat'), 3);
+    const preview = x.tree('kitchen', { freshRun: true });
+    assert.equal(preview.quantity, 3); assert.ok(preview.root);
+    assert.equal(x.schedule(), real); assert.equal(real.plans.has('kitchen'), false);
+    assert.equal(real.plans.get('bakery').maxQuantity, 3); assert.equal(real.reserves.get('wheat'), 3);
+    assert.equal(signature(x), before);
+});
+
+test('fresh-round preview updates its shortages after inventory changes without altering completed progress', () => {
+    const x = setup({ jobs: [recipe('meal', { flour: 1 }), recipe('flour', { wheat: 1 })], items: { wheat: 1 }, times: 3 });
+    recordCompletedRun(x);
+    const blocked = x.tree('kitchen', { freshRun: true });
+    assert.equal(blocked.quantity, 3); assert.equal(find(blocked, 'material', 'wheat').missing, 2);
+    assert.equal(blocked.stamina, null);
+    x.backend.inventory[0].quantity = 3; x.sync();
+    const before = signature(x), supplied = x.tree('kitchen', { freshRun: true });
+    assert.equal(find(supplied, 'material', 'wheat').missing, 0); assert.equal(supplied.stamina.cost, 6);
+    assert.equal(x.tree().phase, 'completed'); assert.equal(x.tree().root, null);
+    assert.equal(signature(x), before);
 });

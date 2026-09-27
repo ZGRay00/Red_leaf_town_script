@@ -26,6 +26,7 @@ function branch(root, name) {
 }
 function fixture() {
     return { title: '营养饲料', quantity: 2, phase: 'planning', status: 'crafting', statusLabel: '先加工谷物饲料', preview: false,
+        note: '整条路线重复说明不应再次显示',
         root: { key: 'nutrition', kind: 'recipe', name: '营养饲料', required: 2, outputPerCraft: 3, outputQuantity: 6, stamina: 8, status: 'crafting', statusLabel: '等待材料', children: [
             { key: 'nutrition/grain', kind: 'material', name: '谷物饲料', required: 8, available: 2, pending: 1, planned: 2, missing: 3,
                 stock: 9, protected: 4, otherAllocated: 3, protections: [{ name: '每日委托', quantity: 4, minQuality: 2 }],
@@ -50,10 +51,14 @@ test('the entire tree starts closed and does not calculate a plan before opening
 test('tree rows display provided quantities without recalculating supplies or shortages', () => {
     const x = view(fixture()), section = x.make({}, { station_id: 'mill' }); toggle(section, true);
     const content = text(section);
-    for (const expected of ['先加工谷物饲料', '加工次数 2', '每次至少产出 3', '合计至少产出 6', '体力 8', '需 8', '库存供给 2', '在途 1', '计划供给 2', '待补 3', '背包总量 9', '受保护 4', '其他分支已分配 3', '每日委托：4（品质 ≥ 2）', '谷仓加工台']) {
+    for (const expected of ['加工 2 次', '产出至少 6 件', '体力 8', '需要 8 件', '待补 3 件', '背包总量 9', '为其他用途保留 4', '其他加工用料 3', '每日委托：4（品质 ≥ 2）']) {
         assert.ok(content.includes(expected), expected);
     }
-    assert.ok(content.includes('库存供给 6')); assert.ok(content.includes('待补 0'));
+    assert.ok(content.includes('可用 6 件'));
+    for (const omitted of ['先加工谷物饲料', '整条路线重复说明', '谷仓加工台', '每次至少产出 3', '待补 0', '已经备齐', '可以开工']) {
+        assert.ok(!content.includes(omitted), omitted + ' is redundant in the expanded tree');
+    }
+    assert.equal(descendants(section).find(node => node.textContent === '产出至少 6 件').title, '每次至少产出 3 件');
 });
 
 test('first two branch levels start expanded and deeper branches start closed', () => {
@@ -77,8 +82,47 @@ test('section and individual branch choices survive state refreshes independentl
 test('missing root displays explanatory state instead of an empty tree', () => {
     const x = view({ phase: 'planning', statusLabel: '加工已暂停', note: '选择配方后可以查看材料。', root: null, preview: true });
     const section = x.make({}, { station_id: 'mill' }); toggle(section, true);
-    assert.ok(text(section).includes('加工已暂停')); assert.ok(text(section).includes('选择配方后可以查看材料。'));
-    assert.ok(text(section).includes('当前用料预览'));
+    assert.ok(text(section).includes('加工已暂停'));
+    assert.ok(!text(section).includes('选择配方后可以查看材料。'));
+    assert.ok(!text(section).includes('当前用料预览'));
+});
+
+test('inventory details stay closed independently of an expanded material branch and remember their choice', () => {
+    const x = view(fixture()), station = { station_id: 'mill' }, section = x.make({}, station); toggle(section, true);
+    const grain = branch(section, '谷物饲料');
+    const stock = grain.children.find(node => node.className === 'rlt-material-stock');
+    assert.equal(grain.open, true); assert.equal(stock.open, false);
+    assert.equal(stock.children[0].textContent, '库存明细');
+    stock.children[0].onclick();
+    const refreshed = x.make({ revision: 2 }, station);
+    const freshGrain = branch(refreshed, '谷物饲料');
+    assert.equal(freshGrain.children.find(node => node.className === 'rlt-material-stock').open, true);
+    assert.equal(branch(refreshed, '小麦').children.find(node => node.className === 'rlt-material-stock').open, false);
+});
+
+test('zero inventory allocations are omitted and a supplied material shows only its nonzero sources', () => {
+    const tree = fixture(), material = tree.root.children[0];
+    Object.assign(material, { required: 5, available: 2, pending: 1, planned: 2, missing: 0, protected: 0, otherAllocated: 0, protections: [] });
+    const x = view(tree), section = x.make({}, { station_id: 'mill' }); toggle(section, true);
+    const content = text(branch(section, '谷物饲料'));
+    for (const expected of ['需要 5 件', '可用 2 件', '待领取 1 件', '待加工 2 件']) assert.ok(content.includes(expected), expected);
+    for (const omitted of ['待补 0', '为其他用途保留 0', '其他加工用料 0']) assert.ok(!content.includes(omitted), omitted);
+});
+
+test('a blocked route keeps its actionable reason while ordinary station descriptions are hidden', () => {
+    const tree = fixture(), blocked = tree.root.children[0].children[0];
+    Object.assign(blocked, { status: 'blocked', statusLabel: '材料受阻', note: '缺少小麦，请先补充基础材料' });
+    const x = view(tree), section = x.make({}, { station_id: 'mill' }); toggle(section, true);
+    assert.ok(text(section).includes('缺少小麦，请先补充基础材料'));
+    assert.ok(text(section).includes('材料受阻'));
+});
+
+test('a submitted queue displays pending executions without a zero-work recipe or zero stamina', () => {
+    const x = view({ phase: 'committed', statusLabel: '重复的已提交说明', note: '重复的体力说明',
+        root: { key: 'queue', kind: 'queue', name: '营养饲料', required: 3, status: 'waiting', statusLabel: '已提交，等待领取', children: [] } });
+    const section = x.make({}, { station_id: 'mill' }); toggle(section, true);
+    assert.ok(text(section).includes('待领取 3 次'));
+    for (const omitted of ['加工 0 次', '体力 0', '重复的已提交说明', '重复的体力说明']) assert.ok(!text(section).includes(omitted), omitted);
 });
 
 test('a refresh between clicking a summary and its deferred toggle event preserves the choice', () => {

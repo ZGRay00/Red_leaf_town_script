@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.3.0
+// @version      4.3.2
 // @description  红叶镇物语自动生产、递归补料与材料树、航海、自选饲料补充与可拖动管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.3.0';
+    const SCRIPT_VERSION = '4.3.2';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -1067,10 +1067,21 @@
         #rlt-auto-helper-panel .rlt-material-amounts{display:flex;gap:2px 9px;flex-wrap:wrap;min-width:0;margin-top:4px;font-size:10px;color:var(--rlt-muted);font-variant-numeric:tabular-nums}
         #rlt-auto-helper-panel .rlt-material-amounts>span{max-width:100%;overflow-wrap:anywhere}
         #rlt-auto-helper-panel .rlt-material-note{font-size:10px;color:var(--rlt-muted);margin:4px 0 0;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-material-amounts.rlt-material-primary{font-size:12px;color:var(--rlt-text);font-weight:600}
+        #rlt-auto-helper-panel .rlt-material-stock{margin-top:5px;font-size:10px;color:var(--rlt-muted)}
+        #rlt-auto-helper-panel .rlt-material-stock>summary{cursor:pointer}
+        #rlt-auto-helper-panel .rlt-craft-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0 5px}
+        #rlt-auto-helper-panel .rlt-craft-metric{display:flex;flex-direction:column;min-width:0;padding:8px 10px;border-radius:9px;background:#ffffff06;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-craft-metric>span{display:block;font-size:11px;color:var(--rlt-muted)}
+        #rlt-auto-helper-panel .rlt-craft-metric>strong{display:block;margin-top:auto;font-size:22px;line-height:1.5;font-variant-numeric:tabular-nums}
+        #rlt-auto-helper-panel .rlt-craft-budget{margin:4px 0;font-size:11px;color:var(--rlt-muted);overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-craft-budget[data-shortage=true]{color:#efb397}
         #rlt-auto-helper-panel .rlt-craft-actions{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0 6px}
         #rlt-auto-helper-panel .rlt-craft-actions button{padding:7px 12px;border:1px solid var(--rlt-line);font-weight:600}
         #rlt-auto-helper-panel .rlt-craft-primary{flex:1;background:#8ead71;color:#17211b}
         #rlt-auto-helper-panel .rlt-craft-stop{flex:1;background:#354238;color:#eef3e9}
+        #rlt-auto-helper-panel .rlt-craft-preview{background:transparent;color:#d6dfb9}
+        #rlt-auto-helper-panel .rlt-craft-preview[aria-pressed=true]{background:#dca46d22;border-color:#dca46d}
         #rlt-auto-helper-panel .rlt-craft-cancel{background:transparent;color:#e5b3a1;border-color:#876759!important}
         #rlt-auto-helper-panel .rlt-craft-state{margin:6px 0;font-size:12px;overflow-wrap:anywhere}
         @media(max-width:380px){#rlt-auto-helper-panel .rlt-material-tree{padding:6px}#rlt-auto-helper-panel .rlt-material-row{padding:6px}#rlt-auto-helper-panel .rlt-material-name{flex-basis:90px}}
@@ -1283,8 +1294,7 @@
             }
             if (page === 'crafting') {
                 appendSetting(body, state, 'crafting.autoCraftInputs', '缺料自动加工');
-                body.appendChild(uiElement('p', 'rlt-note', '配置后点击本站「执行一次」才开工；本轮全部步骤领取完成后自动停止，不循环。每次加工可能产出多件物品，目标填写的是执行配方的次数。体力按当前步骤全部待做路线检查，单次提交受批量上限限制。'));
-                body.appendChild(uiElement('p', 'rlt-note', '停止本轮只停止后续开工，已提交队列继续并可自动领取；取消队列会损失当前一份投入。旧版不限次数按本轮 1 次处理，旧循环设置不再生效。关闭加工总开关也会暂停领取。'));
+                body.appendChild(uiElement('p', 'rlt-note', '目标填写加工次数。点击「执行一次」开始，全部领取后停止。停止本轮会保留已开工队列；关闭加工总开关也会暂停领取。'));
             }
             configBox.appendChild(group);
         }
@@ -1304,12 +1314,12 @@
         craftMaterialExpansion.set(key, open);
         if (craftMaterialExpansion.size > 500) craftMaterialExpansion.delete(craftMaterialExpansion.keys().next().value);
     }
-    function makeCraftMaterialTree(state, node) {
+    function makeCraftMaterialTree(state, node, options = {}) {
         const stationKey = String(node.station_id);
         const sectionKey = JSON.stringify([stationKey, 'section']);
         const section = uiElement('details', 'rlt-material-tree');
         const heading = uiElement('summary', 'rlt-material-heading');
-        const caption = uiElement('span', '', '展开查看逐级用料');
+        const caption = uiElement('span', '', '展开查看用料');
         heading.append(uiElement('strong', '', '材料树'), caption);
         const body = uiElement('div', 'rlt-material-body');
         section.append(heading, body);
@@ -1330,25 +1340,33 @@
             row.style.marginInlineStart = `${Math.min(depth, 4) * 8}px`;
             const head = uiElement('div', 'rlt-material-head');
             head.appendChild(uiElement('span', 'rlt-material-name', material.name || '未命名材料'));
-            const status = uiElement('span', 'rlt-material-status', material.statusLabel || '待确认');
-            status.dataset.status = material.status || 'unchecked';
-            head.appendChild(status);
-            const amounts = uiElement('div', 'rlt-material-amounts');
-            const amount = (label, value) => amounts.appendChild(uiElement('span', '', `${label} ${quantity(value)}`));
+            if (material.status !== 'ready' && material.statusLabel) {
+                const status = uiElement('span', 'rlt-material-status', material.statusLabel);
+                status.dataset.status = material.status || 'unchecked';
+                head.appendChild(status);
+            }
+            const amounts = uiElement('div', `rlt-material-amounts${isMaterial ? '' : ' rlt-material-primary'}`);
+            const amount = (label, value, unit = '') => amounts.appendChild(uiElement('span', '', `${label} ${quantity(value)}${unit}`));
             if (isMaterial) {
-                amount('需', material.required);
-                amount('库存供给', material.available);
-                amount('在途', material.pending);
-                if (Number(material.planned) > 0) amount('计划供给', material.planned);
-                amount('待补', material.missing);
+                amount('需要', material.required, ' 件');
+                if (Number(material.missing) > 0) amount('待补', material.missing, ' 件');
+                if (Number(material.available) > 0) amount('可用', material.available, ' 件');
+                if (Number(material.pending) > 0) amount('待领取', material.pending, ' 件');
+                if (Number(material.planned) > 0) amount('待加工', material.planned, ' 件');
             } else {
-                amount(material.kind === 'queue' ? '已提交待领次数' : '加工次数', material.required);
-                if (material.outputPerCraft != null) amount('每次至少产出', material.outputPerCraft);
-                if (material.outputQuantity != null) amount('合计至少产出', material.outputQuantity);
+                amount(material.kind === 'queue' ? '待领取' : '加工', material.required, ' 次');
                 if (material.stamina != null) amount('体力', material.stamina);
             }
             row.append(head, amounts);
-            if (material.note) row.appendChild(uiElement('p', 'rlt-material-note', material.note));
+            if (!isMaterial && material.outputQuantity != null) {
+                const output = uiElement('div', 'rlt-material-note', `产出至少 ${quantity(material.outputQuantity)} 件`);
+                if (material.outputPerCraft != null) output.title = `每次至少产出 ${quantity(material.outputPerCraft)} 件`;
+                row.appendChild(output);
+            }
+            // 日常路径只显示数量；保留会影响用户决策的受阻原因和额外需求。
+            if (material.note && (material.status === 'blocked' || material.status === 'unchecked' || /^还需先满足/.test(material.note))) {
+                row.appendChild(uiElement('p', 'rlt-material-note', material.note.replace(/；本配方每份至少产出.*$/, '')));
+            }
             if (branch) {
                 branch.open = craftMaterialExpansion.has(key) ? craftMaterialExpansion.get(key) : children.length > 0 && depth < 2;
                 // 原生 toggle 事件异步派发；先记住点击意图，避免同一时刻刷新状态丢失展开选择。
@@ -1356,14 +1374,20 @@
                 branch.ontoggle = () => rememberCraftMaterialExpansion(key, branch.open);
                 branch.appendChild(row);
                 if (hasInventory) {
-                    const detail = uiElement('div', 'rlt-material-note');
+                    const detail = uiElement('details', 'rlt-material-stock');
                     detail.style.marginInlineStart = `${Math.min(depth, 4) * 8 + 8}px`;
+                    const detailKey = JSON.stringify([stationKey, 'stock', material.key ?? path]);
+                    const detailHeading = uiElement('summary', '', '库存明细');
+                    detail.open = craftMaterialExpansion.get(detailKey) === true;
+                    detailHeading.onclick = () => rememberCraftMaterialExpansion(detailKey, !detail.open);
+                    detail.ontoggle = () => rememberCraftMaterialExpansion(detailKey, detail.open);
+                    detail.appendChild(detailHeading);
                     const labels = [];
                     if (material.stock != null) labels.push(`背包总量 ${quantity(material.stock)}`);
-                    if (material.protected != null) labels.push(`受保护 ${quantity(material.protected)}`);
-                    if (material.otherAllocated != null) labels.push(`其他分支已分配 ${quantity(material.otherAllocated)}`);
+                    if (Number(material.protected) > 0) labels.push(`为其他用途保留 ${quantity(material.protected)}`);
+                    if (Number(material.otherAllocated) > 0) labels.push(`其他加工用料 ${quantity(material.otherAllocated)}`);
                     if (labels.length) detail.appendChild(uiElement('div', '', labels.join(' · ')));
-                    for (const need of protections) detail.appendChild(uiElement('div', '',
+                    for (const need of protections.filter(need => Number(need.quantity) > 0)) detail.appendChild(uiElement('div', '',
                         `${need.name || '保留需求'}：${quantity(need.quantity)}${Number(need.minQuality) > 0 ? `（品质 ≥ ${quantity(need.minQuality)}）` : ''}`));
                     branch.appendChild(detail);
                 }
@@ -1378,36 +1402,103 @@
         };
         const render = () => {
             if (rendered) return;
-            const tree = craftMaterialTree(state, node);
+            const tree = craftMaterialTree(state, node, options);
             rendered = true;
             if (!tree) {
                 body.appendChild(uiElement('p', 'rlt-material-note', '选择加工配方后显示所需材料。'));
                 return;
             }
-            if (tree.preview && tree.phase === 'planning') body.appendChild(uiElement('p', 'rlt-material-note', '当前用料预览'));
-            if (tree.statusLabel && tree.statusLabel !== tree.note) {
-                const status = uiElement('span', 'rlt-material-status', tree.statusLabel);
-                status.dataset.status = tree.status || 'unchecked';
-                body.appendChild(status);
-            }
-            if (tree.note) body.appendChild(uiElement('p', 'rlt-material-note', tree.note));
             if (tree.root) {
                 const list = uiElement('ul', 'rlt-material-list');
                 list.appendChild(renderNode(tree.root, 0, 'root'));
                 body.appendChild(list);
-            }
+            } else body.appendChild(uiElement('p', 'rlt-material-note', tree.statusLabel || '选择配方后查看材料。'));
+            if (tree.truncated) body.appendChild(uiElement('p', 'rlt-material-note', '材料较多，仅展开前 160 项。'));
         };
         heading.onclick = () => rememberCraftMaterialExpansion(sectionKey, !section.open);
         section.ontoggle = () => {
             rememberCraftMaterialExpansion(sectionKey, section.open);
-            caption.textContent = section.open ? '点击条目查看用料和库存' : '展开查看逐级用料';
+            caption.textContent = section.open ? '用料与缺口' : '展开查看用料';
             if (section.open) render();
         };
         if (section.open) {
-            caption.textContent = '点击条目查看用料和库存';
+            caption.textContent = '用料与缺口';
             render();
         }
         return section;
+    }
+
+    function makeCraftSummary(state, node, options = {}) {
+        const view = craftDisplayContext(state, node, options), { trace, preview, schedule } = view;
+        const id = String(node.station_id), goal = trace?.goal, budget = trace?.stamina;
+        const section = uiElement('div');
+        if (goal) {
+            const metrics = uiElement('div', 'rlt-craft-summary');
+            const metric = (label, value) => {
+                const cell = uiElement('div', 'rlt-craft-metric');
+                cell.append(uiElement('span', '', label), uiElement('strong', '', value));
+                metrics.appendChild(cell);
+            };
+            const committed = trace.phase === 'committed';
+            metric(committed ? '待领取' : goal.stepCount > 1 ? '本步待加工' : '待加工', `${committed ? goal.committed : goal.remaining} 次`);
+            if (!committed) metric(goal.stepCount > 1 ? '本步体力（含补料）' : '所需体力（含补料）', budget ? String(budget.cost) : '待确认');
+            section.appendChild(metrics);
+            if (!committed) {
+                const details = [];
+                if (preview) details.push('当前配置预估');
+                if (budget) {
+                    details.push(`当前体力 ${Math.floor(budget.current)}`, budget.missing > 0 ? `还差 ${budget.missing}` : '体力足够');
+                    if (budget.reserve) details.push(`保底 ${budget.reserve}`);
+                    if (budget.reserved) details.push(`其他加工预留 ${budget.reserved}`);
+                } else details.push('补齐材料或恢复加工站后确认体力');
+                if (goal.committed > 0) details.push(`另有 ${goal.committed} 次待领取`);
+                const note = uiElement('p', 'rlt-craft-budget', details.join(' · '));
+                note.dataset.shortage = String(budget?.missing > 0);
+                section.appendChild(note);
+            }
+        }
+        let message = view.statusLabel;
+        if (trace?.phase === 'committed') {
+            message = !running ? '请启动助手以自动领取' : !CONFIG.crafting.enabled ? '请开启加工总开关以自动领取' :
+                !CONFIG.crafting.autoCollect ? '自动领取已关闭，请手动领取或开启' :
+                craftCollectable(node) ? '等待自动领取' : '完成后自动领取';
+        } else if (budget?.missing > 0) {
+            const cap = Number(state.player?.stamina_cap ?? Infinity);
+            message = budget.required > cap
+                ? `开工需 ${budget.required} 体力，超过恢复上限 ${cap}；请减少次数，或补充体力、材料。`
+                : `体力恢复至 ${budget.required} 后可开工`;
+        } else if (trace?.feasible) {
+            const plan = [...schedule.plans.values()].find(value => sameId(value.dependencyFor?.stationId ?? value.id, id));
+            const quantity = plan ? craftBatchSize(state, plan.node, plan) : 0;
+            if (quantity > 0) message = `下一步：${plan.job.name || jobId(plan.job)} ×${quantity} 次 · ${Number(plan.job.stamina_cost || 0) * quantity} 体力`;
+            else if (trace.reserveOnly) message = '当前队列领取后继续';
+            else if (preview) message = '';
+            else if (message === '等待材料加工、领取或加工站空闲') {
+                message = trace.waitLabel || '等待材料产出';
+            }
+        }
+        if (trace?.phase !== 'committed' && craftPipelineRunning(id) && (!running || !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart)) {
+            message = !running ? '请启动助手以继续本轮' : !CONFIG.crafting.enabled ? '请开启加工总开关以继续本轮' : '请开启「执行已启动的本轮」以继续';
+        }
+        // 未配置、完成、待核对已由卡片标题/控件提示；不要再重复同一状态。
+        if (message && !view.target.completed && craftFlight(id)?.phase !== 'uncertain' && configuredCraftSteps(id).length) {
+            section.appendChild(uiElement('p', 'rlt-craft-state', message));
+        }
+        return section;
+    }
+
+    // 预览选择只存于当前页面；配置或运行记录变化后退出，不写入本轮权限/进度。
+    const craftPreviewViews = new Map();
+    function craftPreviewView(state, node) {
+        const id = String(node.station_id), view = craftPreviewViews.get(id);
+        if (!view) return null;
+        const run = craftRun(id);
+        if (view.sig !== craftPipelineSig(configuredCraftSteps(id)) || view.runId !== (run?.id ?? null) || view.runStatus !== (run?.status ?? null) ||
+            craftPipelineRunning(id) || craftRunHasQueue(state, id)) {
+            craftPreviewViews.delete(id);
+            return null;
+        }
+        return view;
     }
 
     function makeCraftQueueCard(state, node) {
@@ -1420,14 +1511,20 @@
         const completed = steps.length > 0 && progress.finished;
         const resume = matchingRun && run.status === 'stopped' && !completed && !progress.legacy;
         const queued = craftRunHasQueue(state, id), ready = Number(node.completed_count || 0);
+        const previewView = craftPreviewView(state, node), displayOptions = previewView ? { freshRun: previewView.freshRun } : {};
         const stateLabel = flight?.phase === 'uncertain' ? '需要核对' : ready > 0 ? `${ready} 次已完成可领取` :
             !node.empty ? (flight?.dependencyFor ? '补料加工中' : '目标加工中') : completed ? '本轮已完成' :
             active ? '本轮执行中' : resume ? '本轮已停止' : '等待执行';
-        const card = workCard(node.definition?.name || `加工点 ${id}`, stateLabel,
-            total ? done / total * 100 : null,
-            total ? `本轮已领取 ${done} / ${total} 次${steps.length > 1 && !completed ? ` · 第 ${progress.stepIndex + 1}/${steps.length} 步` : ''}` : '请先配置本轮配方和加工次数');
-        if (!node.empty) card.appendChild(uiElement('p', 'rlt-note', `本队列 ${node.queue_total || flight?.quantity || 1} 次 · 尚未开始 ${node.queued_count || 0} 次 · 剩余约 ${durationLabel(node.queue_remaining_seconds || Math.max(0, taskReadyAt(node) - serverNowSeconds()))}`));
-        if (flight?.dependencyFor) card.appendChild(uiElement('p', 'rlt-note', `正在为「${flight.dependencyFor.name}」补料；补料不计目标进度。`));
+        const card = workCard(node.definition?.name || `加工点 ${id}`, previewView ? previewView.freshRun ? '新一轮预览' : '剩余加工预览' : stateLabel,
+            !previewView && total ? done / total * 100 : null,
+            previewView ? `仅预览，不会开工${steps.length > 1 ? ` · 第 ${previewView.freshRun ? 1 : progress.stepIndex + 1}/${steps.length} 步` : ''}` :
+                total ? `本轮已领取 ${done} / ${total} 次${steps.length > 1 && !completed ? ` · 第 ${progress.stepIndex + 1}/${steps.length} 步` : ''}` : '请先配置本轮配方和加工次数');
+        card.appendChild(makeCraftSummary(state, node, displayOptions));
+        if (!node.empty) {
+            const remaining = node.queue_remaining_seconds || Math.max(0, taskReadyAt(node) - serverNowSeconds());
+            card.appendChild(uiElement('p', 'rlt-note', `${node.recipe?.name || '当前队列'}${remaining > 0 ? ` · 约 ${durationLabel(remaining)}后完成` : ' · 等待领取'}${Number(node.queued_count) > 0 ? ` · 排队 ${node.queued_count} 次` : ''}`));
+        }
+        if (flight?.dependencyFor) card.appendChild(uiElement('p', 'rlt-note', `为「${flight.dependencyFor.name}」补料`));
         const controls = uiElement('div', 'rlt-craft-actions');
         const execute = uiElement('button', active ? 'rlt-craft-stop' : 'rlt-craft-primary', active ? '停止本轮' : resume ? '继续本轮' : completed ? '再执行一次' : '执行一次');
         execute.dataset.focusKey = `craft:${id}:execute`;
@@ -1445,10 +1542,33 @@
             wakeSoon(); refreshConfigRows(currentState);
         };
         controls.appendChild(execute);
+        const previewButton = uiElement('button', 'rlt-craft-preview', previewView ? '关闭预览' : '预览');
+        previewButton.dataset.focusKey = `craft:${id}:preview`;
+        previewButton.setAttribute('aria-label', `加工点 ${node.definition?.name || id}：${previewButton.textContent}`);
+        previewButton.setAttribute('aria-pressed', String(!!previewView));
+        previewButton.disabled = !previewView && (busy || active || queued || !steps.length || nodeJobClosed('crafting', id));
+        previewButton.title = queued || active ? '请先停止本轮并领取现有队列；当前加工信息仍可在材料树中查看' :
+            '按当前库存预览下次执行的材料和体力；不开始加工、不更改进度';
+        previewButton.onclick = () => {
+            const currentState = currentViewState(), current = nodeById(currentState, 'crafting', id);
+            if (!current) return;
+            if (craftPreviewView(currentState, current)) craftPreviewViews.delete(String(id));
+            else {
+                if (busy || craftPipelineRunning(id) || craftRunHasQueue(currentState, id) || nodeJobClosed('crafting', id)) return;
+                const currentSteps = configuredCraftSteps(id);
+                if (!currentSteps.length) return;
+                const currentRun = craftRun(id), currentProgress = craftPipelineProgress(id, currentSteps), sig = craftPipelineSig(currentSteps);
+                // 与「执行一次 / 继续本轮」的行为一致：可续做则看剩余，否则从首步看新一轮。
+                const continueRun = currentRun?.version === 1 && currentRun.status === 'stopped' && currentRun.sig === sig &&
+                    !currentProgress.finished && !currentProgress.legacy;
+                craftPreviewViews.set(String(id), { sig, runId: currentRun?.id ?? null, runStatus: currentRun?.status ?? null, freshRun: !continueRun });
+                rememberCraftMaterialExpansion(JSON.stringify([String(id), 'section']), true);
+            }
+            lastConfigState = null;
+            refreshConfigRows(currentState);
+        };
+        controls.appendChild(previewButton);
         card.appendChild(controls);
-        let materialStatus = craftProductionSchedule(state).statuses.get(String(id));
-        if (active && (!running || !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart)) materialStatus = !running ? '本轮已安排，等待启动助手' : '本轮已安排，等待开启加工总开关和本轮执行';
-        if (materialStatus) card.appendChild(uiElement('p', 'rlt-craft-state', materialStatus));
         if (progress.legacy) card.appendChild(uiElement('p', 'rlt-warning', '旧版进度仅供核对；队列结束后点击执行一次，将按当前配置开启新轮。'));
         if (flight?.phase === 'uncertain') {
             card.appendChild(uiElement('p', 'rlt-warning', flight.reason || '请核对游戏中的加工状态'));
@@ -1496,7 +1616,7 @@
             };
             controls.appendChild(cancel);
         }
-        card.appendChild(makeCraftMaterialTree(state, node));
+        card.appendChild(makeCraftMaterialTree(state, node, displayOptions));
         return card;
     }
     function renderSailingSettings(state) {
@@ -2469,7 +2589,7 @@
         }
         if (bucket.stamina !== stamina) {
             for (const cachedKey of Object.keys(bucket)) {
-                if (cachedKey === 'craftDependencySchedule' || cachedKey === 'craftingReserves' || cachedKey.startsWith('craftMaterialTree:')) delete bucket[cachedKey];
+                if (cachedKey === 'craftDependencySchedule' || cachedKey === 'craftingReserves' || cachedKey.startsWith('craftMaterialTree:') || cachedKey.startsWith('craftDisplay:')) delete bucket[cachedKey];
             }
             bucket.stamina = stamina;
         }
@@ -3593,13 +3713,15 @@
     }
 
     // 当前用户目标与补料队列分开：辅助配方不改下拉选择，不推进根目标的领取进度。
-    function craftTarget(node, { preview = false } = {}) {
+    function craftTarget(node, { preview = false, freshRun = false } = {}) {
         const id = node.station_id;
         if (nodeJobClosed('crafting', id)) return { blocked: '本站已关闭' };
         if (craftFlight(id)?.phase === 'uncertain') return { blocked: '本站队列结果待核对' };
         const steps = configuredCraftSteps(id);
         if (!steps.length) return { blocked: '请先配置本轮配方和加工次数' };
-        const run = craftRun(id), progress = craftPipelineProgress(id, steps);
+        const run = craftRun(id), progress = preview && freshRun
+            ? { done: steps.map(() => 0), stepIndex: 0, finished: false, legacy: false }
+            : craftPipelineProgress(id, steps);
         if (progress.finished) return { blocked: '本轮已全部领取，点击「再执行一次」才会重新加工', completed: true };
         if (!preview && !craftPipelineRunning(id)) return { blocked: run?.status === 'stopped' && run.sig === craftPipelineSig(steps)
             ? '本轮已停止，等待点击继续' : '目标已配置，等待点击「执行一次」' };
@@ -3608,7 +3730,7 @@
         const pipeline = { stationId: id, steps, stepIndex: progress.stepIndex, done: progress.done, taskItemId: step.taskItemId || '' };
         const job = (node.recipes || []).find(recipe => sameId(jobId(recipe), wanted));
         if (!job || job.unlocked === false) return { blocked: `目标配方 #${wanted} 不存在或未解锁` };
-        return { node, id, job, pipeline, runId: craftPipelineRunning(id) ? run.id : null };
+        return { node, id, job, pipeline, runId: preview && freshRun ? null : craftPipelineRunning(id) ? run.id : null };
     }
 
     function craftRecipeInputs(recipe) {
@@ -3649,20 +3771,28 @@
     function craftProductionSchedule(state) {
         return memoizedForState(state, 'craftDependencySchedule', () => craftProductionScheduleUncached(state));
     }
+    // 卡片摘要与展开明细共享同一份规划，预览也只计算一次，不生成实际提交权限。
+    function craftDisplayContext(state, node, { freshRun = false } = {}) {
+        return memoizedForState(state, `craftDisplay:${node.station_id}:${freshRun ? 'new' : 'current'}`, () => {
+            const id = String(node.station_id), target = craftTarget(node, { preview: true, freshRun });
+            const preview = freshRun || !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart || !craftPipelineRunning(id);
+            const schedule = preview && target.job
+                ? craftProductionScheduleUncached(state, { previewStationId: id, freshRun }) : craftProductionSchedule(state);
+            return { target, preview, schedule, trace: schedule.trees.get(id),
+                statusLabel: schedule.statuses.get(id) || target.blocked || '等待加工目标' };
+        });
+    }
     // 展示直接使用调度器的分配轨迹，避免另外推演一棵与实际开工不一致的材料树。
     // 暂停时只预览本站，不写进度、不预留真实库存，也不生成可提交计划。
-    function craftMaterialTree(state, node) {
+    function craftMaterialTree(state, node, { freshRun = false } = {}) {
         if (!node) return null;
-        return memoizedForState(state, `craftMaterialTree:${node.station_id}`, () => {
-            const id = String(node.station_id), target = craftTarget(node, { preview: true });
-            const preview = !CONFIG.crafting.enabled || !CONFIG.crafting.autoStart || !craftPipelineRunning(id);
-            const schedule = preview && target.job
-                ? craftProductionScheduleUncached(state, { previewStationId: id }) : craftProductionSchedule(state);
-            const trace = schedule.trees.get(id);
-            const statusLabel = schedule.statuses.get(id) || target.blocked || '等待加工目标';
+        return memoizedForState(state, `craftMaterialTree:${node.station_id}:${freshRun ? 'new' : 'current'}`, () => {
+            const id = String(node.station_id);
+            const { target, preview, schedule, trace, statusLabel } = craftDisplayContext(state, node, { freshRun });
             const tree = { title: target.job?.name || node.definition?.name || `加工点 ${id}`,
                 quantity: trace?.quantity || 0, goal: trace?.goal || null, phase: trace?.phase || (target.completed ? 'completed' : 'planning'), preview,
-                status: target.completed ? 'ready' : 'waiting', statusLabel, note: '', root: null, stamina: trace?.stamina || null };
+                status: target.completed ? 'ready' : 'waiting', statusLabel, note: '', root: null, stamina: trace?.stamina || null,
+                truncated: !!trace?.truncated };
             const notes = [];
             if (preview && tree.phase === 'planning') notes.push('用料预览；点击执行后按最新库存重新检查。');
             if (trace) {
@@ -3686,7 +3816,7 @@
                 tree.status = trace.feasible ? tree.root?.status || 'waiting' : 'blocked';
                 if (trace.stamina?.missing > 0) {
                     tree.status = 'waiting';
-                    if (tree.root) { tree.root.status = 'waiting'; tree.root.statusLabel = '等待整条路线体力'; }
+                    if (tree.root) { tree.root.status = 'waiting'; tree.root.statusLabel = '体力不足'; }
                 } else if (!trace.feasible) {
                     if (tree.root) { tree.root.status = 'blocked'; tree.root.statusLabel = '材料检查未通过'; }
                     notes.push(`本次按 ${trace.quantity} 次检查未通过，不提交补料；原因见上方状态及材料分支。`);
@@ -3714,12 +3844,12 @@
             return tree;
         });
     }
-    function craftProductionScheduleUncached(state, { previewStationId = null } = {}) {
+    function craftProductionScheduleUncached(state, { previewStationId = null, freshRun = false } = {}) {
         const result = { plans: new Map(), statuses: new Map(), reserves: new Map(), rootReserves: new Map(), trees: new Map() };
         const cfg = CONFIG.crafting;
         if (previewStationId == null && (!cfg.enabled || !cfg.autoStart)) return result;
         const nodes = state.crafting_stations || [], targets = new Map(nodes.map(node => [String(node.station_id),
-            craftTarget(node, { preview: sameId(node.station_id, previewStationId) })]));
+            craftTarget(node, { preview: sameId(node.station_id, previewStationId), freshRun })]));
         const actual = new Map(), pending = new Map(), uncertain = new Set();
         for (const item of state.inventory || []) {
             const id = String(item.item_id);
@@ -3809,7 +3939,7 @@
             if (!target.job) { result.statuses.set(rootId, target.blocked); continue; }
             const reserveOnly = (!node.empty || flight) && !flight?.dependencyFor;
             const baseLimit = cfg.batchEnabled ? Math.min(99, Math.max(1, Math.floor(cfg.batchLimit))) : 1;
-            const queued = reserveOnly && target.pipeline && flight?.phase === 'active' && flight.steps?.length &&
+            const queued = !(freshRun && sameId(node.station_id, previewStationId)) && reserveOnly && target.pipeline && flight?.phase === 'active' && flight.steps?.length &&
                 sameId(flight.recipeId, jobId(target.job)) && flight.stepIndex === target.pipeline.stepIndex &&
                 craftPipelineSig(flight.steps) === craftPipelineSig(target.pipeline.steps)
                 ? Math.max(0, flight.quantity - flight.credited) : 0;
@@ -4004,7 +4134,17 @@
             if (previewStationId != null) { result.statuses.set(rootId, '材料检查完成，启动后按最新库存安排加工'); continue; }
             const available = chosen.operations.find(operation => operation.materialReady && operation.node.empty &&
                 !operation.node.task_snapshot && !craftFlight(operation.id) && !result.plans.has(String(operation.id)));
-            if (!available) { result.statuses.set(rootId, '等待材料加工、领取或加工站空闲'); continue; }
+            if (!available) {
+                const next = chosen.operations.find(operation => operation.materialReady);
+                const waitingMaterial = [...chosen.trace.values()].find(row => row.kind === 'material' && row.pending > 0);
+                // 仅增加展示原因；材料齐备并不表示站点已经空闲。
+                result.trees.get(rootId).waitLabel = next ?
+                    (!next.node.empty || next.node.task_snapshot || craftFlight(next.id)
+                        ? `等待「${next.node.definition?.name || next.id}」队列完成并领取`
+                        : '等待其他加工目标先开工') :
+                    waitingMaterial ? `等待「${waitingMaterial.name}」加工完成并领取` : '等待材料产出';
+                result.statuses.set(rootId, '等待材料加工、领取或加工站空闲'); continue;
+            }
             const pipeItem = available.pipeline?.taskItemId || '';
             // 根目标的专用道具不会套到中间材料；辅助加工只遵守所在站点的道具设置。
             available.taskItem = pipeItem === '__off' ? null : slotTaskItem(state, 'crafting', available.id, 'start',
