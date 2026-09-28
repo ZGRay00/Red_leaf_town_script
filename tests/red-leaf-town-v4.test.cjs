@@ -52,7 +52,7 @@ function harness(initial = fixture(), entries = []) {
             calls.push(request); if (!responder) throw new Error(`Unexpected network: ${url}`); return responder(request);
         },
     };
-    const exposure = `window.__test = { CONFIG, chooseCropTarget, gatherNeeds, needShortage, runtime, setSetting, getOverride, setOverride, liveStamina, staminaWaitSeconds, nextDelay,
+    const exposure = `window.__test = { CONFIG, chooseCropTarget, plantEmptyPlots, cropHourlyProfit, farmingPlantingNeeds, gatherNeeds, needShortage, runtime, setSetting, getOverride, setOverride, liveStamina, staminaWaitSeconds, nextDelay,
         doAquaticFeed, doSailing, feedInputs, feedThresholds, feedPurchaseSnapshot, identifyPurchasedFeed, craftBatchSize, collectReadyIndustries, startEmptyIndustries,
         craftFlight, saveCraftFlight, craftPipelineProgress, creditCraftFlight, reconcileCraftFlights, startCraftPlan, configuredCraftSteps,
         startCraftRun, stopCraftRun, craftRun, craftPipelineRunning,

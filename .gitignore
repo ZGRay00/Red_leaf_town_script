@@ -17,6 +17,7 @@
 !tests/red-leaf-town-material-browser.cjs
 !tests/red-leaf-town-feed-selection.test.cjs
 !tests/red-leaf-town-inventory-audit.test.cjs
+!tests/red-leaf-town-farming.test.cjs
 !tests/red-leaf-town-lifecycle-audit.test.cjs
 !tests/red-leaf-town-partner-audit.test.cjs
 !tests/red-leaf-town-aquatic-audit.test.cjs

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.3.2
+// @version      4.4.0
 // @description  红叶镇物语自动生产、递归补料与材料树、航海、自选饲料补充与可拖动管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.3.2';
+    const SCRIPT_VERSION = '4.4.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -60,7 +60,7 @@
             prefer: 'first',          // 自动选择策略: 'first' 列表第一种 | 'fastest' 生长最快 | 'slowest' 生长最慢
             autoBuySeeds: true,       // 没种子时自动去商店买（逐粒按需购买；金币不足时按 selling 白名单安全售卖凑钱）
             autoSellForSeeds: true,   // 买种子金币不足时，自动售卖多余物资凑钱（配合 autoBuySeeds）
-            seedStrategy: 'portal',   // 种植/购买策略: 'portal' 传送门需求优先，满足后按经济价值 | 'profit' 始终按经济价值最高
+            seedStrategy: 'portal',   // 'portal' 委托、已解锁传送门优先，满足后按净收益；'profit' 仅委托优先，其他按净收益
             seedShopId: null,         // 可选：强制指定商店条目 id，优先级最高
             autoAssignPartner: true,  // 自动派驻/优化驻场伙伴（有更强的空闲伙伴时自动更换）
         },
@@ -858,15 +858,15 @@
         }
     }
 
-    const plantPlot = (slot, cropId, taskItemId = '') => mutate(`/plots/${slot}/plant`, {
-        payload: { crop_id: cropId, task_item_id: taskItemId || '' }, cue: 'action:plant',
+    const plantPlot = (slot, cropId, taskItemId = '', beforeWrite) => mutate(`/plots/${slot}/plant`, {
+        payload: { crop_id: cropId, task_item_id: taskItemId || '' }, cue: 'action:plant', beforeWrite,
     });
     const harvestPlot = (slot) => mutate(`/plots/${slot}/harvest`, { cue: 'action:harvest' });
-    const buyItem = (shopId, qty = 1) => mutate('/shop/buy', {
-        payload: { shop_id: shopId, quantity: qty }, cue: 'action:buy',
+    const buyItem = (shopId, qty = 1, beforeWrite) => mutate('/shop/buy', {
+        payload: { shop_id: shopId, quantity: qty }, cue: 'action:buy', beforeWrite,
     });
-    const sellItem = (itemId, qty, quality = 0) =>
-        mutate(`/inventory/${itemId}/sell`, { payload: { quantity: qty, quality }, cue: 'action:sell' });
+    const sellItem = (itemId, qty, quality = 0, beforeWrite) =>
+        mutate(`/inventory/${itemId}/sell`, { payload: { quantity: qty, quality }, cue: 'action:sell', beforeWrite });
     const siteUrl = (industry, siteId) => `/${industry}/${industry === 'crafting' ? 'stations' : 'sites'}/${siteId}`;
     const startSite = (industry, siteId, payloadKey, id, taskItemId = '', quantity = 1, beforeWrite) =>
         mutate(`${siteUrl(industry, siteId)}/start`, {
@@ -1913,6 +1913,11 @@
     // 按页生成槽位编辑器；选项来自最新状态，选择从持久化配置恢复
     function renderFarmSettings(state) {
         const { group, body } = makeGroup('农场');
+        appendSetting(body, state, 'farming.seedStrategy', '自动选种策略', { choices: [
+            { value: 'portal', text: '委托 → 传送门 → 净收益' },
+            { value: 'profit', text: '委托优先，其余按净收益' },
+        ] });
+        body.appendChild(uiElement('p', 'rlt-note', '自动田先补需求，再按普通品质产量估算每小时净收益。已有种子不再计购种花费；买不起的种子会跳过。高品质门贡按缺口试种，收获后再核对品质。'));
         // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
         const slots = (state.plots || []).map(p => p.slot);
         slots.push(slots.length ? Math.max(...slots) + 1 : 0);
@@ -2541,36 +2546,35 @@
 
     function cropHourlyProfit(state, crop, ability = 0, plot = null) {
         const produceId = cropProduceItemId(crop);
-        const producePrice = itemSellPrice(state, produceId, cropProduceName(crop), crop.produce_sell_price ?? crop.produce?.sell_price ?? crop.item?.sell_price);
-        const shopEntry = (state.shop || []).find(e => sameId(shopEntryItemId(e), crop.seed_item_id));
-        const seedRaw = crop.seed_price ?? shopEntry?.price;
-        if (producePrice == null) return null;
-        // 种子不可购买（树果等探索/航海掉落地）：库存有货时按边际成本 0 估值（种子卖价也是 0，无机会成本）；无货无法估值
-        let seedPrice;
-        if (seedRaw == null || !Number.isFinite(Number(seedRaw))) {
-            if (seedQty(state, crop) <= 0) return null;
-            seedPrice = 0;
-        } else {
-            seedPrice = Number(seedRaw);
-        }
+        // 新产物品质未知，只用基础价/普通品质价；背包里一件高品质产物不能抬高整片田的估值。
+        const baseState = { ...state, inventory: (state.inventory || []).filter(item => Number(item.quality || 0) === 0) };
+        const producePrice = itemSellPrice(baseState, produceId, cropProduceName(crop),
+            crop.produce_sell_price ?? crop.produce?.sell_price ?? crop.item?.sell_price);
+        const entry = seedShopEntry(state, crop);
+        // 比较本次种植的新增金币收益：已有种子无需再次付款；缺种时使用实际将购买的商品价格。
+        const seedPrice = seedQty(state, crop) > 0 ? 0 : entry ? Number(entry.price) : null;
+        if (producePrice == null || producePrice < 0 || seedPrice == null) return null;
         const minYield = Number(crop.yield_min ?? 1);
         const maxYield = Number(crop.yield_max ?? minYield);
+        if (!Number.isFinite(minYield) || !Number.isFinite(maxYield) || minYield <= 0 || maxYield < minYield) return null;
         const startItem = plot ? slotTaskItem(state, 'farming', plot.slot, 'start', { notify: false }) : null;
         // 树果等作物带 minimum_duration_seconds 时长下限：能力加成不能把收获压缩到下限以内
         const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability,
             crop.minimum_duration_seconds ?? 1, taskItemDurationMultiplier(startItem));
-        if (!seconds) return null;
-        return (((minYield + maxYield) / 2) * producePrice - seedPrice) / (seconds / 3600);
+        if (!Number.isFinite(seconds) || seconds <= 0) return null;
+        const value = (((minYield + maxYield) / 2) * producePrice - seedPrice) / (seconds / 3600);
+        return Number.isFinite(value) ? value : null;
     }
 
     function bestCrop(state, crops, plot = null) {
         const ability = farmingAbility(state, plot);
         const scored = crops
             .map(crop => ({ crop, value: cropHourlyProfit(state, crop, ability, plot) }))
-            .filter(x => x.value != null)
+            .filter(x => x.value != null && x.value > 0)
             .sort((a, b) => b.value - a.value);
         if (scored.length) return scored[0].crop;
-        const list = [...crops];
+        // 未知售价时只使用已有种子；纯赚钱不盲买无法估值或已知亏本的种子。
+        const list = crops.filter(crop => seedQty(state, crop) > 0 && cropHourlyProfit(state, crop, ability, plot) == null);
         if (CONFIG.farming.prefer === 'fastest') list.sort((a, b) => Number(a.growth_seconds || Infinity) - Number(b.growth_seconds || Infinity));
         if (CONFIG.farming.prefer === 'slowest') list.sort((a, b) => Number(b.growth_seconds || 0) - Number(a.growth_seconds || 0));
         return list[0] || null;
@@ -2645,17 +2649,23 @@
         let qty = 0;
         for (const plot of state.plots || []) {
             if (plot.empty || !plot.crop || !cropMatchesNeed(plot.crop, need)) continue;
-            qty += Math.max(1, Number(plot.crop.yield_min ?? 1));
+            const minimum = Number(plot.crop.yield_min ?? 1);
+            if (Number.isFinite(minimum) && minimum > 0) qty += minimum;
         }
         return qty;
     }
 
-    function needShortage(state, need) {
-        const shortages = memoizedForState(state, 'productionShortages', () => {
+    function productionNeedKey(state, need) {
+        const id = need.itemId ?? itemMetadata(state, null, need.name)?.item_id ??
+            cropProduceItemId((state.crops || []).find(crop => cropProduceName(crop) === need.name));
+        return id != null ? `id:${id}` : `name:${need.name}`;
+    }
+
+    function productionShortages(state, includeCrops = true) {
+        return memoizedForState(state, includeCrops ? 'productionShortages' : 'productionShortages:withoutCrops', () => {
             const groups = new Map(), result = new Map();
             for (const row of gatherNeeds(state, { productionOnly: true })) {
-                const itemId = row.itemId ?? itemMetadata(state, null, row.name)?.item_id;
-                const key = itemId != null ? `id:${itemId}` : `name:${row.name}`;
+                const key = productionNeedKey(state, row);
                 if (!groups.has(key)) groups.set(key, []);
                 groups.get(key).push(row);
             }
@@ -2665,7 +2675,7 @@
                 const totals = qualities.map(quality => {
                     const query = { ...sample, minQuality: quality };
                     return inventoryQty(state, query.itemId, query.name, quality) +
-                        inFlightCropQty(state, query) + inFlightIndustryGuaranteedQty(state, query);
+                        (includeCrops ? inFlightCropQty(state, query) : 0) + inFlightIndustryGuaranteedQty(state, query);
                 });
                 const stock = qualities.map((quality, index) => ({ quality, free: Math.max(0, totals[index] - (totals[index + 1] || 0)) }));
                 // 先满足高品质门槛，再使用最低可满足品质；相同门槛保留委托优先和原始需求顺序。
@@ -2682,13 +2692,48 @@
             }
             return result;
         });
+    }
+
+    function needShortage(state, need) {
+        const shortages = productionShortages(state);
         return shortages.get(need) ?? Math.max(0, need.need
             - inventoryQty(state, need.itemId, need.name, need.minQuality)
             - inFlightCropQty(state, need) - inFlightIndustryGuaranteedQty(state, need));
     }
 
-    function findCropForNeed(state, need) {
-        return (state.crops || []).find(c => cropMatchesNeed(c, need)) || null;
+    // 高品质门贡的在途作物只充当一批待验证的试种额度，不当作合格库存，也不解除物品保护。
+    function farmingPlantingNeeds(state) {
+        return memoizedForState(state, 'farmingPlantingNeeds', () => {
+            const needs = gatherNeeds(state, { productionOnly: true });
+            const shortages = productionShortages(state), withoutCrops = productionShortages(state, false);
+            const pending = new Map();
+            for (const need of needs) {
+                const key = productionNeedKey(state, need);
+                if (!pending.has(key)) pending.set(key, inFlightCropQty(state, { ...need, minQuality: 0 }));
+                // 普通需求已分配的在途产物不能再用于高品质试种。
+                if (need.minQuality <= 0) pending.set(key, Math.max(0, pending.get(key) -
+                    Math.max(0, (withoutCrops.get(need) || 0) - (shortages.get(need) || 0))));
+            }
+            return needs.map(need => {
+                const shortage = shortages.get(need) || 0, key = productionNeedKey(state, need);
+                const trial = need.minQuality > 0 ? Math.min(shortage, pending.get(key) || 0) : 0;
+                pending.set(key, Math.max(0, (pending.get(key) || 0) - trial));
+                return { need, shortage, pending: trial };
+            });
+        });
+    }
+
+    function seedPurchaseBudget(state) {
+        let budget = playerCoins(state);
+        if (!CONFIG.farming.autoSellForSeeds) return budget;
+        let units = Math.max(0, Math.floor(CONFIG.selling.maxUnitsPerTick - runtime.soldUnits));
+        for (const row of computeSellables(state)) {
+            const quantity = Math.min(units, Math.floor(row.surplus));
+            budget += quantity * row.price;
+            units -= quantity;
+            if (units <= 0) break;
+        }
+        return budget;
     }
 
     function chooseCropTarget(state, plot) {
@@ -2698,58 +2743,58 @@
         const plotWanted = plot ? plotCropOverride(plot.slot) : null;
         if (plotWanted != null) {
             const crop = (state.crops || []).find(c => sameId(cropId(c), plotWanted));
-            if (crop) return { crop, reason: '槽位指定作物' };
+            if (crop && crop.unlocked !== false && !crop.locked) return { crop, reason: '槽位指定作物' };
             return { blocked: `槽位指定作物 #${plotWanted} 当前不可用` };
         }
         if (cfg.cropId != null) {
             const crop = (state.crops || []).find(c => sameId(cropId(c), cfg.cropId));
-            if (crop) return { crop, reason: '指定作物', strict: cfg.strictCropId };
+            if (crop && crop.unlocked !== false && !crop.locked) return { crop, reason: '指定作物', strict: cfg.strictCropId };
             return { blocked: `指定作物 #${cfg.cropId} 当前不可用`, strict: cfg.strictCropId };
         }
 
+        let budget = null;
+        const maxStamina = Math.max(Number(state.player?.stamina_cap ?? Infinity), liveStamina(state));
+        const candidates = (state.crops || []).filter(crop => {
+            const cost = Number(crop.stamina_cost || 0);
+            if (cropId(crop) == null || crop.seed_item_id == null || crop.unlocked === false || crop.locked ||
+                !Number.isFinite(cost) || cost < 0 || cost > maxStamina) return false;
+            if (seedQty(state, crop) > 0) return true;
+            if (!cfg.autoBuySeeds) return false;
+            const entry = seedShopEntry(state, crop);
+            if (!entry) return false;
+            if (Number(entry.price) <= playerCoins(state)) return true;
+            budget ??= seedPurchaseBudget(state);
+            return Number(entry.price) <= budget;
+        });
+        const ability = farmingAbility(state, plot);
         if (CONFIG.commissions.enabled || cfg.seedStrategy !== 'profit') {
-            for (const need of gatherNeeds(state, { productionOnly: true })) {
+            for (const { need, shortage, pending } of farmingPlantingNeeds(state)) {
                 if (need.source === 'portal' && cfg.seedStrategy === 'profit') continue;
-                const shortage = needShortage(state, need);
-                if (shortage <= 0) continue;
-                const crop = findCropForNeed(state, need);
+                const missing = shortage - pending;
+                if (missing <= 0) continue;
+                const matched = candidates.filter(crop => cropMatchesNeed(crop, need));
+                const duration = crop => {
+                    const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability, crop.minimum_duration_seconds ?? 1);
+                    const yieldMin = Number(crop.yield_min ?? 1);
+                    return seconds > 0 && Number.isFinite(seconds) && Number.isFinite(yieldMin) && yieldMin > 0
+                        ? seconds * Math.ceil(missing / yieldMin) : Infinity;
+                };
+                const crop = matched.sort((a, b) => duration(a) - duration(b))[0];
                 if (!crop) continue;
-                const canBuy = CONFIG.farming.autoBuySeeds &&
-                    seedShopEntries(state).some(e => sameId(shopEntryItemId(e), crop.seed_item_id));
-                if (seedQty(state, crop) <= 0 && !canBuy) {
-                    logSkip(`need:no-seed:${need.itemId ?? need.name}`, `${need.name || need.itemId} 有缺口，但当前没有对应种子来源`);
-                    continue;
-                }
                 const reason = need.source === 'commission'
                     ? `今日委托缺 ${need.name || need.itemId} ×${shortage}`
-                    : `传送门「${need.portal?.name || need.portal?.portal_id || ''}」缺 ${need.name} ×${shortage}`;
-                return { crop, reason, need };
+                    : `传送门「${need.portal?.name || need.portal?.portal_id || ''}」缺 ${need.name || need.itemId} ×${shortage}`;
+                return { crop, reason: reason + (need.minQuality > 0 ? `（品质 ≥ ${need.minQuality}${pending > 0 ? `，在途试种 ${pending} 件` : ''}）` : ''), need };
             }
         }
 
-        const buyableSeeds = new Set(seedShopEntries(state).map(e => String(shopEntryItemId(e))));
-        const candidates = (state.crops || []).filter(c => seedQty(state, c) > 0 ||
-            (cfg.autoBuySeeds && buyableSeeds.has(String(c.seed_item_id))));
         const crop = bestCrop(state, candidates, plot);
         if (crop) {
-            // 记录本次估值表，便于核对“为什么选它”
-            const ability = farmingAbility(state, plot);
-            const table = candidates.map(c => {
-                const v = cropHourlyProfit(state, c, ability, plot);
-                return `${c.name || '作物#' + cropId(c)}=${v == null ? '缺价' : v.toFixed(2)}`;
-            }).join(' ');
-            log(`作物估值（土地 ${plot.slot + 1}，能力 ${ability}）：${table} → 选 ${crop.name || cropId(crop)}`);
-            return { crop, reason: '经济价值最高' };
+            const value = cropHourlyProfit(state, crop, ability, plot);
+            return { crop, reason: value == null ? '售价资料不足，使用已有种子' : `预计净收益最高（约 ${value.toFixed(1)} 金币/时）` };
         }
-        // 诊断：定位“没有可用或可购买的种子”时商店/作物的实际结构
-        const shopSample = (state.shop || []).slice(0, 6)
-            .map(e => `${e.id}:${e.item?.name || '?'}(item_id=${shopEntryItemId(e)},kind=${e.item?.kind},locked=${!!e.locked},price=${e.price})`)
-            .join(' ');
-        const cropSample = (state.crops || []).slice(0, 6)
-            .map(c => `${c.name || cropId(c)}(seed=${c.seed_item_id},库存=${seedQty(state, c)})`)
-            .join(' ');
-        logSkip('seed:diag', `诊断｜autoBuySeeds=${cfg.autoBuySeeds} 可购种子条目=${buyableSeeds.size}｜商店[${(state.shop || []).length}]: ${shopSample || '空'}｜作物[${(state.crops || []).length}]: ${cropSample || '空'}`);
-        return { blocked: '没有可用或可购买的种子' };
+        return { blocked: candidates.length ? '暂无需求可补，现有候选没有可确认的正收益，等待种子或需求变化' :
+            '暂无可种作物：请检查种子、购种预算、解锁条件和体力上限' };
     }
 
     // 商店条目的物品 id：优先内嵌 item.item_id，缺失时退到条目 id（种子条目的 id 即物品 id，如 wheat_seed）
@@ -2759,8 +2804,15 @@
 
     function seedShopEntries(state) {
         return (state.shop || []).filter(e =>
-            shopEntryItemId(e) != null && !e.locked &&
+            e.id != null && String(e.id) !== '' && shopEntryItemId(e) != null && !e.locked && e.unlocked !== false && e.price != null && e.price !== '' &&
+            Number.isFinite(Number(e.price)) && Number(e.price) >= 0 &&
             (state.crops || []).some(c => sameId(c.seed_item_id, shopEntryItemId(e))));
+    }
+
+    function seedShopEntry(state, crop) {
+        const entries = seedShopEntries(state).filter(entry => sameId(shopEntryItemId(entry), crop.seed_item_id));
+        return entries.find(entry => sameId(entry.id, CONFIG.farming.seedShopId)) ||
+            entries.sort((a, b) => Number(a.price) - Number(b.price))[0] || null;
     }
 
     function playerCoins(state) { return Number(state.player?.coins || 0); }
@@ -2947,7 +2999,7 @@
         return Math.max(0, Math.floor(safe));
     }
 
-    async function autoSellForCoins(target) {
+    async function autoSellForCoins(target, beforeWrite) {
         const failedStacks = new Set();
         while (playerCoins(runtime.state) < target && runtime.soldUnits < CONFIG.selling.maxUnitsPerTick) {
             const candidate = computeSellables(runtime.state).find(({ item }) =>
@@ -2964,7 +3016,11 @@
             const quality = Number(item.quality || 0);
             const stackKey = `${item.item_id}:${quality}`;
             try {
-                await sellItem(item.item_id, qty, quality);
+                const plannedState = runtime.state;
+                await sellItem(item.item_id, qty, quality, () => {
+                    beforeWrite?.();
+                    if (runtime.state !== plannedState) throw new ApiError('售卖前库存已变化，下一轮重新计算', { code: 'aborted' });
+                });
                 runtime.soldUnits += qty;
                 clearSkip(`fail:sell:${stackKey}`);
                 log(`已安全卖出 ${item.quality_name || ''}${item.name} ×${qty}（+${candidate.price * qty} 金币）`);
@@ -2979,16 +3035,11 @@
         return ok;
     }
 
-    async function buySeedForCrop(crop, reason) {
+    async function buySeedForCrop(crop, reason, beforeWrite) {
         let state = runtime.state;
         const cfg = CONFIG.farming;
-        let entry = null;
-        if (cfg.seedShopId != null) {
-            const forced = (state.shop || []).find(e => sameId(e.id, cfg.seedShopId));
-            if (forced && sameId(shopEntryItemId(forced), crop.seed_item_id) && !forced.locked) entry = forced;
-            else logSkip('seed:bad-forced-shop', `指定商店条目 #${cfg.seedShopId} 不是目标作物的可用种子`);
-        }
-        entry ||= seedShopEntries(state).find(e => sameId(shopEntryItemId(e), crop.seed_item_id)) || null;
+        if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds) return false;
+        const entry = seedShopEntry(state, crop);
         if (!entry) {
             logSkip(`seed:unavailable:${cropId(crop)}`, `${crop.name || '目标作物'} 没有可购买的种子`);
             return false;
@@ -2996,11 +3047,20 @@
         const price = Number(entry.price || 0);
         if (playerCoins(state) < price && cfg.autoSellForSeeds) {
             log(`金币不足（${playerCoins(state)}/${price}），尝试安全售卖以购买 1 粒种子...`);
-            await autoSellForCoins(price);
+            await autoSellForCoins(price, beforeWrite);
             state = runtime.state;
         }
+        beforeWrite?.();
+        if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds) return false;
         if (playerCoins(state) < price) return false;
-        await buyItem(entry.id, 1); // 按需逐粒购买，避免为了填满所有空地过度变卖
+        await buyItem(entry.id, 1, () => {
+            beforeWrite?.();
+            const freshEntry = seedShopEntry(runtime.state, crop);
+            if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds || runtime.state !== state ||
+                !freshEntry || !sameId(freshEntry.id, entry.id) || Number(freshEntry.price) !== price) {
+                throw new ApiError('购种条件已变化，下一轮重新选种', { code: 'aborted' });
+            }
+        }); // 按需逐粒购买，避免为了填满所有空地过度变卖
         clearSkip('seed:poor');
         clearSkip(`seed:unavailable:${cropId(crop)}`);
         log(`已购买 ${entry.item?.name || entry.id} ×1（${reason}，花费 ${price}）`);
@@ -3175,7 +3235,9 @@
         if (!CONFIG.farming.autoPlant) return;
         const cfg = CONFIG.farming;
         if (!cfg.enabled) return;
-        const slots = (runtime.state.plots || []).filter(p => p.empty).map(p => p.slot);
+        // 先落实手动锁定田，再让自动田使用写响应里的在途产量补缺，避免抢种同一份需求。
+        const slots = (runtime.state.plots || []).filter(p => p.empty).map(p => p.slot)
+            .sort((a, b) => Number(plotCropOverride(b) != null) - Number(plotCropOverride(a) != null));
         for (const slot of slots) {
             if (!cfg.enabled || !cfg.autoPlant) return;
             let state = runtime.state;
@@ -3184,7 +3246,6 @@
             const target = chooseCropTarget(state, plot);
             if (!target.crop) {
                 logSkip(`crop:blocked:${target.blocked}`, `土地 ${slot + 1}：${target.blocked || '没有可种作物'}`);
-                if (target.strict) return;
                 continue;
             }
             const { crop, reason } = target;
@@ -3196,32 +3257,44 @@
             }
             clearSkip(`stamina:farming:${slot}`);
 
-            if (seedQty(state, crop) <= 0) {
-                if (!cfg.autoBuySeeds) {
-                    logSkip(`seed:disabled:${cropId(crop)}`, `${crop.name || '目标作物'} 没有种子（可开启 autoBuySeeds）`);
-                    if (target.strict) return;
-                    continue;
+            const revision = settingsRevision;
+            const checkChoice = () => {
+                if (settingsRevision !== revision || !cfg.enabled || !cfg.autoPlant) {
+                    const error = new ApiError('种植设置已变化，下一轮重新选种', { code: 'aborted' });
+                    error.farmingPlanChanged = true;
+                    throw error;
                 }
-                if (!await buySeedForCrop(crop, reason)) {
-                    if (target.strict) return;
-                    continue;
-                }
-                state = runtime.state;
-                plot = (state.plots || []).find(p => p.slot === slot);
-                if (!plot?.empty || seedQty(state, crop) <= 0) continue;
-            }
-
+            };
             try {
-                if (!cfg.enabled || !cfg.autoPlant) return;
+                if (seedQty(state, crop) <= 0) {
+                    if (!cfg.autoBuySeeds) {
+                        logSkip(`seed:disabled:${cropId(crop)}`, `${crop.name || '目标作物'} 没有种子（可开启 autoBuySeeds）`);
+                        continue;
+                    }
+                    if (!await buySeedForCrop(crop, reason, checkChoice)) continue;
+                    state = runtime.state;
+                    plot = (state.plots || []).find(p => p.slot === slot);
+                    if (!plot?.empty || seedQty(state, crop) <= 0) continue;
+                }
+
+                checkChoice();
+                if (cost > liveStamina(state)) continue;
                 const startItem = slotTaskItem(runtime.state, 'farming', slot, 'start');
-                await plantPlot(slot, cropId(crop), taskItemRecordId(startItem) ?? '');
+                await plantPlot(slot, cropId(crop), taskItemRecordId(startItem) ?? '', () => {
+                    checkChoice();
+                    const current = (runtime.state.plots || []).find(p => p.slot === slot);
+                    if (runtime.state !== state || !current?.empty || seedQty(runtime.state, crop) <= 0 || cost > liveStamina(runtime.state)) {
+                        throw new ApiError('种植前状态已变化，下一轮重新选种', { code: 'aborted' });
+                    }
+                });
                 clearSkip(`fail:plant:${slot}`);
                 clearSkip(`seed:disabled:${cropId(crop)}`);
                 const itemText = startItem ? `，使用 ${startItem.name || '任务道具#' + taskItemRecordId(startItem)}` : '';
                 log(`土地 ${slot + 1}：种下 ${crop.name || '作物#' + cropId(crop)}（${reason}${itemText}）`);
             } catch (e) {
+                if (e.farmingPlanChanged) return;
                 if (shouldAbortTick(e)) throw e;
-                logSkip(`fail:plant:${slot}`, `土地 ${slot + 1} 种植失败：${e.message}`);
+                logSkip(`fail:plant:${slot}`, `土地 ${slot + 1} 购种或种植失败：${e.message}`);
             }
         }
     }
@@ -4253,7 +4326,7 @@
                     }
                     continue;
                 }
-                if (node.empty || node.ready) continue;
+                if (node.empty || node.ready || Number(need.minQuality || 0) > 0) continue;
                 const snapshot = node.task_snapshot;
                 const active = node.task || node.recipe || snapshot?.task || snapshot?.recipe || snapshot;
                 if (!active) continue;
