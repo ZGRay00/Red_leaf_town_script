@@ -22,6 +22,8 @@
 !tests/red-leaf-town-refining.test.cjs
 !tests/red-leaf-town-facilities.test.cjs
 !tests/red-leaf-town-feed-quality.test.cjs
+!tests/red-leaf-town-feed-mix.test.cjs
+!tests/red-leaf-town-feed-mix-browser.cjs
 !tests/red-leaf-town-v450-audit.test.cjs
 !tests/red-leaf-town-lifecycle-audit.test.cjs
 !tests/red-leaf-town-partner-audit.test.cjs

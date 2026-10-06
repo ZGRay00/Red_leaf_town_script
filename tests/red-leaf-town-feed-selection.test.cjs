@@ -141,7 +141,7 @@ test('feed selector persists an explicit choice and resets the previous filling 
     const x = harness(state), body = x.context.document.createElement('div');
     x.h.setRunning(false);
     x.h.renderFeedChoice(body, state);
-    const select = body.children[0].children.find(child => child.tagName === 'SELECT');
+    const select = body.children.flatMap(row => row.children).find(child => child.tagName === 'SELECT' && child.getAttribute('aria-label') === '投喂物品');
     assert.ok(select.children.some(option => option.value === 'pumpkin' && option.textContent.includes('南瓜')));
     x.h.setOverride('rlt-feed-filling', '1'); select.value = 'pumpkin'; select.onchange();
     assert.equal(x.h.CONFIG.feed.itemId, 'pumpkin'); assert.equal(x.h.getOverride('rlt-feed-filling'), null);

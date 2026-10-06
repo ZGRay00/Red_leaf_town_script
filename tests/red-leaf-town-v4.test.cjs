@@ -36,8 +36,15 @@ function element(tag = 'div') {
     Object.defineProperty(result, 'lastChild', { get() { return this.children.at(-1); } });
     return result;
 }
-function harness(initial = fixture(), entries = []) {
+function harness(initial = fixture(), entries = [], options = {}) {
     const storage = new Map(entries), calls = [];
+    // Legacy scenarios select volume-only compatibility while preserving any
+    // supplied saved settings. Policy tests use the real production defaults.
+    if (!options.feedDefaults) {
+        if (!storage.has('rlt-setting:feed.mode')) storage.set('rlt-setting:feed.mode', JSON.stringify('single'));
+        if (!storage.has('rlt-setting:feed.qualityTargetEnabled')) storage.set('rlt-setting:feed.qualityTargetEnabled', 'false');
+        storage.set('rlt-feed-policy:v6', '1');
+    }
     let backend = structuredClone(initial), responder;
     const story = { cue() {}, active: false, queue: [] }, game = { state: initial, refresh() {} };
     const app = { __vue_app__: { _context: { config: { globalProperties: { $pinia: { _s: new Map([['story', story], ['game', game]]) } } } } } };
@@ -65,7 +72,8 @@ function harness(initial = fixture(), entries = []) {
     assert.ok(source.includes('if (CONFIG.ui.autoStart) start();'));
     source = source.replace('if (CONFIG.ui.autoStart) start();', exposure);
     vm.runInNewContext(source, context, { filename: sourcePath });
-    const h = context.window.__test; h.acceptState(structuredClone(initial)); h.setRunning();
+    const h = context.window.__test;
+    h.acceptState(structuredClone(initial)); h.setRunning();
     return { h, calls, storage, context, setResponder(fn) { responder = fn; },
         get backend() { return backend; }, set backend(value) { backend = value; },
         response(result = {}) { return { ok: true, status: 200, json: async () => ({ data: { state: structuredClone(backend), result } }) }; },

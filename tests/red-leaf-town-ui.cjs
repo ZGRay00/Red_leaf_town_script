@@ -132,6 +132,8 @@ async function main() {
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.crafting.autoCraftInputs`), false);
     await evaluate(`document.querySelector('[aria-label="缺料自动加工"]').click()`);
     await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click()`);
+    await evaluate(`(()=>{const e=document.querySelector('select[aria-label="投喂方式"]');e.value='single';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
     assert.deepEqual(await evaluate(`Array.from(document.querySelector('select[aria-label="投喂物品"]').options).map(o=>o.value)`), ['', 'pumpkin', 'grain_feed']);
     await evaluate(`(()=>{const e=document.querySelector('select[aria-label="投喂物品"]');e.value='pumpkin';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.itemId`), 'pumpkin');
@@ -215,12 +217,13 @@ async function main() {
     assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('已选项目合计 38 件')`), true);
     assert.equal(await evaluate(`document.querySelector('${farmUpgrade}').disabled`), true, 'farm materials cannot consume the new pond reservation');
     await screenshot('rlt-v451-facility-reservation');
-    await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click();document.querySelector('[aria-label="启用品质目标"]').click()`);
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click()`);
+    assert.equal(await evaluate(`document.querySelector('[aria-label="启用品质目标"]')`), null);
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.qualityTargetEnabled`), true);
     await evaluate(`(()=>{const e=document.querySelector('input[aria-label="目标品质分"]');e.focus();e.value='65';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.qualityTarget`), 65);
     await evaluate(`new Promise(r=>setTimeout(r,40))`);
-    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('目标 65')`), true);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('目标 ≥ 65')`), true);
     await screenshot('rlt-v450-feed-quality');
     await evaluate(`document.querySelector('.rlt-tabs [data-page="refining"]').click()`);
     const refineButton = '[data-focus-key="refining:1:execute"]';

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.0.0
-// @description  红叶镇物语自动生产、双倍田、递归加工与精制房、设施材料预留、饲料品质目标和管理面板
+// @version      5.1.0
+// @description  红叶镇物语自动生产、双倍田、递归加工与精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @downloadURL  none
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.0.0';
+    const SCRIPT_VERSION = '5.1.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -124,12 +124,14 @@
         },
 
         feed: {
-            enabled: false,          // 独立于水产总开关，只投入选中的物品
+            enabled: false,          // 独立于水产总开关，遵守投料方案与品质目标
+            mode: 'smart',           // smart 自动保质（饲料类）；mix 自定义份数配比；single 单一物品
+            mix: '[]',               // JSON [{itemId,weight}]，最多 6 种，按新增饲料份数归一配比
             itemId: '',              // 留空兼容旧设置：均衡饲料；其他物品从游戏实际可投喂列表选择
             autoBuy: true,
             batchBuy: true,          // 识别每件换算份数后，按缺口和预算批量购买
-            qualityTargetEnabled: false, // 开启后同时满足槽内加权平均品质目标；仍只投入所选物品
-            qualityTarget: 50,
+            qualityTargetEnabled: true, // 兼容旧设置；新界面始终使用品质保护
+            qualityTarget: 45,        // 品质目标最少 41 分，默认留出 5 分余量
             thresholdMode: 'percent', // percent = 容量百分比，units = 饲料份数
             low: 20,
             target: 80,
@@ -232,6 +234,13 @@
         setOverride(`rlt-setting:${path}`, JSON.stringify(value));
     }
     installSettings(CONFIG);
+    // 升级旧单品设置时保留物品与高品质目标，同时启用新的品质保护；不改变补料启停。
+    if (!getOverride('rlt-feed-policy:v6')) {
+        if (!getOverride('rlt-setting:feed.mode') && CONFIG.feed.itemId) setSetting('feed.mode', 'single');
+        setSetting('feed.qualityTargetEnabled', true);
+        if (!Number.isFinite(CONFIG.feed.qualityTarget) || CONFIG.feed.qualityTarget < 41) setSetting('feed.qualityTarget', 45);
+        setOverride('rlt-feed-policy:v6', '1');
+    }
 
     // ---------- 槽位级覆盖配置（localStorage 记忆） ----------
     function getOverride(key) {
@@ -1165,6 +1174,19 @@
         #rlt-auto-helper-panel .rlt-control>span{opacity:.85;overflow-wrap:anywhere;flex-shrink:0;max-width:48%}
         #rlt-auto-helper-panel .rlt-input{background:#17211b;color:#e8e0cf;border:1px solid #555f52;min-width:0}
         #rlt-auto-helper-panel select.rlt-input{flex:1}
+        #rlt-auto-helper-panel .rlt-feed-mix{border:1px solid var(--rlt-line);border-radius:10px;padding:9px;margin:9px 0;min-width:0}
+        #rlt-auto-helper-panel .rlt-feed-mix-row{border-bottom:1px dashed var(--rlt-line);padding:8px 0;min-width:0}
+        #rlt-auto-helper-panel .rlt-feed-mix-row:last-child{border-bottom:0}
+        #rlt-auto-helper-panel .rlt-feed-mix-heading{display:flex;gap:8px;align-items:center;justify-content:space-between}
+        #rlt-auto-helper-panel .rlt-feed-mix-heading>strong{min-width:0;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-feed-mix-heading>button{flex:none}
+        #rlt-auto-helper-panel .rlt-feed-mix-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+        #rlt-auto-helper-panel .rlt-feed-mix-note{font-size:11px;color:var(--rlt-muted);margin:5px 0;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-feed-preview{margin:10px 0;padding:10px;border:1px solid var(--rlt-line);border-radius:10px;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-feed-preview strong{display:block}
+        #rlt-auto-helper-panel .rlt-feed-preview p{margin:5px 0}
+        #rlt-auto-helper-panel .rlt-feed-stock{font-size:11px;overflow-wrap:anywhere}
+        #rlt-auto-helper-panel .rlt-feed-stock summary{cursor:pointer;color:var(--rlt-muted)}
         #rlt-auto-helper-panel .rlt-switch{border:0;background:#555f52;color:#e8e0cf}
         #rlt-auto-helper-panel .rlt-switch[aria-checked=true]{background:#8ead71;color:#17211b}
         #rlt-auto-helper-panel [hidden]{display:none!important}
@@ -1328,8 +1350,8 @@
             const slot = state.aquatic?.feed_slot;
             if (slot) {
                 const bounds = feedThresholds(slot);
-                card('feed', `饲料 · ${selectedFeed(state).name}`, `${Math.floor(slot.units)} / ${slot.capacity} 份`, slot.capacity > 0 ? slot.units / slot.capacity * 100 : null,
-                    bounds.valid ? `底限 ${Math.floor(bounds.low)} → 目标 ${Math.ceil(bounds.target)} 份 · 品质分 ${Number.isFinite(Number(slot.quality_score)) ? Number(slot.quality_score).toFixed(1) : '待确认'}${CONFIG.feed.qualityTargetEnabled ? ` / 目标 ${CONFIG.feed.qualityTarget}` : ''} · ${CONFIG.feed.enabled ? '自动补充' : '自动补充关闭'}` : '请检查上下限设置');
+                card('feed', `饲料 · ${feedSelection(state).name}`, `${Math.floor(slot.units)} / ${slot.capacity} 份`, slot.capacity > 0 ? slot.units / slot.capacity * 100 : null,
+                    bounds.valid ? `底限 ${Math.floor(bounds.low)} → 目标 ${Math.ceil(bounds.target)} 份 · 品质分 ${Number.isFinite(Number(slot.quality_score)) ? Number(slot.quality_score).toFixed(1) : '待确认'} / 目标 ≥ ${feedGoal()} · ${CONFIG.feed.enabled ? '自动补充' : '自动补充关闭'}` : '请检查上下限设置');
             }
             const projects = selectedFacilityUpgrades(state);
             if (projects.length) text('facility-summary', 'p', 'rlt-note', `设施材料预留：${projects.map(project => project.name || project.id).join('、')}`);
@@ -1358,7 +1380,7 @@
             ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
             ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
             ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '执行已启动的本轮'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.batchLimit', '每次最多提交次数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
-            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买所选物品'], ['feed.batchBuy', '批量购买所选物品'], ['feed.qualityTargetEnabled', '启用品质目标'], ['feed.qualityTarget', '目标品质分'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
+            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买'], ['feed.batchBuy', '批量购买'], ['feed.qualityTarget', '目标品质分', { min: 41 }], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
             ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
             ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
         ];
@@ -1368,9 +1390,8 @@
             if (page === 'feed') renderFeedChoice(body, state);
             for (const [path, label, options] of fields) appendSetting(body, state, path, label, options || {});
             if (page === 'feed') {
-                body.appendChild(uiElement('p', 'rlt-note', '只投入选中物品；可选项来自游戏实际可投喂列表，已见物品耗尽后仍保留。南瓜、谷物饲料等首次入库并可投喂后会自动出现。库存不足且商店没有该物品时等待，不改用其他饲料。'));
-                body.appendChild(uiElement('p', 'rlt-note', '达到底限后补至目标；整件投料可能略超目标，始终不超容量。保留委托、传送门和加工用料；均衡饲料以外的物品也遵守默认库存保留量。预算为 0 时不购买。'));
-                if (CONFIG.feed.qualityTargetEnabled) body.appendChild(uiElement('p', 'rlt-note', '品质分按份数加权。低于品质目标时也会补料，可能超过填充水位；只用所选物品的可用品质，不倒空饲料槽。无法达标时等待补货或容量释放。'));
+                body.appendChild(uiElement('p', 'rlt-note', '到达底限后补至目标；品质不足时也会检查补料。品质按份数加权，整件投喂始终不超容量；无法达标时等待补货或容量释放。'));
+                body.appendChild(uiElement('p', 'rlt-note', '预留委托、门贡、加工、精制和设施用料；农产品遵守库存保留量。预算为 0 时不购买，库存预览不包含尚未购买的物品。'));
                 const slot = state.aquatic?.feed_slot;
                 if (slot) {
                     const bounds = feedThresholds(slot);
@@ -5605,26 +5626,123 @@
             !item.locked && item.unlocked !== false && item.id != null) || null : null;
         return { itemId, name, entry, confirmed };
     }
-    function renderFeedChoice(body, state) {
-        const choices = feedChoices(state), selected = selectedFeed(state);
-        const { row, select } = makeSelectRow('投喂物品', '只使用所选物品；没有可用库存或对应商店商品时等待');
-        const inputs = feedInputs(state);
-        fillSelect(select, choices.map(item => {
-            const rows = inputs.filter(input => sameId(input.item_id, item.itemId));
-            const stock = inventoryQty(state, item.itemId);
-            const conversions = [...new Set(rows.map(input => Number(input.units)))].sort((a, b) => a - b);
-            return { value: item.itemId, text: `${item.name} · 库存 ${stock}${conversions.length ? ` · ${conversions.join('/')} 份/件` : ' · 等待投喂数据'}` };
-        }), CONFIG.feed.itemId || null, '均衡饲料（默认）');
-        select.onchange = () => {
-            setSetting('feed.itemId', select.value);
-            setOverride(FEED_FILL_KEY, '');
-            for (const notice of [...skipNotices]) if (notice.startsWith('feed:')) clearSkip(notice);
-            wakeSoon();
+    let feedMixDraft = null;
+    function refreshFeedControls() {
+        setOverride(FEED_FILL_KEY, '');
+        for (const notice of [...skipNotices]) if (notice.startsWith('feed:')) clearSkip(notice);
+        wakeSoon(); lastConfigState = null; refreshConfigRows(currentViewState());
+    }
+    function feedDisplayNumber(value, places = 1) {
+        return value == null || !Number.isFinite(Number(value)) ? '待确认' : Number(Number(value).toFixed(places)).toLocaleString();
+    }
+    function renderFeedStock(body, state, itemId) {
+        if (!itemId) return;
+        const inputs = feedInputs(state, itemId), quantity = inventoryQty(state, itemId);
+        if (!inputs.length) {
+            body.appendChild(uiElement('p', 'rlt-feed-mix-note', `库存 ${quantity} 件 · 每件份数与单位品质分待确认`)); return;
+        }
+        let rows;
+        try { rows = inputs.map(input => ({ input, free: Math.max(0, Math.floor(feedFreeQuantity(state, input))) })); }
+        catch (error) { body.appendChild(uiElement('p', 'rlt-feed-mix-note', `库存可用量待确认：${error.message}`)); return; }
+        const free = rows.reduce((sum, row) => sum + row.free, 0), units = rows.reduce((sum, row) => sum + row.free * Number(row.input.units), 0);
+        body.appendChild(uiElement('p', 'rlt-feed-mix-note', `可用 ${free} / 库存 ${quantity} 件 · 可换 ${feedDisplayNumber(units)} 份`));
+        const detail = row => `${row.input.quality_name || `品质 ${Number(row.input.quality || 0)}`}：${row.input.units} 份/件 · 单位品质分 ${feedDisplayNumber(feedUnitScore(row.input))} · 可用 ${row.free} 件`;
+        if (rows.length === 1) body.appendChild(uiElement('p', 'rlt-feed-mix-note', detail(rows[0])));
+        else {
+            const details = uiElement('details', 'rlt-feed-stock');
+            details.appendChild(uiElement('summary', '', `${rows.length} 种品质的换算与库存`));
+            for (const row of rows) details.appendChild(uiElement('p', 'rlt-feed-mix-note', detail(row)));
+            body.appendChild(details);
+        }
+    }
+    function renderFeedMixEditor(body, state) {
+        const saved = String(CONFIG.feed.mix || '[]'), configured = configuredFeedMix();
+        if (!feedMixDraft || (!feedMixDraft.dirty && feedMixDraft.source !== saved)) {
+            feedMixDraft = { source: saved, rows: configured.rows.map(row => ({ itemId: String(row.itemId), weight: Number(row.weight) })), dirty: false };
+        }
+        const editor = uiElement('div', 'rlt-feed-mix'); editor.dataset.feedMix = 'editor';
+        editor.appendChild(uiElement('strong', '', '自定义组合'));
+        editor.appendChild(uiElement('p', 'rlt-feed-mix-note', '按新增饲料份数分配，实际件数取决于每件换算。填写正权重，自动折算成 100%；最多 6 种物品。'));
+        const list = uiElement('div'), summary = uiElement('p', 'rlt-feed-mix-note'), notice = uiElement('p', 'rlt-note');
+        summary.dataset.feedMixSummary = 'true'; notice.dataset.feedMixDraft = 'true';
+        const actions = uiElement('div', 'rlt-feed-mix-actions');
+        const add = uiElement('button', '', '添加成分'), apply = uiElement('button', 'rlt-craft-primary', '应用组合'), cancel = uiElement('button', '', '取消编辑');
+        add.dataset.feedMixAction = 'add'; apply.dataset.feedMixAction = 'apply'; cancel.dataset.feedMixAction = 'cancel';
+        let controls = [];
+        const validate = () => {
+            const rows = feedMixDraft.rows;
+            if (!rows.length) return '请添加至少一种物品';
+            if (rows.length > 6) return '最多配置 6 种物品';
+            if (rows.some(row => !row.itemId)) return '请选择每项的物品';
+            if (new Set(rows.map(row => row.itemId)).size !== rows.length) return '同一种物品只需添加一次';
+            if (rows.some(row => !Number.isInteger(row.weight) || row.weight < 1 || row.weight > 100)) return '份数占比请填写 1～100 的整数权重';
+            return '';
         };
-        body.appendChild(row);
-        if (CONFIG.feed.itemId && !selected.confirmed) body.appendChild(uiElement('p', 'rlt-warning', '所选物品尚未在本次游戏版本的可投喂列表中出现，等待游戏确认后再补充。'));
-        else if (!selected.entry) body.appendChild(uiElement('p', 'rlt-note', `商店暂无「${selected.name}」，将使用可用库存；不足时等待补货或加工完成。`));
-        renderFeedQuality(body, state, selected);
+        const update = () => {
+            const reason = validate(), rows = feedMixDraft.rows, total = rows.reduce((sum, row) => sum + (Number(row.weight) > 0 ? Number(row.weight) : 0), 0);
+            summary.textContent = reason || `总配比 ${rows.map(row => row.weight).join(' : ')} · 按份数折算为 100%`;
+            notice.textContent = feedMixDraft.dirty ? '草稿尚未应用；自动补料仍使用已保存的组合。' : '以下库存预览使用已保存的组合。';
+            apply.disabled = !!reason || !feedMixDraft.dirty; cancel.disabled = !feedMixDraft.dirty; add.disabled = rows.length >= 6;
+            for (const [index, control] of controls.entries()) {
+                control.percent.textContent = total > 0 && rows[index].weight > 0 ? `折算 ${feedDisplayNumber(rows[index].weight / total * 100)}%` : '占比待填写';
+                for (const option of control.select.options || control.select.children) option.disabled = !!option.value && rows.some((row, other) => other !== index && row.itemId === option.value);
+            }
+        };
+        const renderRows = () => {
+            list.replaceChildren(); controls = [];
+            const choices = feedChoices(state);
+            feedMixDraft.rows.forEach((entry, index) => {
+                const card = uiElement('div', 'rlt-feed-mix-row'); card.dataset.feedMixRow = String(index);
+                const head = uiElement('div', 'rlt-feed-mix-heading'), remove = uiElement('button', '', '移除');
+                remove.setAttribute('aria-label', `移除第 ${index + 1} 项成分`); remove.dataset.feedMixAction = 'remove';
+                remove.onclick = () => { feedMixDraft.rows.splice(index, 1); feedMixDraft.dirty = true; renderRows(); };
+                head.append(uiElement('strong', '', `成分 ${index + 1}`), remove); card.appendChild(head);
+                const { row, select } = makeSelectRow(`组合物品 ${index + 1}`, '只能选择游戏已确认可投喂的物品；耗尽或暂不可用的已选项会保留');
+                fillSelect(select, choices.map(item => ({ value: item.itemId, text: item.name })), entry.itemId || null, '请选择物品');
+                select.onchange = () => { entry.itemId = select.value; feedMixDraft.dirty = true; renderRows(); };
+                card.appendChild(row);
+                const control = makeControlRow('份数占比'), input = makeNumberInput(entry.weight, { min: 1, max: 100, width: '72px', title: `份数占比 ${index + 1}` });
+                input.dataset.feedMixWeight = String(index);
+                const percent = uiElement('small');
+                input.oninput = input.onchange = () => { entry.weight = Number(input.value); feedMixDraft.dirty = true; update(); };
+                control.row.append(control.label, input, percent); card.appendChild(control.row);
+                renderFeedStock(card, state, entry.itemId); list.appendChild(card); controls.push({ select, percent });
+            });
+            update();
+        };
+        add.onclick = () => { if (feedMixDraft.rows.length < 6) { feedMixDraft.rows.push({ itemId: '', weight: 50 }); feedMixDraft.dirty = true; renderRows(); } };
+        cancel.onclick = () => { feedMixDraft = { source: String(CONFIG.feed.mix || '[]'), rows: configuredFeedMix().rows.map(row => ({ itemId: String(row.itemId), weight: Number(row.weight) })), dirty: false }; renderRows(); };
+        apply.onclick = () => {
+            if (validate()) return;
+            const next = JSON.stringify(feedMixDraft.rows.map(row => ({ itemId: row.itemId, weight: row.weight })));
+            setSetting('feed.mix', next); feedMixDraft.source = next; feedMixDraft.dirty = false; refreshFeedControls();
+        };
+        actions.append(add, apply, cancel); editor.append(list, summary, notice, actions); body.appendChild(editor); renderRows();
+    }
+    function renderFeedChoice(body, state) {
+        const mode = feedMode(), selection = feedSelection(state), choices = feedChoices(state);
+        const { row: modeRow, select: modeSelect } = makeSelectRow('投喂方式', '自动保质仅使用已确认的饲料类物品；自定义组合可明确选择农产品');
+        fillSelect(modeSelect, [{ value: 'smart', text: '自动保质配料' }, { value: 'mix', text: '自定义份数配比' }, { value: 'single', text: '单一物品' }], mode, '请选择');
+        modeSelect.onchange = () => {
+            if (!['smart', 'mix', 'single'].includes(modeSelect.value)) { modeSelect.value = feedMode(); return; }
+            setSetting('feed.mode', modeSelect.value); modeSelect.blur(); refreshFeedControls();
+        };
+        body.appendChild(modeRow);
+        if (mode === 'mix') renderFeedMixEditor(body, state);
+        else if (mode === 'single') {
+            const selected = selectedFeed(state), { row, select } = makeSelectRow('投喂物品', '只使用此物品的可用品质；无法达标时等待');
+            fillSelect(select, choices.map(item => ({ value: item.itemId, text: `${item.name} · 库存 ${inventoryQty(state, item.itemId)} 件` })), CONFIG.feed.itemId || null, '均衡饲料（默认）');
+            select.onchange = () => { setSetting('feed.itemId', select.value); select.blur(); refreshFeedControls(); };
+            body.appendChild(row); renderFeedStock(body, state, selected.itemId);
+        } else {
+            body.appendChild(uiElement('p', 'rlt-note', '从游戏已确认、名称包含“饲料”的物品中自动配料。南瓜等农产品须在自定义组合或单一物品中明确选择。'));
+            for (const item of selection.items || []) {
+                const card = uiElement('div', 'rlt-work'); card.dataset.feedCandidate = String(item.itemId);
+                card.appendChild(uiElement('strong', '', item.name || item.itemId)); renderFeedStock(card, state, item.itemId); body.appendChild(card);
+            }
+        }
+        if (selection.reason) body.appendChild(uiElement('p', 'rlt-warning', selection.reason));
+        renderFeedQuality(body, state);
     }
     function feedThresholds(slot) {
         const capacity = Number(slot?.capacity);
@@ -5647,15 +5765,17 @@
             const key = `${input.item_id}:${Number(input.quality || 0)}`;
             const previous = groups.get(key);
             if (!previous) groups.set(key, { input, conflict: false });
-            else if (Number(previous.input.units) !== Number(input.units) || (CONFIG.feed.qualityTargetEnabled &&
-                feedUnitScore(previous.input) !== feedUnitScore(input))) previous.conflict = true;
+            else if (Number(previous.input.units) !== Number(input.units) ||
+                feedUnitScore(previous.input) !== feedUnitScore(input)) previous.conflict = true;
         }
         // 同一品质是同一库存栈，重复条目不能重复计算库存；换算量冲突则等待兼容数据。
         return [...groups.values()].filter(row => !row.conflict).map(row => row.input);
     }
     function feedFreeQuantity(state, input) {
         const stacks = (state.inventory || []).filter(item => sameId(item.item_id, input.item_id));
-        const rows = reservedStacksForItem(state, stacks, craftingInputReserves(state), { dedicatedFeed: selectedFeed(state).name === BALANCED_FEED_NAME });
+        const entry = (state.shop || []).find(row => sameId(shopEntryItemId(row), input.item_id));
+        const name = input.item?.name || input.name || itemMetadata(state, input.item_id)?.name || entry?.item?.name || entry?.name;
+        const rows = reservedStacksForItem(state, stacks, craftingInputReserves(state), { dedicatedFeed: name === BALANCED_FEED_NAME });
         return rows.filter(row => Number(row.item.quality || 0) === Number(input.quality || 0))
             .reduce((sum, row) => sum + row.free, 0);
     }
@@ -5678,6 +5798,60 @@
         const value = Number(input.unit_score);
         return Number.isFinite(value) && value >= 0 ? value : null;
     }
+    function feedMode() {
+        return ['smart', 'mix', 'single'].includes(CONFIG.feed.mode) ? CONFIG.feed.mode : 'smart';
+    }
+    function feedGoal() {
+        const goal = Number(CONFIG.feed.qualityTarget);
+        return Number.isFinite(goal) ? Math.max(41, goal) : 45;
+    }
+    function configuredFeedMix() {
+        let raw;
+        try { raw = JSON.parse(CONFIG.feed.mix); } catch { return { rows: [], valid: false, reason: '组合配比格式无效，请重新应用' }; }
+        if (!Array.isArray(raw) || !raw.length || raw.length > 6) return { rows: [], valid: false, reason: '请选择 1 至 6 种投料物品并应用组合' };
+        const rows = [], ids = new Set();
+        for (const row of raw) {
+            const itemId = typeof row?.itemId === 'string' ? row.itemId.trim() : '', weight = Number(row?.weight);
+            if (!itemId || ids.has(itemId) || !Number.isSafeInteger(weight) || weight < 1 || weight > 100) {
+                return { rows: [], valid: false, reason: '每种物品只能选择一次，份数占比须为 1 至 100' };
+            }
+            ids.add(itemId); rows.push({ itemId, weight });
+        }
+        return { rows, valid: true, reason: '' };
+    }
+    function feedSelection(state) {
+        const mode = feedMode(), choices = feedChoices(state);
+        const describe = row => {
+            const itemId = row.itemId, choice = choices.find(item => sameId(item.itemId, itemId));
+            const entry = (state.shop || []).find(item => sameId(shopEntryItemId(item), itemId) &&
+                !item.locked && item.unlocked !== false && item.id != null) || null;
+            return { ...row, name: choice?.name || itemMetadata(state, itemId)?.name || `物品 #${itemId}`,
+                entry, confirmed: !!choice };
+        };
+        let items, reason = '';
+        if (mode === 'single') items = [selectedFeed(state)];
+        else if (mode === 'mix') {
+            const mix = configuredFeedMix(); reason = mix.reason; items = mix.rows.map(describe);
+            if (mix.valid && items.some(item => !item.confirmed)) reason = '组合中的部分物品尚未出现在当前游戏的可投喂列表，等待确认';
+        } else {
+            items = choices.filter(item => item.name.includes('饲料')).map(describe);
+            const entry = balancedFeedEntry(state), id = shopEntryItemId(entry);
+            if (id != null && !items.some(item => sameId(item.itemId, id))) {
+                items.unshift({ itemId: id, name: BALANCED_FEED_NAME, entry, confirmed: true });
+            }
+            if (!items.length) reason = '暂无已确认的饲料类物品，请入库后同步，或明确配置自定义组合';
+        }
+        const ids = new Set(items.filter(item => item.itemId != null).map(item => String(item.itemId)));
+        return { mode, items, reason, inputs: feedInputs(state).filter(input => ids.has(String(input.item_id))),
+            name: mode === 'smart' ? '自动保质' : mode === 'mix' ? '自定义组合' : items[0]?.name || BALANCED_FEED_NAME };
+    }
+    function feedPlan(state, target) {
+        const selection = feedSelection(state), slot = state.aquatic?.feed_slot;
+        if (selection.reason) return { feasible: false, deposits: [], units: Number(slot?.units), quality: Number(slot?.quality_score),
+            room: Number(slot?.capacity) - Number(slot?.units), missing: Math.max(0, target - Number(slot?.units)), reason: selection.reason };
+        return selection.mode === 'mix' ? feedMixPlan(state, selection.inputs, target, configuredFeedMix().rows) :
+            feedQualityPlan(state, selection.inputs, target);
+    }
     function feedSettingsSignature() { return JSON.stringify(CONFIG.feed); }
     function feedWriteGuard(state, revision, signature, build, onReady) {
         return () => {
@@ -5692,7 +5866,7 @@
     // 使用各品质的安全库存；只读计算，不假设品质编号等于单位品质分。
     function feedQualityPlan(state, inputs, target) {
         const slot = state.aquatic?.feed_slot, units = Number(slot?.units), capacity = Number(slot?.capacity);
-        const desired = Number(CONFIG.feed.qualityTarget), current = units === 0 ? 0 : feedUnitScore({ unit_score: slot?.quality_score });
+        const desired = feedGoal(), current = units === 0 ? 0 : feedUnitScore({ unit_score: slot?.quality_score });
         const result = { feasible: false, deposits: [], units, quality: current, missing: Math.max(0, target - units), room: capacity - units, reason: '' };
         if (!Number.isFinite(units) || units < 0 || !Number.isFinite(capacity) || capacity < units || current == null ||
             !Number.isFinite(desired) || desired < 0 || !Number.isFinite(target)) {
@@ -5763,7 +5937,7 @@
         }
         const deposits = new Map();
         for (let part = best.plan.tail; part; part = part.previous) {
-            const key = Number(part.input.quality || 0), previous = deposits.get(key);
+            const key = `${part.input.item_id}:${Number(part.input.quality || 0)}`, previous = deposits.get(key);
             deposits.set(key, { input: part.input, count: (previous?.count || 0) + part.count });
         }
         // 高分先投入：已经达标时，每一步都不低于目标；原先未达标时先提高平均分。
@@ -5771,6 +5945,199 @@
         result.feasible = true; result.units = units + best.amount; result.quality = best.quality;
         result.missing = Math.max(0, target - result.units); result.room = capacity - result.units;
         if (result.missing > 0) result.reason = '可用品质库存不足以补到水位目标';
+        return result;
+    }
+    // 混合比例按本次新增份数计算。总量只检查水位、库存/品质拐点及整件边界，不逐份穷举大槽。
+    function feedMixPlan(state, inputs, target, mixRows) {
+        const slot = state.aquatic?.feed_slot, units = Number(slot?.units), capacity = Number(slot?.capacity);
+        const goal = feedGoal(), current = units === 0 ? 0 : feedUnitScore({ unit_score: slot?.quality_score });
+        const result = { feasible: false, deposits: [], units, quality: current,
+            missing: Math.max(0, target - units), room: capacity - units, reason: '', mixBreakdown: [] };
+        if (!Number.isFinite(units) || units < 0 || !Number.isFinite(capacity) || capacity < units || current == null ||
+            !Number.isFinite(goal) || goal <= 40 || !Number.isFinite(target) || !Array.isArray(mixRows) ||
+            !mixRows.length || mixRows.length > 6 || mixRows.some(row => !row || row.itemId == null ||
+                !Number.isFinite(Number(row.weight)) || Number(row.weight) <= 0) ||
+            new Set(mixRows.map(row => String(row.itemId))).size !== mixRows.length) {
+            result.reason = '混合比例、饲料品质或容量数据不完整，等待确认'; return result;
+        }
+        const room = capacity - units, wanted = Math.max(0, target - units), epsilon = 1e-7;
+        if (!wanted && current >= goal) { result.feasible = true; return result; }
+        if (room <= 0) { result.reason = '饲料槽已满，等待消耗腾出空间后按比例提升品质'; return result; }
+        const weightTotal = mixRows.reduce((sum, row) => sum + Number(row.weight), 0);
+        if (!Number.isFinite(weightTotal)) { result.reason = '混合比例超出可计算范围'; return result; }
+        const items = mixRows.map(row => ({ itemId: String(row.itemId), weight: Number(row.weight),
+            ratio: Number(row.weight) / weightTotal, rows: [], stock: 0, minUnit: Infinity, maxUnit: 0 }));
+        const byId = new Map(items.map(item => [item.itemId, item])), stacks = new Map();
+        for (const input of inputs || []) {
+            if (!byId.has(String(input?.item_id))) continue;
+            const perItem = Number(input.units), score = feedUnitScore(input), quality = Number(input.quality || 0);
+            if (!Number.isFinite(perItem) || perItem <= 0 || score == null || !Number.isFinite(quality)) continue;
+            const key = `${input.item_id}:${quality}`, prior = stacks.get(key);
+            if (prior) {
+                if (prior.perItem !== perItem || prior.score !== score) prior.conflict = true;
+                continue;
+            }
+            stacks.set(key, { input, perItem, score, conflict: false });
+        }
+        for (const row of stacks.values()) {
+            if (row.conflict) continue;
+            const count = Math.min(Math.floor(feedFreeQuantity(state, row.input)), Math.floor(room / row.perItem));
+            if (!Number.isSafeInteger(count) || count <= 0 || !Number.isFinite(count * row.perItem)) continue;
+            const item = byId.get(String(row.input.item_id));
+            item.rows.push({ ...row, count }); item.stock += count * row.perItem;
+            item.minUnit = Math.min(item.minUnit, row.perItem); item.maxUnit = Math.max(item.maxUnit, row.perItem);
+        }
+        if (items.some(item => !item.rows.length || !Number.isFinite(item.stock) || !(item.ratio > 0))) {
+            result.reason = '每种正占比饲料都需有安全库存及已确认品质分，等待补充'; return result;
+        }
+        for (const item of items) item.rows.sort((a, b) => b.score - a.score || a.perItem - b.perItem);
+        const minimum = items.reduce((sum, item) => sum + item.minUnit, 0);
+        if (minimum > room + epsilon) { result.reason = '剩余容量装不下每种饲料各一件，等待消耗'; return result; }
+        let work = 0, exhausted = false;
+        const budget = () => { if (++work > 1200000) exhausted = true; return !exhausted; };
+        // 精确等比的连续上界、各品质耗尽点以及品质达标交点，定位值得检查的整件总量。
+        const exactMax = Math.min(room, ...items.map(item => item.stock / item.ratio));
+        const looseMax = Math.min(room, ...items.map(item => (item.stock + item.maxUnit) / item.ratio));
+        const breaks = new Set([0, exactMax]), references = [Math.min(room, wanted), looseMax, exactMax, minimum];
+        for (const item of items) {
+            let amount = 0;
+            for (const row of item.rows) {
+                amount += row.count * row.perItem;
+                const value = amount / item.ratio;
+                if (value > 0 && value < exactMax) breaks.add(value);
+            }
+        }
+        const margin = total => {
+            let value = units * (current - goal);
+            for (const item of items) {
+                let remaining = total * item.ratio;
+                for (const row of item.rows) {
+                    const amount = Math.min(remaining, row.count * row.perItem);
+                    value += amount * (row.score - goal); remaining -= amount;
+                    if (remaining <= epsilon) break;
+                }
+            }
+            return value;
+        };
+        const ordered = [...breaks].sort((a, b) => a - b);
+        for (let index = 1; index < ordered.length; index++) {
+            const left = ordered[index - 1], right = ordered[index], a = margin(left), b = margin(right);
+            if (!Number.isFinite(a) || !Number.isFinite(b)) { result.reason = '混合品质数据超出可计算范围'; return result; }
+            if (a === 0 && left > 0) references.push(left);
+            if ((a < 0 && b >= 0) || (a >= 0 && b < 0)) references.push(left + (right - left) * -a / (b - a));
+        }
+        references.push(...ordered.filter(value => value > 0).sort((a, b) => Math.abs(a - wanted) - Math.abs(b - wanted)));
+        const totals = [], seenTotals = new Set();
+        const addTotal = value => {
+            if (!Number.isFinite(value) || value <= 0 || value > room + epsilon || totals.length >= 96) return;
+            const number = Math.min(room, value), key = number.toPrecision(14);
+            if (!seenTotals.has(key)) { seenTotals.add(key); totals.push(number); }
+        };
+        for (const reference of references) addTotal(reference);
+        for (const reference of references) for (const item of items) for (const row of item.rows) {
+            const count = reference * item.ratio / row.perItem;
+            for (const offset of [-1, 0, 1, 2]) addTotal((Math.floor(count) + offset) * row.perItem / item.ratio);
+        }
+        // 每项只留少量不同份数的整件方案；同份数优先分值最高者。
+        const trim = (values, limit, desired) => {
+            const byAmount = new Map();
+            for (const value of values) {
+                const key = `${value.amount.toPrecision(14)}:${value.maxUnit}`, previous = byAmount.get(key);
+                if (!previous || value.score > previous.score) byAmount.set(key, value);
+            }
+            const all = [...byAmount.values()];
+            if (all.length <= limit) return all;
+            const chosen = new Set();
+            const take = (rows, count) => { for (const row of rows.slice(0, count)) chosen.add(row); };
+            take([...all].sort((a, b) => Math.abs(a.amount - desired) - Math.abs(b.amount - desired) || b.score - a.score), limit / 2);
+            take([...all].sort((a, b) => (b.score - goal * b.amount) - (a.score - goal * a.amount)), limit / 4);
+            take([...all].sort((a, b) => a.amount - b.amount), limit / 8);
+            take([...all].sort((a, b) => b.amount - a.amount), limit / 8);
+            return [...chosen];
+        };
+        const optionsFor = (item, total) => {
+            const desired = total * item.ratio, upper = Math.min(room, item.stock, desired + item.maxUnit);
+            let values = [{ amount: 0, score: 0, maxUnit: 0, parts: [] }];
+            for (const row of item.rows) {
+                const next = [];
+                for (const value of values) {
+                    const maximum = Math.min(row.count, Math.floor((upper - value.amount + epsilon) / row.perItem));
+                    if (maximum < 0) continue;
+                    const floor = Math.floor(Math.max(0, desired - value.amount) / row.perItem);
+                    const counts = maximum <= 8 ? Array.from({ length: maximum + 1 }, (_, index) => index) :
+                        [0, Math.min(maximum, Math.max(0, floor - 1)), Math.min(maximum, floor), Math.min(maximum, floor + 1), maximum];
+                    for (const count of new Set(counts)) {
+                        if (!budget()) return [];
+                        const amount = value.amount + count * row.perItem, score = value.score + count * row.perItem * row.score;
+                        if (!Number.isFinite(amount) || !Number.isFinite(score) || amount > room + epsilon) continue;
+                        next.push({ amount, score, maxUnit: count ? Math.max(value.maxUnit, row.perItem) : value.maxUnit,
+                            parts: count ? [...value.parts, { input: row.input, count }] : value.parts });
+                    }
+                }
+                values = trim(next, 24, desired);
+            }
+            return trim(values.filter(value => value.amount > 0 && Math.abs(value.amount - desired) <= value.maxUnit + epsilon), 16, desired);
+        };
+        let best = null;
+        for (const total of totals) {
+            if (exhausted) break;
+            let combinations = [{ amount: 0, score: 0, lower: 0, upper: room, selected: [] }], processedRatio = 0;
+            for (const item of items) {
+                processedRatio += item.ratio;
+                const options = optionsFor(item, total), next = [];
+                for (const previous of combinations) for (const option of options) {
+                    if (!budget()) break;
+                    const amount = previous.amount + option.amount;
+                    const lower = Math.max(previous.lower, (option.amount - option.maxUnit) / item.ratio);
+                    const upper = Math.min(previous.upper, (option.amount + option.maxUnit) / item.ratio);
+                    if (lower > upper + epsilon || amount > upper + epsilon || amount > room + epsilon) continue;
+                    next.push({ amount, score: previous.score + option.score, lower, upper, selected: [...previous.selected, option] });
+                }
+                // 同总量的分配也可能具有不同可接受比例区间，不能只按总量合并掉另一条路线。
+                next.sort((a, b) => Math.abs(a.amount - total * processedRatio) -
+                    Math.abs(b.amount - total * processedRatio) ||
+                    (b.score - goal * b.amount) - (a.score - goal * a.amount));
+                if (next.length > 128) {
+                    const quality = [...next].sort((a, b) => (b.score - goal * b.amount) - (a.score - goal * a.amount));
+                    combinations = [...new Set([...next.slice(0, 96), ...quality.slice(0, 32)])];
+                } else combinations = next;
+                if (!combinations.length || exhausted) break;
+            }
+            for (const value of combinations) {
+                if (value.selected.length !== items.length || value.amount < value.lower - epsilon || value.amount > value.upper + epsilon) continue;
+                const quality = (units * current + value.score) / (units + value.amount);
+                if (!Number.isFinite(quality) || quality + 1e-9 < goal || items.some((item, index) =>
+                    Math.abs(value.selected[index].amount - value.amount * item.ratio) > value.selected[index].maxUnit + epsilon)) continue;
+                const filled = value.amount + epsilon >= wanted;
+                const deviation = items.reduce((sum, item, index) => sum + Math.abs(value.selected[index].amount / value.amount - item.ratio), 0);
+                if (!best || (filled && !best.filled) || (filled === best.filled &&
+                    ((filled ? value.amount < best.amount - epsilon : value.amount > best.amount + epsilon) ||
+                    (Math.abs(value.amount - best.amount) <= epsilon && (deviation < best.deviation - 1e-12 ||
+                        (Math.abs(deviation - best.deviation) <= 1e-12 && quality > best.quality)))))) {
+                    best = { ...value, filled, quality, deviation };
+                }
+            }
+        }
+        if (!best) {
+            result.reason = exhausted ? '混合饲料组合过多，暂未找到同时符合比例和品质的方案' :
+                '现有安全库存与剩余容量暂无法确认同时满足混合比例和品质目标的方案'; return result;
+        }
+        const deposits = best.selected.flatMap(option => option.parts).sort((a, b) => feedUnitScore(b.input) - feedUnitScore(a.input));
+        let filledUnits = units, scoreTotal = units * current, previousScore = current;
+        for (const { input, count } of deposits) {
+            const amount = count * Number(input.units); filledUnits += amount; scoreTotal += amount * feedUnitScore(input);
+            const nextScore = scoreTotal / filledUnits;
+            if (filledUnits > capacity + epsilon || !Number.isFinite(nextScore) ||
+                (previousScore >= goal ? nextScore + 1e-9 < goal : nextScore + 1e-9 < previousScore)) {
+                result.reason = '混合饲料分步投入无法保持品质目标，等待重新规划'; return result;
+            }
+            previousScore = nextScore;
+        }
+        result.feasible = true; result.deposits = deposits; result.units = filledUnits; result.quality = scoreTotal / filledUnits;
+        result.missing = Math.max(0, target - filledUnits); result.room = Math.max(0, capacity - filledUnits);
+        result.mixBreakdown = items.map((item, index) => ({ itemId: item.itemId, weight: item.weight, ratio: item.ratio,
+            units: best.selected[index].amount, actualRatio: best.selected[index].amount / best.amount, tolerance: best.selected[index].maxUnit }));
+        if (result.missing > epsilon) result.reason = '当前可按比例保质补充部分饲料，其余等待库存或容量';
         return result;
     }
     function feedQualityProductKey(feed, build) { return `rlt-feed-quality-product:${build || ''}:${feed.itemId}:${feed.entry?.id}`; }
@@ -5799,25 +6166,285 @@
         let item = inventory.find(row => sameId(row.item_id, feed.itemId) && Number(row.quality || 0) === product.quality);
         if (item) item.quantity = Number(item.quantity || 0) + count;
         else inventory.push({ item_id: feed.itemId, name: feed.name, quality: product.quality, quantity: count });
-        const inputs = feedInputs(state, feed.itemId).map(input => ({ ...input }));
-        if (!inputs.some(input => Number(input.quality || 0) === product.quality)) {
+        const inputs = feedInputs(state).map(input => ({ ...input }));
+        if (!inputs.some(input => sameId(input.item_id, feed.itemId) && Number(input.quality || 0) === product.quality)) {
             inputs.push({ item_id: feed.itemId, item: { name: feed.name }, quality: product.quality,
                 units: product.units, unit_score: product.unit_score });
         }
         return { state: { ...state, inventory }, inputs };
     }
-    function renderFeedQuality(body, state, feed = selectedFeed(state)) {
+    const FEED_BATCH_KEY = 'rlt-feed-batch:v1';
+    function feedBatch() { return readJson(FEED_BATCH_KEY); }
+    function clearFeedBatch() { setOverride(FEED_BATCH_KEY, ''); }
+    function saveFeedBatch(batch) { setOverride(FEED_BATCH_KEY, JSON.stringify(batch)); }
+    function feedPurchaseAdvice(state, selection, plan, target, allowance, build) {
+        let candidate = null, reason = '';
+        const slot = state.aquatic.feed_slot;
+        const products = selection.items.map(feed => ({ feed, product: feedQualityProduct(state, feed, build) }));
+        for (const { feed, product } of products) {
+            const price = Number(feed.entry?.price);
+            if (!feed.confirmed || !feed.entry || !Number.isFinite(price) || price < 0 || price > allowance) continue;
+            if (!product) return { feed, count: 1, price };
+            if (product.quality == null || !(Number(product.units) > 0) || feedUnitScore(product) == null) reason = '已购买识别商品，等待游戏确认品质与份数，不会重复购买';
+        }
+        const known = products.filter(({ feed, product }) => feed.confirmed && feed.entry && product?.quality != null &&
+            Number(product.units) > 0 && feedUnitScore(product) != null && Number.isFinite(Number(feed.entry.price)) && Number(feed.entry.price) >= 0);
+        if (selection.mode === 'mix') {
+            const mix = configuredFeedMix().rows;
+            const stock = known.filter(({ feed }) => mix.some(row => sameId(row.itemId, feed.itemId)))
+                .map(row => ({ ...row, price: Number(row.feed.entry.price),
+                    limit: Math.min(100000, Number(row.feed.entry.price) > 0 ? Math.floor(allowance / Number(row.feed.entry.price)) : 100000) }));
+            if (!stock.length) return { reason: reason || '组合中暂无可确认的补货商品，等待库存' };
+            // 校准后的商品只进入采购模拟。真实投入仍必须读取购买响应中的官方 inputs。
+            const cache = new Map(); let evaluations = 0;
+            const evaluate = (counts, requested = target) => {
+                const key = `${requested}:${counts.join(',')}`;
+                if (cache.has(key)) return cache.get(key);
+                if (++evaluations > 80) return null;
+                let draft = state;
+                stock.forEach(({ feed, product }, index) => {
+                    if (!counts[index]) return;
+                    const next = feedQualityPurchaseState(draft, feed, product, counts[index]);
+                    draft = { ...next.state, aquatic: { ...draft.aquatic, feed_slot: { ...draft.aquatic.feed_slot, inputs: next.inputs } } };
+                });
+                const result = { state: draft, plan: feedMixPlan(draft, feedInputs(draft), requested, mix) };
+                cache.set(key, result); return result;
+            };
+            const improves = value => value?.plan.feasible && value.plan.deposits.length > 0 &&
+                (!plan.feasible || value.plan.units > plan.units + 1e-7);
+            const cost = counts => counts.reduce((sum, count, index) => sum + count * stock[index].price, 0);
+            const minimize = (maximum, requested = target) => {
+                let counts = [...maximum], value = evaluate(counts, requested);
+                if (!improves(value)) return null;
+                const requiredUnits = value.plan.units;
+                const sufficient = next => next?.plan.feasible && next.plan.units + 1e-7 >= requiredUnits;
+                // 大槽先按本次真实用量剪掉虚拟余货。差额也计入满足显式/默认保留量所需的补货。
+                const trimmed = stock.map(({ feed, product }, index) => {
+                    const input = feedInputs(value.state, feed.itemId).find(row => Number(row.quality || 0) === product.quality);
+                    if (!input) return counts[index];
+                    const used = value.plan.deposits.filter(row => sameId(row.input.item_id, feed.itemId) &&
+                        Number(row.input.quality || 0) === product.quality).reduce((sum, row) => sum + row.count, 0);
+                    return Math.min(counts[index], Math.max(0, Math.ceil(used + counts[index] - feedFreeQuantity(value.state, input))));
+                });
+                const trial = evaluate(trimmed, requested);
+                if (sufficient(trial)) { counts = trimmed; value = trial; }
+                // 重新规划允许使用原有的较低品质库存，不能因虚拟高品质太多而多买。
+                for (let index = 0; index < counts.length && evaluations < 80; index++) {
+                    if (!counts[index]) continue;
+                    const oneLess = [...counts]; oneLess[index]--;
+                    const adjacent = evaluate(oneLess, requested);
+                    if (!sufficient(adjacent)) continue; // 常见的精确缺口少一件即失败，大槽无需再做二分。
+                    counts = oneLess; value = adjacent;
+                    let low = 0, high = counts[index];
+                    while (low < high && evaluations < 80) {
+                        const mid = Math.floor((low + high) / 2), proposed = [...counts]; proposed[index] = mid;
+                        const next = evaluate(proposed, requested);
+                        if (sufficient(next)) { high = mid; counts = proposed; value = next; }
+                        else low = mid + 1;
+                    }
+                }
+                return { counts, value, cost: cost(counts) };
+            };
+            const maximum = stock.map(row => row.limit), full = minimize(maximum);
+            if (!full) return { reason: reason || '安全库存与已知商品无法组成符合比例和品质目标的补料方案' };
+            let chosen = full;
+            if (full.cost > allowance + 1e-7) {
+                // 先取得最小可行改善，再按同一预算向完整水位扩展；不分别给每种商品一份预算。
+                const base = plan.feasible ? plan.units : Number(slot.units);
+                const smallest = Math.min(...selection.inputs.map(input => Number(input.units)).filter(value => value > 0),
+                    ...stock.map(row => Number(row.product.units)));
+                const minimumTarget = Math.min(target, base + smallest);
+                const minimum = minimize(maximum, minimumTarget);
+                if (!minimum || minimum.cost > allowance + 1e-7) return { reason: '本轮共享预算不足以组成一批符合比例和品质目标的饲料' };
+                const extra = full.counts.map((count, index) => Math.max(0, count - minimum.counts[index]));
+                const extraCost = cost(extra), factor = extraCost > 0 ? Math.min(1, (allowance - minimum.cost) / extraCost) : 1;
+                const counts = minimum.counts.map((count, index) => count + Math.floor(extra[index] * factor));
+                // 补齐缩放后的整件尾差，最多逐商品检查一轮，不随库存规模循环。
+                const order = stock.map((_, index) => index).sort((a, b) =>
+                    (extra[b] * factor % 1) - (extra[a] * factor % 1) || stock[a].price - stock[b].price);
+                for (const index of order) if (counts[index] < full.counts[index] && cost(counts) + stock[index].price <= allowance + 1e-7) counts[index]++;
+                const partial = minimize(counts);
+                chosen = partial && partial.cost <= allowance + 1e-7 ? partial : minimum;
+            }
+            if (chosen.cost > allowance + 1e-7 || !improves(chosen.value)) return { reason: '组合采购仍需核对预算与品质，暂不购买' };
+            const index = chosen.counts.findIndex(count => count > 0);
+            if (index < 0) return { reason: '已有安全库存足够组成当前可行批次，无需补货' };
+            const { feed, price } = stock[index];
+            return { feed, price, count: Math.min(chosen.counts[index], CONFIG.feed.batchBuy ? 99 : 1) };
+        }
+        for (const { feed, product } of known) {
+            const price = Number(feed.entry.price), maximum = Math.min(100000, price > 0 ? Math.floor(allowance / price) : 100000);
+            if (maximum <= 0) continue;
+            const evaluate = count => {
+                const draft = feedQualityPurchaseState(state, feed, product, count);
+                draft.state = { ...draft.state, aquatic: { ...state.aquatic, feed_slot: { ...slot, inputs: draft.inputs } } };
+                return feedPlan(draft.state, target);
+            };
+            const full = evaluate(maximum);
+            if (!full.feasible || (plan.feasible && full.missing >= plan.missing)) continue;
+            let low = 1, high = maximum;
+            while (low < high) {
+                const mid = Math.floor((low + high) / 2), value = evaluate(mid);
+                if (value.feasible && value.missing <= full.missing) high = mid; else low = mid + 1;
+            }
+            const count = Math.min(low, CONFIG.feed.batchBuy ? 99 : 1);
+            if (!candidate || full.missing < candidate.missing || (full.missing === candidate.missing && count * price < candidate.count * candidate.price)) candidate = { feed, count, price, missing: full.missing };
+        }
+        return candidate || { reason: reason || '已确认商品无法改善品质目标，等待其他饲料库存' };
+    }
+    async function doCombinationFeed() {
+        const cfg = CONFIG.feed, signature = feedSettingsSignature(), build = detectedGameBuild();
+        let spent = 0;
+        const wait = reason => logSkip(`feed:mix:${reason}`, reason);
+        for (let attempt = 0; attempt < 12 && running && cfg.enabled && feedSettingsSignature() === signature; attempt++) {
+            const state = runtime.state, slot = state.aquatic?.feed_slot, revision = settingsRevision;
+            if (!slot || !(state.aquatic?.unlocked || state.livestock?.unlocked)) return;
+            const bounds = feedThresholds(slot), selection = feedSelection(state);
+            if (!bounds.valid || selection.reason) { wait(selection.reason || '饲料水位设置无效'); return; }
+            let batch = feedBatch();
+            if (batch && (batch.signature !== signature || batch.build !== build)) {
+                if (batch.phase !== 'ready') { wait('上次投料结果待核对，请在饲料页检查后重置批次'); return; }
+                clearFeedBatch(); batch = null;
+            }
+            if (batch && batch.phase !== 'ready') { wait('上次投料结果待核对，请在饲料页检查后重置批次'); return; }
+            if (batch) {
+                if (!Array.isArray(batch.remaining) || !batch.remaining.length) { clearFeedBatch(); continue; }
+                const step = batch.remaining[0], input = feedInputs(state, step.itemId).find(row => Number(row.quality || 0) === step.quality);
+                const current = Number(slot.units) === 0 ? 0 : feedUnitScore({ unit_score: slot.quality_score });
+                if (!Number.isSafeInteger(step.count) || step.count <= 0 || !input || feedUnitScore(input) == null || Number(input.units) !== step.units || feedUnitScore(input) !== step.score || current == null) {
+                    wait('本批剩余成分品质或换算已变化，请核对并重置投料批次'); return;
+                }
+                if (Math.floor(feedFreeQuantity(state, input)) < step.count) { wait('本批剩余成分库存不足或已预留，等待补充，或在饲料页放弃剩余并重算'); return; }
+                const added = step.count * step.units, total = Number(slot.units) + added;
+                const score = (Number(slot.units) * current + added * step.score) / total;
+                if (total > Number(slot.capacity) || !(score + 1e-9 >= feedGoal() || (current < feedGoal() && score >= current && step.score > feedGoal()))) {
+                    wait('当前容量或品质已变化，本批剩余成分暂不能安全投料'); return;
+                }
+                try {
+                    await depositFeed(step.itemId, step.quality, step.count, feedWriteGuard(state, revision, signature, build, () => saveFeedBatch({ ...batch, phase: 'submitting' })));
+                    if (!(Number(runtime.state.aquatic?.feed_slot?.units) > Number(slot.units))) { saveFeedBatch({ ...batch, phase: 'uncertain' }); wait('投料响应未确认增加，请核对本批'); return; }
+                    batch = { ...batch, phase: 'ready', remaining: batch.remaining.slice(1) };
+                    if (batch.remaining.length) saveFeedBatch(batch); else clearFeedBatch();
+                    const fresh = feedUnitScore({ unit_score: runtime.state.aquatic?.feed_slot?.quality_score });
+                    log(`组合投料：${input.item?.name || step.itemId} ×${step.count}（${added} 份），槽品质 ${fresh == null ? '待确认' : fresh.toFixed(1)}`);
+                    if (fresh == null || fresh + 1e-9 < Math.min(feedGoal(), score)) { wait('服务器品质与预估不符，等待核对'); return; }
+                    continue;
+                } catch (error) {
+                    saveFeedBatch({ ...batch, phase: error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived) ? 'ready' : 'uncertain' });
+                    if (error.code === 'feed_replan') return;
+                    if (shouldAbortTick(error)) throw error;
+                    wait(`组合投料失败：${error.message}`); return;
+                }
+            }
+            const current = Number(slot.units) === 0 ? 0 : feedUnitScore({ unit_score: slot.quality_score });
+            if (current == null) { wait('饲料槽品质数据待确认'); return; }
+            const qualityLow = current + 1e-9 < feedGoal();
+            if (!qualityLow && Number(slot.units) >= bounds.target) { setOverride(FEED_FILL_KEY, ''); return; }
+            if (!qualityLow && Number(slot.units) > bounds.low && getOverride(FEED_FILL_KEY) !== '1') return;
+            localStorage.setItem(FEED_FILL_KEY, '1');
+            const plan = feedPlan(state, bounds.target);
+            if ((!plan.feasible || plan.missing > 0) && cfg.autoBuy && attempt < 11 && plan.room > 0) {
+                const allowance = cfg.maxSpendPerTick > 0 ? Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent)) : 0;
+                const advice = allowance > 0 ? feedPurchaseAdvice(state, selection, plan, bounds.target, allowance, build) : { reason: '本轮预算或金币保底不足' };
+                if (advice.count > 0) {
+                    const { feed, count, price } = advice, key = feedQualityProductKey(feed, build);
+                    const product = feedQualityProduct(state, feed, build), before = feedPurchaseSnapshot(state, feed.itemId);
+                    const evidence = { ...product, attempted: true, before: { inventory: [...before.inventory], inputs: [...before.inputs] }, quantity: count };
+                    const previous = getOverride(key), submitted = JSON.stringify(evidence); let saved = false;
+                    try {
+                        await buyItem(feed.entry.id, count, feedWriteGuard(state, revision, signature, build, () => { setOverride(key, submitted); saved = true; }));
+                        const observed = identifyPurchasedFeed(before, runtime.state, feed.itemId, count);
+                        const purchased = observed ? { ...evidence, ...observed } : { ...evidence, quality: null, units: 0, unit_score: null };
+                        const input = feedInputs(runtime.state, feed.itemId).find(row => purchased.quality != null && Number(row.quality || 0) === purchased.quality);
+                        if (input) { purchased.units = Number(input.units); purchased.unit_score = feedUnitScore(input); }
+                        setOverride(key, JSON.stringify(purchased)); spent += price * count;
+                        log(`组合补货：${feed.name} ×${count}（${price * count} 金币）`);
+                        if (!observed) { wait('购买品质尚未确认，暂停重复购买'); return; }
+                        continue;
+                    } catch (error) {
+                        if (saved && getOverride(key) === submitted && (error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived))) setOverride(key, previous);
+                        if (error.code === 'feed_replan') return;
+                        if (shouldAbortTick(error)) throw error;
+                        wait(`组合补货失败：${error.message}`); return;
+                    }
+                }
+                if (!plan.feasible && advice.reason) wait(advice.reason);
+            }
+            if (plan.feasible && plan.deposits.length) {
+                saveFeedBatch({ version: 1, signature, build, phase: 'ready', remaining: plan.deposits.map(({ input, count }) => ({ itemId: input.item_id, quality: Number(input.quality || 0), count, units: Number(input.units), score: feedUnitScore(input) })) });
+                continue;
+            }
+            if (plan.reason) wait(plan.reason);
+            return;
+        }
+    }
+    function renderFeedQuality(body, state) {
         const slot = state.aquatic?.feed_slot;
         if (!slot) return;
-        const format = value => value == null || !Number.isFinite(value) ? '待确认' : Number(value.toFixed(1)).toLocaleString();
-        const current = feedUnitScore({ unit_score: slot.quality_score }), inputs = feedInputs(state, feed.itemId);
-        const bounds = feedThresholds(slot);
-        const plan = CONFIG.feed.qualityTargetEnabled && bounds.valid ? feedQualityPlan(state, inputs, bounds.target) : null;
+        const selection = feedSelection(state), current = feedUnitScore({ unit_score: slot.quality_score });
+        const bounds = feedThresholds(slot), format = feedDisplayNumber;
+        let plan = null;
+        try { if (bounds.valid) plan = feedPlan(state, bounds.target); }
+        catch { plan = { feasible: false, deposits: [], reason: '库存保护或配料数据待确认，暂不能生成投喂预览' }; }
         const rate = Number(slot.hourly_rate), endurance = units => Number.isFinite(rate) && rate > 0
             ? durationLabel(units / rate * 3600) : rate === 0 ? '暂无消耗' : '待确认';
-        body.appendChild(uiElement('p', 'rlt-note', `品质分 ${format(current)}${CONFIG.feed.qualityTargetEnabled ? ` · 目标 ${format(Number(CONFIG.feed.qualityTarget))}` : ''}${plan?.deposits.length ? ` · 库存投喂后 ${format(plan.quality)}` : ''}`));
-        body.appendChild(uiElement('p', 'rlt-note', `当前续航 ${endurance(Number(slot.units))}${plan?.deposits.length ? ` → ${endurance(plan.units)}` : ''}`));
-        if (plan?.reason) body.appendChild(uiElement('p', 'rlt-warning', plan.reason));
+        const card = uiElement('div', 'rlt-feed-preview'); card.dataset.feedPreview = 'true';
+        card.appendChild(uiElement('strong', '', selection.mode === 'mix' ? '已应用组合 · 库存补料预览' : '库存补料预览'));
+        const deposits = plan?.feasible ? plan.deposits || [] : [], hasDeposit = deposits.length > 0;
+        card.appendChild(uiElement('p', 'rlt-note', `品质分 ${format(current)}${hasDeposit ? ` → ${format(plan.quality)}` : ''} · 目标 ≥ ${format(feedGoal())}`));
+        card.appendChild(uiElement('p', 'rlt-note', `槽内 ${format(Number(slot.units))}${hasDeposit ? ` → ${format(plan.units)}` : ''} / ${format(Number(slot.capacity))} 份`));
+        card.appendChild(uiElement('p', 'rlt-note', `续航 ${endurance(Number(slot.units))}${hasDeposit ? ` → ${endurance(plan.units)}` : ''}`));
+        if (hasDeposit) {
+            const grouped = new Map();
+            for (const { input, count } of deposits) {
+                const id = String(input.item_id), row = grouped.get(id) || { count: 0, units: 0,
+                    name: selection.items.find(item => sameId(item.itemId, id))?.name || input.item?.name || input.name || `物品 #${id}` };
+                row.count += count; row.units += count * Number(input.units); grouped.set(id, row);
+            }
+            const total = [...grouped.values()].reduce((sum, row) => sum + row.units, 0);
+            card.appendChild(uiElement('small', '', '本轮新增份数（按整件投喂，实际比例可能略有偏差）'));
+            for (const row of grouped.values()) card.appendChild(uiElement('p', 'rlt-feed-mix-note',
+                `${row.name} × ${format(row.count)} 件 · ${format(row.units)} 份 · 占 ${format(total > 0 ? row.units / total * 100 : 0)}%`));
+        }
+        const reason = !bounds.valid ? '上下限无效，请调整触发底限和填充目标' : plan?.reason;
+        if (reason) card.appendChild(uiElement('p', 'rlt-warning', reason));
+        else if (plan?.feasible && !hasDeposit) card.appendChild(uiElement('p', 'rlt-note', '当前无需投入库存'));
+        if (plan && (!plan.feasible || plan.missing > 0)) {
+            let purchase;
+            if (!CONFIG.feed.autoBuy) purchase = '自动购买已关闭，等待可用库存';
+            else if (!(CONFIG.feed.maxSpendPerTick > 0)) purchase = '每轮购买预算为 0，等待可用库存';
+            else {
+                const buyable = selection.items.filter(item => item.entry).map(item => item.name);
+                purchase = buyable.length ? `可检查购买：${buyable.join('、')}；仍须符合预算、品质和配比，预览不含购买量`
+                    : '所选物品暂无商店来源，等待可用库存';
+            }
+            card.appendChild(uiElement('p', 'rlt-note', purchase));
+        }
+        body.appendChild(card);
+        const batch = feedBatch();
+        if (!batch) return;
+        if (batch.phase === 'submitting' || batch.phase === 'uncertain') {
+            body.appendChild(uiElement('p', 'rlt-warning', '上次投料结果待核对，已暂停本批继续投入。请先在游戏中确认库存与饲料槽。'));
+            const reset = uiElement('button', '', '核对后重置投料批次'); reset.dataset.feedBatchReset = 'true';
+            reset.disabled = busy;
+            reset.onclick = () => {
+                if (busy || !['submitting', 'uncertain'].includes(feedBatch()?.phase)) return;
+                if (!window.confirm('请先在游戏中核对上次投料是否已经完成。清除记录后将按当前库存重新计算，不会重发旧请求。确认重置？')) return;
+                clearFeedBatch(); refreshFeedControls();
+            };
+            body.appendChild(reset);
+        } else if (batch.phase === 'ready' && batch.remaining?.length) {
+            const count = batch.remaining.reduce((sum, row) => sum + Number(row.count || 0), 0);
+            body.appendChild(uiElement('p', 'rlt-note', `本批还有 ${format(count)} 件待投入，将优先完成本批；以上为重新配料的库存预览。`));
+            const abandon = uiElement('button', '', '放弃本批剩余并重算'); abandon.dataset.feedBatchAbandon = 'true';
+            abandon.disabled = busy;
+            abandon.onclick = () => {
+                if (busy || feedBatch()?.phase !== 'ready') return;
+                if (!window.confirm('已投入的饲料不会退回。放弃本批剩余记录后，将按之后新增的份数重新计算配比。确认重新配料？')) return;
+                clearFeedBatch(); refreshFeedControls();
+            };
+            body.appendChild(abandon);
+        }
     }
     async function doQualityFeed() {
         const cfg = CONFIG.feed, signature = feedSettingsSignature(), build = detectedGameBuild();
@@ -5830,7 +6457,7 @@
             if (!bounds.valid || !feed.confirmed) { wait('饲料上下限或所选物品数据待确认'); return; }
             const current = Number(slot.units) === 0 ? 0 : feedUnitScore({ unit_score: slot.quality_score });
             if (current == null || !Number.isFinite(cfg.qualityTarget) || cfg.qualityTarget < 0) { wait('饲料品质分或目标设置待确认'); return; }
-            const qualityLow = current + 1e-9 < cfg.qualityTarget;
+            const qualityLow = current + 1e-9 < feedGoal();
             if (!qualityLow && Number(slot.units) >= bounds.target) { setOverride(FEED_FILL_KEY, ''); return; }
             if (!qualityLow && Number(slot.units) > bounds.low && getOverride(FEED_FILL_KEY) !== '1') return;
             // 直接写标记不使设置修订号变化；本轮每次真正写入仍核对状态和所有库存保护设置。
@@ -5955,6 +6582,12 @@
     async function doAquaticFeed() {
         const cfg = CONFIG.feed;
         if (!CONFIG.feed.enabled) return;
+        const batch = feedBatch();
+        if (batch && batch.phase !== 'ready') {
+            logSkip('feed:batch:uncertain', '上次投料结果待核对，请先在饲料页检查后重置批次'); return;
+        }
+        if (batch && feedMode() === 'single') clearFeedBatch();
+        if (feedMode() !== 'single') return doCombinationFeed();
         if (cfg.qualityTargetEnabled) return doQualityFeed();
         const signature = feedSettingsSignature();
         let spent = 0;

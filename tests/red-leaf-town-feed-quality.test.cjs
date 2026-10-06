@@ -58,7 +58,7 @@ function setup({ units = 100, capacity = 1000, score = 10, goal = 50, target = 8
     return x;
 }
 
-test('quality targets are disabled by default and missing score metadata preserves legacy feeding', async () => {
+test('explicit legacy volume mode preserves feeding when score metadata is absent', async () => {
     const plain = harness(); assert.equal(plain.h.CONFIG.feed.qualityTargetEnabled, false);
     const x = setup({ stocks: [[0, 7, 100, undefined]] });
     x.h.CONFIG.feed.qualityTargetEnabled = false;
@@ -239,21 +239,22 @@ test('pre-write resynchronization invalidates a quality deposit based on the old
 });
 
 test('feed UI shows current and predicted quality, endurance and useful waiting reasons', () => {
+    const text = node => [node.textContent || '', ...(node.children || []).map(text)].join('\n');
     const x = setup({ score: 0, target: 200, low: 100, stocks: [[3, 1, 100, 100]] });
     const body = x.context.document.createElement('div');
     x.h.renderFeedChoice(body, x.h.runtime.state);
-    const lines = body.children.map(row => row.textContent || '').join('\n');
-    assert.match(lines, /品质分 0.*目标 50.*投喂后 50/); assert.match(lines, /续航/);
+    const lines = text(body);
+    assert.match(lines, /品质分\s*0\s*→\s*50/); assert.match(lines, /目标\s*≥\s*50/); assert.match(lines, /续航/);
     const y = setup({ score: 0, target: 200, low: 100, stocks: [[0, 1, 100, 10]] });
     const empty = y.context.document.createElement('div'); y.h.renderFeedChoice(empty, y.h.runtime.state);
-    assert.match(empty.children.map(row => row.textContent || '').join('\n'), /无法.*品质目标/);
+    assert.match(text(empty), /无法.*品质目标/);
 });
 
 test('quality plans match exhaustive whole-piece combinations for varied capacities and scores', () => {
     let seed = 7919;
     const random = limit => { seed = (seed * 48271) % 2147483647; return seed % limit; };
     for (let sample = 0; sample < 70; sample++) {
-        const units = random(5), capacity = units + 10 + random(10), score = random(100), goal = random(80);
+        const units = random(5), capacity = units + 10 + random(10), score = random(100), goal = Math.max(41, random(80));
         const target = Math.max(1, capacity - random(6));
         const stocks = [0, 1, 2].map(quality => [quality, 1 + random(3), 1 + random(7), random(120)]);
         const x = setup({ units, capacity, score, goal, target, low: 0, stocks }), plan = x.plan();
