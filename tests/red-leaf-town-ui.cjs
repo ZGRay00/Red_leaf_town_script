@@ -3,9 +3,10 @@ const assert = require('node:assert/strict');
 const { fixture, sourcePath } = require('./red-leaf-town-v4.test.cjs');
 const preview = path.join(__dirname, 'red-leaf-town-preview.html');
 const state = fixture(), now = state.server_time;
-state.inventory.push({ item_id: 'pumpkin', name: '南瓜', quality: 0, quantity: 30 }, { item_id: 'grain_feed', name: '谷物饲料', quality: 0, quantity: 20 });
-state.aquatic.feed_slot.inputs = [{ item_id: 'pumpkin', item: { name: '南瓜' }, quality: 0, quantity: 30, units: 30 }, { item_id: 'grain_feed', item: { name: '谷物饲料' }, quality: 0, quantity: 20, units: 90 }];
-state.plots = [{ slot: 0, empty: false, ready: false, ready_at: now + 240, planted_at: now - 360, crop: { name: '南瓜' } }];
+state.inventory.push({ item_id: 'pumpkin', name: '南瓜', quality: 1, quantity: 30 }, { item_id: 'grain_feed', name: '谷物饲料', quality: 0, quantity: 20 },
+    { item_id: 'grape', name: '葡萄', quality: 1, quantity: 20 }, { item_id: 'wood', name: '木材', quality: 1, quantity: 30 });
+state.aquatic.feed_slot.inputs = [{ item_id: 'pumpkin', item: { name: '南瓜' }, quality: 1, quantity: 30, units: 30, unit_score: 60 }, { item_id: 'grain_feed', item: { name: '谷物饲料' }, quality: 0, quantity: 20, units: 90, unit_score: 80 }];
+state.plots = [{ slot: 0, size: 2, empty: false, ready: false, ready_at: now + 240, planted_at: now - 360, crop: { name: '南瓜' } }];
 state.crops = [{ id: 'pumpkin', name: '南瓜', seed_item_id: 'pumpkin_seed' }];
 state.partners = [{ partner_id: 'p1', name: '海风', tendencies: [{ industry: 'aquatic', effective_ability: 45 }] }, { partner_id: 'p2', name: '晨曦' }, { partner_id: 'p3', name: '林间' }];
 state.sailing.active_run = { run_id: 'demo', route_name: '芦苇湾', started_at: now - 1500, ready_at: now + 2100, partner_ids: ['p1'] };
@@ -13,11 +14,27 @@ Object.assign(state.crafting_stations[0], { empty: false, ready: false, complete
 state.crafting_stations.push({ ...structuredClone(state.crafting_stations[0]), station_id: 'kitchen', definition: { name: '小镇厨房' },
     empty: true, ready: false, completed_count: 0, queued_count: 0, collected_count: 0, queue_total: 0,
     queue_remaining_seconds: 0, recipe: null, task_snapshot: null });
+state.facilities = {
+    upgrades: [
+        { id: 'farm_2', kind: 'farm', name: '第二块双倍田', unlocked: true, coins: 1500, inputs: [{ item_id: 'wood', name: '木材', quantity: 20 }] },
+        { id: 'feed_2', kind: 'feed', name: '扩充共用饲料槽', unlocked: true, coins: 1000, inputs: [{ item_id: 'wood', name: '木材', quantity: 10 }] },
+    ],
+    refining: { built: true, unlocked: true, ability: 120, max_quality: 4, locked: true,
+        assigned_partner: { partner_id: 'refiner', name: '酿酒伙伴' },
+        slots: [{ task_id: 'manual-wine', item: { item_id: 'grape_wine', name: '葡萄酒' }, max_quality: 4,
+            quality_times: [now - 60, now + 600, now + 3600, now + 7200] }, null, null, null, null, null],
+        recipes: [{ id: 'grape_wine', unlocked: true, item: { item_id: 'grape_wine', name: '葡萄酒' },
+            input_item: { item_id: 'grape', name: '葡萄' }, input_quantity: 2, output_prices: [5, 10, 20, 40],
+            options: [1, 2].map(quality => ({ quality, owned: quality === 1 ? 20 : 0, input_value: 4,
+                quality_times: [now + 60, now + 600, now + 3600, now + 7200] })) }] },
+};
 const source = fs.readFileSync(sourcePath, 'utf8').replace('if (CONFIG.ui.autoStart) start();', `window.__rltPreview = {
     runtime, refreshConfigRows, renderDashboard, setSetting, getOverride, start, stop, CONFIG,
-    craftRun, startCraftRun, stopCraftRun, configuredCraftSteps, craftPipelineProgress, advanceCraftPipeline, finishCraftRun
+    craftRun, startCraftRun, stopCraftRun, configuredCraftSteps, craftPipelineProgress, advanceCraftPipeline, finishCraftRun,
+    refiningConfig, refiningRun, startRefiningRun, stopRefiningRun
 };
 setOverride('rlt-node-job:crafting:kitchen', 'flour'); setOverride('rlt-craft-lock-times:kitchen', '3');
+setOverride('rlt-refining-config:1', JSON.stringify({recipeId:'grape_wine',inputQuality:1,targetQuality:3,times:2}));
 runtime.state = window.fixtureState; renderDashboard(runtime.state);`);
 fs.writeFileSync(preview, `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>红叶镇助手预览</title><style>body{background:#e8eddf;color:#324535;font:18px system-ui;margin:45px}h1{font-size:28px}p{font-size:14px;color:#6c7c62}</style><div id="app"><h1>红叶镇物语</h1><p>助手界面离线预览 · 模拟状态</p></div><script>localStorage.clear();window.fixtureState=${JSON.stringify(state)};document.querySelector('#app').__vue_app__={_context:{config:{globalProperties:{$pinia:{_s:new Map([['story',{cue(){},active:false,queue:[]}],['game',{state:window.fixtureState,refresh(){}}]])}}}}};window.fetch=async()=>{throw new Error('Preview must not access game network')};</script><script>${source.replace(/<\/script/gi, '<\\/script')}</script></html>`, 'utf8');
 
@@ -40,12 +57,12 @@ async function main() {
         const image = await send('Page.captureScreenshot', { format: 'png', clip: box }); fs.writeFileSync(path.join(__dirname, name + '.png'), Buffer.from(image.data, 'base64'));
     }
     await screenshot('rlt-v4-overview');
-    for (const name of ['production', 'crafting', 'sailing', 'feed', 'settings']) {
+    for (const name of ['production', 'crafting', 'refining', 'sailing', 'feed', 'facilities', 'settings']) {
         await evaluate(`document.querySelector('.rlt-tabs [data-page="${name}"]').click()`);
         const visible = await evaluate(`Array.from(document.querySelectorAll('.rlt-group')).map(e=>e.dataset.page)`);
         assert.ok(visible.length && visible.every(value => value === name), name + ' panel visibility');
         const overflow = await evaluate(`(()=>{const e=document.querySelector('#rlt-auto-helper-panel');return e.scrollWidth-e.clientWidth})()`); assert.ok(overflow <= 1, name + ' horizontal overflow');
-        if (['crafting', 'feed', 'sailing'].includes(name)) await screenshot('rlt-v4-' + name);
+        if (['crafting', 'feed', 'sailing', 'refining', 'facilities'].includes(name)) await screenshot('rlt-v4-' + name);
     }
     // Real browser interaction: a module switch must update its ARIA state and persisted setting.
     await evaluate(`document.querySelector('.rlt-tabs [data-page="crafting"]').click()`);
@@ -113,6 +130,50 @@ async function main() {
     assert.deepEqual(craft.done, [0]); assert.equal(craft.focusKey, 'craft:kitchen:execute');
     await clickCraftControl();
     assert.equal((await craftControl()).run.status, 'stopped');
+    // New pages: explicit reservations, average quality settings and finite refining runs.
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="facilities"]').click()`);
+    await evaluate(`(()=>{const e=document.querySelector('select[aria-label="农田改良"]');e.value='farm_2';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`window.__rltPreview.getOverride('rlt-facility-reserve:farm')`), 'farm_2');
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('预留中')`), true);
+    await evaluate(`(()=>{const e=document.querySelector('select[aria-label="饲料设施"]');e.value='feed_2';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('已选项目合计 30 件')`), true);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('项备齐')`), false);
+    await screenshot('rlt-v450-facility-reservation');
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click();document.querySelector('[aria-label="启用品质目标"]').click()`);
+    assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.qualityTargetEnabled`), true);
+    await evaluate(`(()=>{const e=document.querySelector('input[aria-label="目标品质分"]');e.focus();e.value='65';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.qualityTarget`), 65);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('目标 65')`), true);
+    await screenshot('rlt-v450-feed-quality');
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="refining"]').click()`);
+    const refineButton = '[data-focus-key="refining:1:execute"]';
+    assert.equal(await evaluate(`window.__rltPreview.refiningRun(1)`), null);
+    await evaluate(`document.querySelector('${refineButton}').closest('.rlt-work').querySelector('summary').click()`);
+    const refinePoint = await evaluate(`(()=>{const e=document.querySelector('${refineButton}');e.scrollIntoView({block:'center'});e.focus();const r=e.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2}})()`);
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...refinePoint, button: 'left', clickCount: 1 });
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...refinePoint, button: 'left', clickCount: 1 });
+    const refineRunId = await evaluate(`window.__rltPreview.refiningRun(1).id`);
+    assert.equal(await evaluate(`window.__rltPreview.refiningRun(1).status`), 'running');
+    assert.equal(await evaluate(`document.activeElement.dataset.focusKey`), 'refining:1:execute');
+    assert.equal(await evaluate(`document.querySelector('${refineButton}').closest('.rlt-work').querySelector('details').open`), true);
+    assert.equal(await evaluate(`[...document.querySelector('${refineButton}').closest('.rlt-work').querySelectorAll('input,select')].every(e=>e.disabled)`), true);
+    await evaluate(`document.querySelector('${refineButton}').click()`);
+    assert.equal(await evaluate(`window.__rltPreview.refiningRun(1).status`), 'stopped');
+    assert.equal(await evaluate(`document.activeElement.dataset.focusKey`), 'refining:1:execute');
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'char', text: '\r', unmodifiedText: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    assert.equal(await evaluate(`window.__rltPreview.refiningRun(1).status`), 'running');
+    assert.equal(await evaluate(`window.__rltPreview.refiningRun(1).id`), refineRunId);
+    await evaluate(`document.querySelector('${refineButton}').click()`);
+    await screenshot('rlt-v450-refining-config');
+    await evaluate(`(()=>{const e=document.querySelector('${refineButton}').closest('.rlt-work').querySelector('select[aria-label="精制配方"]');e.focus();e.value='';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`window.__rltPreview.refiningConfig(1).recipeId`), '');
+    assert.equal(await evaluate(`document.querySelector('${refineButton}').disabled`), true);
     await evaluate(`document.querySelector('.rlt-tabs [data-page="sailing"]').click();for(let n=1;n<=3;n++){const e=document.querySelector('select[aria-label="伙伴 '+n+'"]');e.focus();e.value='p'+n;e.dispatchEvent(new Event('change',{bubbles:true}))}`);
     assert.deepEqual(await evaluate(`JSON.parse(window.__rltPreview.CONFIG.sailing.partnerIds)`), ['p1', 'p2', 'p3']);
     assert.equal(await evaluate(`document.querySelector('select[aria-label="伙伴 2"] option[value="p1"]').disabled`), true);
@@ -137,7 +198,7 @@ async function main() {
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('.rlt-dashboard')).display`), 'none');
     await evaluate(`document.querySelector('[aria-label="展开助手面板"]').click();window.__rltPreview.setSetting('ui.showGraphs',true);window.__rltPreview.refreshConfigRows(window.fixtureState)`);
     await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
-    for (const name of ['overview', 'crafting', 'sailing', 'feed']) {
+    for (const name of ['overview', 'crafting', 'refining', 'sailing', 'feed', 'facilities']) {
         await evaluate(`document.querySelector('.rlt-tabs [data-page="${name}"]').click()`);
         assert.equal(await evaluate(`(()=>{const e=document.querySelector('#rlt-auto-helper-panel'),r=e.getBoundingClientRect();return r.right<=innerWidth && r.left>=0 && r.top>=0 && r.bottom<=innerHeight && e.scrollWidth-e.clientWidth<=1})()`), true, name + ' mobile bounds');
     }
@@ -169,6 +230,11 @@ async function main() {
         const small = await panelBox(); assert.equal(small.width, 48); assert.equal(small.height, 48);
         await evaluate(`document.querySelector('[aria-label="展开助手面板"]').click()`);
         const expanded = await panelBox(); assert.ok(expanded.left >= 0 && expanded.top >= 0 && expanded.right <= width && expanded.bottom <= height);
+        for (const name of ['refining', 'feed', 'facilities']) {
+            await evaluate(`document.querySelector('.rlt-tabs [data-page="${name}"]').click()`);
+            assert.equal(await evaluate(`(()=>{const e=document.querySelector('.rlt-config');return e.scrollWidth-e.clientWidth<=1})()`), true, name + ' narrow content overflow');
+            if (width === 320) await screenshot('rlt-v450-narrow-' + name);
+        }
         await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click()`);
     }
     assert.deepEqual(errors, []); console.log('Browser: one-shot execution/stop/resume with trusted mouse and keyboard, run identity/progress, lazy tabs, unique switches, focus/edit preservation, scroll memory, stable dashboard, graph/collapse toggles, desktop/mobile bounds and zero page errors passed.');

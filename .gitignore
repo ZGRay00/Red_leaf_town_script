@@ -18,6 +18,11 @@
 !tests/red-leaf-town-feed-selection.test.cjs
 !tests/red-leaf-town-inventory-audit.test.cjs
 !tests/red-leaf-town-farming.test.cjs
+!tests/red-leaf-town-double-plots.test.cjs
+!tests/red-leaf-town-refining.test.cjs
+!tests/red-leaf-town-facilities.test.cjs
+!tests/red-leaf-town-feed-quality.test.cjs
+!tests/red-leaf-town-v450-audit.test.cjs
 !tests/red-leaf-town-lifecycle-audit.test.cjs
 !tests/red-leaf-town-partner-audit.test.cjs
 !tests/red-leaf-town-aquatic-audit.test.cjs

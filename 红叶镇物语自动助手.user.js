@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.4.0
-// @description  红叶镇物语自动生产、递归补料与材料树、航海、自选饲料补充与可拖动管理面板
+// @version      4.5.0
+// @description  红叶镇物语自动生产、双倍田、递归加工与精制房、设施材料预留、饲料品质目标和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @downloadURL  none
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.4.0';
+    const SCRIPT_VERSION = '4.5.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -58,7 +58,7 @@
             cropId: null,             // 指定作物 id；null = 自动选择
             strictCropId: true,       // 指定作物无种子/不可种时等待，不偷偷改种其他作物
             prefer: 'first',          // 自动选择策略: 'first' 列表第一种 | 'fastest' 生长最快 | 'slowest' 生长最慢
-            autoBuySeeds: true,       // 没种子时自动去商店买（逐粒按需购买；金币不足时按 selling 白名单安全售卖凑钱）
+            autoBuySeeds: true,       // 种子不足时按田块缺口购买；金币不足时按 selling 白名单安全售卖凑钱
             autoSellForSeeds: true,   // 买种子金币不足时，自动售卖多余物资凑钱（配合 autoBuySeeds）
             seedStrategy: 'portal',   // 'portal' 委托、已解锁传送门优先，满足后按净收益；'profit' 仅委托优先，其他按净收益
             seedShopId: null,         // 可选：强制指定商店条目 id，优先级最高
@@ -128,6 +128,8 @@
             itemId: '',              // 留空兼容旧设置：均衡饲料；其他物品从游戏实际可投喂列表选择
             autoBuy: true,
             batchBuy: true,          // 识别每件换算份数后，按缺口和预算批量购买
+            qualityTargetEnabled: false, // 开启后同时满足槽内加权平均品质目标；仍只投入所选物品
+            qualityTarget: 50,
             thresholdMode: 'percent', // percent = 容量百分比，units = 饲料份数
             low: 20,
             target: 80,
@@ -151,6 +153,8 @@
             maxSpendPerTick: 1000,
             upgradeLimit: 1,
         },
+        facilities: { reserveMaterials: true }, // 仅保护面板明确选中的改良项目，不自动建造
+        refining: { enabled: true, autoCollect: true, autoAssignPartner: false, partnerId: '' },
         taskItems: { enabled: true },
         ui: { showGraphs: true, showLogs: true, compact: false, autoStart: true },
 
@@ -426,7 +430,7 @@
             totals.set(String(key), (totals.get(String(key)) || 0) + qty);
         }
         for (const [itemId, quantity] of totals) {
-            const safe = safeUnspecifiedConsumeQty(state, itemId, '', { reserveCraftingInputs: false, applyKeep: false });
+            const safe = safeUnspecifiedConsumeQty(state, itemId, '', { reserveCraftingInputs: false, applyKeep: false, excludeRefining: true });
             count = Math.min(count, Math.floor(safe / quantity));
         }
         if (plan.taskItem) {
@@ -655,12 +659,39 @@
         if (CONFIG.commissions.enabled && (!state.commissions || typeof state.commissions !== 'object')) {
             errors.push('commissions');
         }
+        if (CONFIG.facilities.reserveMaterials && FACILITY_KINDS.some(kind => getOverride(facilityReserveKey(kind)))) {
+            if (!Array.isArray(state.facilities?.upgrades)) errors.push('facilities.upgrades');
+            else for (const upgrade of selectedFacilityUpgrades(state)) {
+                if (!Array.isArray(upgrade.inputs) || upgrade.inputs.some(input =>
+                    !input || (input.item_id ?? input.item?.item_id) == null || !Number.isSafeInteger(Number(input.quantity)) || Number(input.quantity) <= 0 ||
+                    !Number.isSafeInteger(Number(input.min_quality ?? 0)) || Number(input.min_quality ?? 0) < 0 || Number(input.min_quality ?? 0) > 5)) {
+                    errors.push('facilities.upgrades[].inputs');
+                }
+            }
+        }
+        const refining = state.facilities?.refining;
+        if (CONFIG.refining.enabled && refining?.built && (!Array.isArray(refining.slots) || !Array.isArray(refining.recipes))) {
+            errors.push('facilities.refining');
+        }
+        if (CONFIG.refining.enabled) for (let slot = 0; slot < 6; slot++) {
+            const run = readJson(`rlt-refining-run:${slot}`);
+            if (run?.status !== 'running') continue;
+            if (!refining?.built || !Array.isArray(refining.slots) || slot >= refining.slots.length || !Array.isArray(refining.recipes)) {
+                errors.push('facilities.refining.active_run'); continue;
+            }
+            if (!run.collectOnly) {
+                const recipe = refining.recipes.find(row => sameId(row.id, run.config?.recipeId));
+                if (!recipe || (recipe.input_item?.item_id ?? recipe.input_item?.id) == null ||
+                    !Number.isSafeInteger(Number(recipe.input_quantity)) || Number(recipe.input_quantity) <= 0) errors.push('facilities.refining.recipes.active_run');
+            }
+        }
         const needsPartners = (CONFIG.farming.enabled && CONFIG.farming.autoAssignPartner) ||
             (CONFIG.gathering.enabled && CONFIG.gathering.autoAssignPartner) ||
             (CONFIG.mining.enabled && CONFIG.mining.autoAssignPartner) ||
             (CONFIG.crafting.enabled && CONFIG.crafting.autoAssignPartner) ||
             (CONFIG.aquatic.enabled && CONFIG.aquatic.autoAssignPartner) ||
-            (CONFIG.livestock.enabled && CONFIG.livestock.autoAssignPartner) || CONFIG.sailing.enabled;
+            (CONFIG.livestock.enabled && CONFIG.livestock.autoAssignPartner) || CONFIG.sailing.enabled ||
+            (CONFIG.refining.enabled && CONFIG.refining.autoAssignPartner);
         requireArray('partners', needsPartners);
         // 面板道具下拉和槽位级道具选择都依赖 task_items，任一产业启用即要求该字段
         const needsTaskItems = CONFIG.farming.enabled || CONFIG.gathering.enabled ||
@@ -884,8 +915,8 @@
     const takeCommission = (commissionId) => mutate(`/commissions/${commissionId}/take`, {
         cue: 'action:submit_commission',
     });
-    const useTaskItem = (industry, slotId, taskItemId) => mutate('/tasks/use-item', {
-        payload: { industry, slot_id: String(slotId), task_item_id: taskItemId },
+    const useTaskItem = (industry, slotId, taskItemId, beforeWrite) => mutate('/tasks/use-item', {
+        payload: { industry, slot_id: String(slotId), task_item_id: taskItemId }, beforeWrite,
     });
 
     // 水产接口（与官网前端一致；抛竿带幂等 request_id）
@@ -906,8 +937,8 @@
     const harvestPond = (pondId, qty) => mutate(`/ponds/${pondId}/harvest`, {
         payload: { quantity: qty }, cue: 'action:harvest_pond',
     });
-    const depositFeed = (itemId, quality, count) => mutate('/feed-slot/deposit', {
-        payload: { item_id: itemId, quality, count },
+    const depositFeed = (itemId, quality, count, beforeWrite) => mutate('/feed-slot/deposit', {
+        payload: { item_id: itemId, quality, count }, beforeWrite,
     });
 
     // 畜牧接口（照料每次 1 体力；收取不耗体力，animal_id 传空串 = 整栋全收）
@@ -1014,7 +1045,7 @@
         #rlt-auto-helper-panel .rlt-toolbar{display:flex;gap:7px;margin-bottom:8px}
         #rlt-auto-helper-panel .rlt-toolbar button{flex:1;margin:0!important;padding:7px!important}
         #rlt-auto-helper-panel .rlt-toolbar+span{font-size:11px;color:var(--rlt-muted);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:19px}
-        #rlt-auto-helper-panel .rlt-tabs{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;padding:9px 0 11px;flex-shrink:0;border-bottom:1px solid var(--rlt-line)}
+        #rlt-auto-helper-panel .rlt-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;padding:9px 0 11px;flex-shrink:0;border-bottom:1px solid var(--rlt-line)}
         #rlt-auto-helper-panel .rlt-tabs button{background:transparent;border:0;color:#adb9a9;padding:7px 0}
         #rlt-auto-helper-panel .rlt-tabs .selected{background:#dca46d;color:#20271c;font-weight:700}
         #rlt-auto-helper-panel .rlt-dashboard{overflow:auto;min-height:0;padding:12px 2px 4px;max-height:52vh;scrollbar-width:thin}
@@ -1119,7 +1150,8 @@
         @media(prefers-reduced-motion:reduce){#rlt-auto-helper-panel *{transition:none!important}}
         `;
         document.head.appendChild(style);
-        const pages = [['overview', '概览'], ['production', '生产'], ['crafting', '加工'], ['sailing', '航海'], ['feed', '饲料'], ['settings', '设置']];
+        const pages = [['overview', '概览'], ['production', '生产'], ['crafting', '加工'], ['refining', '精制'],
+            ['sailing', '航海'], ['feed', '饲料'], ['facilities', '设施'], ['settings', '设置']];
         if (!pages.some(([id]) => id === activeDashboardPage)) activeDashboardPage = 'overview';
         for (const [id, name] of pages) {
             const button = uiElement('button', '', name);
@@ -1229,10 +1261,26 @@
                 const progress = node.ready ? 100 : started > 0 && readyAt > started ? (now - started) / (readyAt - started) * 100 : null;
                 const readyCount = Number(node.completed_count || 0);
                 const status = industry === 'crafting' && readyCount > 0 ? `${readyCount} 份可领` : node.ready ? '待领取' : readyAt > now ? durationLabel(readyAt - now) : '等待结算';
-                const nameText = node.definition?.name || `${name} ${node.slot != null ? Number(node.slot) + 1 : node.site_id ?? node.station_id}`;
+                const nameText = node.definition?.name || (industry === 'farming' ? plotLabel(node) : `${name} ${node.site_id ?? node.station_id}`);
                 card(`${industry}:${node.slot ?? node.site_id ?? node.station_id ?? index}`, nameText, status, progress, node.recipe?.name || node.crop?.name || node.task?.name || '');
             }
             if (!count) text('production-empty', 'p', 'rlt-empty', '暂无进行中的生产任务');
+            const room = refiningRoom(state);
+            if (room?.built) {
+                const tasks = (room.slots || []).map((task, slot) => ({ task, slot, run: refiningConfiguredRun(slot) }))
+                    .filter(row => row.task || row.run?.status === 'running');
+                if (tasks.length) text('refining-title', 'h3', 'rlt-section-label', '精制房');
+                for (const { task, slot, run } of tasks) {
+                    const quality = task ? (task.quality_times || []).filter(time => Number(time) <= now).length : 0;
+                    const names = ['未成品', '普通', '良品', '上品', '臻品'];
+                    const readyAt = run?.status === 'running' && task ? refiningTargetTime(task, run.config.targetQuality) : null;
+                    card(`refining:${slot}`, `精制 ${slot + 1} · ${task?.item?.name || '等待投料'}`,
+                        task ? names[Math.min(4, quality)] : '待执行', null,
+                        !CONFIG.refining.enabled ? '精制管理已关闭' : run?.flight?.phase === 'uncertain' ? '请到精制页核对本批' :
+                            readyAt != null ? readyAt > now ? `距目标 ${names[run.config.targetQuality]} ${durationLabel(readyAt - now)}` : '已达领取目标' :
+                            task ? '手动任务，未安排自动领取' : refiningBlockReason(state, slot));
+                }
+            }
             text('sea-title', 'h3', 'rlt-section-label', '航海与饲料');
             const sail = state.sailing?.active_run;
             if (sail) {
@@ -1246,8 +1294,10 @@
             if (slot) {
                 const bounds = feedThresholds(slot);
                 card('feed', `饲料 · ${selectedFeed(state).name}`, `${Math.floor(slot.units)} / ${slot.capacity} 份`, slot.capacity > 0 ? slot.units / slot.capacity * 100 : null,
-                    bounds.valid ? `底限 ${Math.floor(bounds.low)} → 目标 ${Math.ceil(bounds.target)} 份 · ${CONFIG.feed.enabled ? '自动补充' : '自动补充关闭'}` : '请检查上下限设置');
+                    bounds.valid ? `底限 ${Math.floor(bounds.low)} → 目标 ${Math.ceil(bounds.target)} 份 · 品质分 ${Number.isFinite(Number(slot.quality_score)) ? Number(slot.quality_score).toFixed(1) : '待确认'}${CONFIG.feed.qualityTargetEnabled ? ` / 目标 ${CONFIG.feed.qualityTarget}` : ''} · ${CONFIG.feed.enabled ? '自动补充' : '自动补充关闭'}` : '请检查上下限设置');
             }
+            const projects = selectedFacilityUpgrades(state);
+            if (projects.length) text('facility-summary', 'p', 'rlt-note', `设施材料预留：${projects.map(project => project.name || project.id).join('、')}`);
             text('footer', 'div', 'rlt-footer', `状态同步 ${state.server_time ? new Date(state.server_time * 1000).toLocaleTimeString() : '待同步'} · ${running ? '助手运行中' : '助手已停止'}`);
         }
         for (const key of dashboardViews.keys()) if (!keys.has(key)) dashboardViews.delete(key);
@@ -1273,7 +1323,7 @@
             ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
             ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
             ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '执行已启动的本轮'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.batchLimit', '每次最多提交次数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
-            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买所选物品'], ['feed.batchBuy', '批量购买所选物品'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
+            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买所选物品'], ['feed.batchBuy', '批量购买所选物品'], ['feed.qualityTargetEnabled', '启用品质目标'], ['feed.qualityTarget', '目标品质分'], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
             ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
             ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
         ];
@@ -1285,6 +1335,7 @@
             if (page === 'feed') {
                 body.appendChild(uiElement('p', 'rlt-note', '只投入选中物品；可选项来自游戏实际可投喂列表，已见物品耗尽后仍保留。南瓜、谷物饲料等首次入库并可投喂后会自动出现。库存不足且商店没有该物品时等待，不改用其他饲料。'));
                 body.appendChild(uiElement('p', 'rlt-note', '达到底限后补至目标；整件投料可能略超目标，始终不超容量。保留委托、传送门和加工用料；均衡饲料以外的物品也遵守默认库存保留量。预算为 0 时不购买。'));
+                if (CONFIG.feed.qualityTargetEnabled) body.appendChild(uiElement('p', 'rlt-note', '品质分按份数加权。低于品质目标时也会补料，可能超过填充水位；只用所选物品的可用品质，不倒空饲料槽。无法达标时等待补货或容量释放。'));
                 const slot = state.aquatic?.feed_slot;
                 if (slot) {
                     const bounds = feedThresholds(slot);
@@ -1388,7 +1439,7 @@
                     if (Number(material.otherAllocated) > 0) labels.push(`其他加工用料 ${quantity(material.otherAllocated)}`);
                     if (labels.length) detail.appendChild(uiElement('div', '', labels.join(' · ')));
                     for (const need of protections.filter(need => Number(need.quantity) > 0)) detail.appendChild(uiElement('div', '',
-                        `${need.name || '保留需求'}：${quantity(need.quantity)}${Number(need.minQuality) > 0 ? `（品质 ≥ ${quantity(need.minQuality)}）` : ''}`));
+                        `${need.name || '保留需求'}：${quantity(need.quantity)}${need.exactQuality != null ? `（指定品质 ${quantity(need.exactQuality)}）` : Number(need.minQuality) > 0 ? `（品质 ≥ ${quantity(need.minQuality)}）` : ''}`));
                     branch.appendChild(detail);
                 }
                 if (children.length) {
@@ -1800,8 +1851,9 @@
         const keepKey = nodeTaskItemKeepKey(industry, id);
         const stored = getOverride(itemKey);
         const current = stored === '__off' ? null : stored; // 旧版“停用”值归入默认的“不使用”
-        const labelPrefix = industry === 'farming' ? `土地 ${id + 1}` : `${INDUSTRY_NAMES[industry] || industry}点 ${id}`;
-        const { row, select } = makeSelectRow('└ 道具:', '选择该点位使用的特殊道具；默认不使用');
+        const plot = industry === 'farming' ? (state.plots || []).find(candidate => sameId(candidate.slot, id)) : null;
+        const labelPrefix = industry === 'farming' ? plotLabel(plot || { slot: id }) : `${INDUSTRY_NAMES[industry] || industry}点 ${id}`;
+        const { row, select } = makeSelectRow('└ 道具:', `选择该点位使用的特殊道具；默认不使用${plotSize(plot) > 1 ? `；每次消耗 ${plotSize(plot)} 个，保留量另计` : ''}`);
         select.style.maxWidth = '150px'; // 给保留数量输入留出行内空间
         fillSelect(select, items.map(it => ({
             value: taskItemRecordId(it),
@@ -1919,17 +1971,19 @@
         ] });
         body.appendChild(uiElement('p', 'rlt-note', '自动田先补需求，再按普通品质产量估算每小时净收益。已有种子不再计购种花费；买不起的种子会跳过。高品质门贡按缺口试种，收获后再核对品质。'));
         // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
-        const slots = (state.plots || []).map(p => p.slot);
-        slots.push(slots.length ? Math.max(...slots) + 1 : 0);
-        for (const slot of slots) {
+        const plots = [...(state.plots || [])];
+        const nextSlot = plots.length ? Math.max(...plots.map(plot => Number(plot.slot) + plotSize(plot))) : 0;
+        plots.push({ slot: nextSlot, size: 1 });
+        for (const plot of plots) {
+            const slot = plot.slot;
             const key = plotCropKey(slot);
-            const { row, select } = makeSelectRow(`土地${slot + 1}:`, '选择这块地要种的作物；「自动」按传送门/委托需求 > 经济价值选择');
+            const { row, select } = makeSelectRow(`${plotLabel(plot)}:`, '选择这块地要种的作物；双倍田每次消耗两份种子、体力和道具；「自动」先补需求再按净收益选择');
             fillSelect(select, (state.crops || []).map(c => ({
                 value: cropId(c), text: c.name || `作物#${cropId(c)}`,
             })), getOverride(key), '自动');
             select.onchange = () => {
                 setOverride(key, select.value);
-                log(`土地 ${slot + 1}：${select.value ? '已锁定作物' : '恢复自动选种'}`);
+                log(`${plotLabel(plot)}：${select.value ? '已锁定作物' : '恢复自动选种'}`);
             };
             body.appendChild(row);
             const itemRow = makeTaskItemRow(state, 'farming', slot);
@@ -2036,7 +2090,9 @@
         } else if (activeDashboardPage === 'crafting') {
             renderIndustrySettings(state, ['crafting']);
             renderModuleSettings(state, 'crafting');
-        } else if (activeDashboardPage === 'sailing') renderSailingSettings(state);
+        } else if (activeDashboardPage === 'refining') renderRefiningSettings(state);
+        else if (activeDashboardPage === 'facilities') renderFacilitySettings(state);
+        else if (activeDashboardPage === 'sailing') renderSailingSettings(state);
         else renderModuleSettings(state, activeDashboardPage);
         if (focusKey) [...configBox.querySelectorAll('button[data-focus-key]')].find(button => button.dataset.focusKey === focusKey)?.focus({ preventScroll: true });
         configBox.scrollTop = pageScroll.get(activeDashboardPage) || 0;
@@ -2394,6 +2450,8 @@
             const readyAt = Number(state.sailing?.active_run?.ready_at || 0);
             if (readyAt > now) wait = Math.min(wait, readyAt - now);
         }
+        const refiningReadyAt = refiningNextReadyAt(state);
+        if (refiningReadyAt > now) wait = Math.min(wait, refiningReadyAt - now);
         if (CONFIG.feed.enabled) {
             const slot = state.aquatic?.feed_slot, bounds = feedThresholds(slot);
             if (bounds.valid && Number(slot.hourly_rate) > 0 && slot.units > bounds.low) {
@@ -2439,30 +2497,44 @@
 
     // 槽位级任务道具：只认面板锁定的道具（支持保留数量），未锁定即不使用
     // forcedId：加工流程步骤单独指定的道具 id，传入时跳过槽位配置查找
-    function slotTaskItem(state, industry, slotId, timing, { notify = true, forcedId = null } = {}) {
+    function slotTaskItem(state, industry, slotId, timing, { notify = true, forcedId = null, requiredQuantity = null } = {}) {
         if (!CONFIG.taskItems.enabled || (industry === 'crafting' && !CONFIG.crafting.useTaskItems)) return null;
         const override = forcedId != null ? forcedId :
             (industry === 'crafting' && timing === 'active' ? craftFlight(slotId)?.taskItemChoice : null) ?? getOverride(nodeTaskItemKey(industry, slotId));
         if (override == null || override === '__off') return null; // '__off' 兼容旧版存储
         const keep = Math.max(0, Number(getOverride(nodeTaskItemKeepKey(industry, slotId)) || 0));
+        const required = requiredQuantity == null
+            ? (industry === 'farming' ? plotSize((state.plots || []).find(plot => sameId(plot.slot, slotId))) : 1)
+            : Math.max(1, Math.ceil(Number(requiredQuantity) || 1));
         const item = (state.task_items || []).find(candidate => {
             const eligible = candidate?.eligible_industries;
             return sameId(taskItemRecordId(candidate), override) && candidate.timing === timing &&
-                Number(candidate.quantity || 0) - keep > 0 &&
+                Number(candidate.quantity || 0) - keep >= required &&
                 (!Array.isArray(eligible) || eligible.length === 0 || eligible.includes(industry));
         }) || null;
         const key = `task-item:${timing}:${industry}:${slotId}:${override}`;
         if (item) clearSkip(key);
         else if (notify) {
-            logSkip(key, `${INDUSTRY_NAMES[industry] || industry}点 ${slotId}：道具 #${override} 库存不足（保留 ${keep} 个）、类型不符或不适用于该产业，已跳过`);
+            logSkip(key, `${INDUSTRY_NAMES[industry] || industry}点 ${slotId}：道具 #${override} 库存不足（需 ${required} 个，保留 ${keep} 个）、类型不符或不适用于该产业，已跳过`);
         }
         return item;
     }
 
+    function plotSize(plot) {
+        const size = Number(plot?.size || 1);
+        return Number.isSafeInteger(size) && size > 0 ? size : 1;
+    }
+    function plotLabel(plot) {
+        const first = Number(plot.slot) + 1, size = plotSize(plot);
+        return size > 1 ? `双倍田 ${first}＋${first + size - 1}` : `土地 ${first}`;
+    }
     function seedQty(state, crop) {
         return (state.inventory || [])
             .filter(i => sameId(i.item_id, crop.seed_item_id))
             .reduce((sum, i) => sum + Number(i.quantity || 0), 0);
+    }
+    function seedMissing(state, crop, plot = null) {
+        return Math.max(0, plotSize(plot) - seedQty(state, crop));
     }
 
     function inventoryQty(state, itemId, name = '', minQuality = 0) {
@@ -2547,12 +2619,16 @@
     function cropHourlyProfit(state, crop, ability = 0, plot = null) {
         const produceId = cropProduceItemId(crop);
         // 新产物品质未知，只用基础价/普通品质价；背包里一件高品质产物不能抬高整片田的估值。
-        const baseState = { ...state, inventory: (state.inventory || []).filter(item => Number(item.quality || 0) === 0) };
+        const baseState = { ...state, inventory: (state.inventory || [])
+            .filter(item => [0, 1].includes(Number(item.quality || 0)) && item.sell_price != null && item.sell_price !== '' &&
+                Number.isFinite(Number(item.sell_price)) && Number(item.sell_price) >= 0)
+            .sort((a, b) => Number(b.quality || 0) - Number(a.quality || 0)) };
         const producePrice = itemSellPrice(baseState, produceId, cropProduceName(crop),
             crop.produce_sell_price ?? crop.produce?.sell_price ?? crop.item?.sell_price);
         const entry = seedShopEntry(state, crop);
         // 比较本次种植的新增金币收益：已有种子无需再次付款；缺种时使用实际将购买的商品价格。
-        const seedPrice = seedQty(state, crop) > 0 ? 0 : entry ? Number(entry.price) : null;
+        const missing = seedMissing(state, crop, plot);
+        const seedPrice = !missing ? 0 : entry ? Number(entry.price) * missing : null;
         if (producePrice == null || producePrice < 0 || seedPrice == null) return null;
         const minYield = Number(crop.yield_min ?? 1);
         const maxYield = Number(crop.yield_max ?? minYield);
@@ -2562,7 +2638,7 @@
         const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability,
             crop.minimum_duration_seconds ?? 1, taskItemDurationMultiplier(startItem));
         if (!Number.isFinite(seconds) || seconds <= 0) return null;
-        const value = (((minYield + maxYield) / 2) * producePrice - seedPrice) / (seconds / 3600);
+        const value = (((minYield + maxYield) / 2) * plotSize(plot) * producePrice - seedPrice) / (seconds / 3600);
         return Number.isFinite(value) ? value : null;
     }
 
@@ -2574,7 +2650,7 @@
             .sort((a, b) => b.value - a.value);
         if (scored.length) return scored[0].crop;
         // 未知售价时只使用已有种子；纯赚钱不盲买无法估值或已知亏本的种子。
-        const list = crops.filter(crop => seedQty(state, crop) > 0 && cropHourlyProfit(state, crop, ability, plot) == null);
+        const list = crops.filter(crop => seedMissing(state, crop, plot) === 0 && cropHourlyProfit(state, crop, ability, plot) == null);
         if (CONFIG.farming.prefer === 'fastest') list.sort((a, b) => Number(a.growth_seconds || Infinity) - Number(b.growth_seconds || Infinity));
         if (CONFIG.farming.prefer === 'slowest') list.sort((a, b) => Number(b.growth_seconds || 0) - Number(a.growth_seconds || 0));
         return list[0] || null;
@@ -2606,6 +2682,422 @@
             cm.status !== 'forwarded' && cm.status !== 'forward_completed' && cm.status !== 'completed';
     }
 
+    // ---------- 精制房：每格明确执行一轮，按目标品质收取 ----------
+    const refiningConfigKey = slot => `rlt-refining-config:${slot}`;
+    const refiningRunKey = slot => `rlt-refining-run:${slot}`;
+    const refiningRun = slot => readJson(refiningRunKey(slot));
+    const refiningRoom = state => state?.facilities?.refining;
+    const refiningTask = (state, slot) => refiningRoom(state)?.slots?.[slot] || null;
+    const refiningItemId = item => item?.item_id ?? item?.id ?? null;
+    const refiningQualityName = quality => ['未成品', '普通', '良品', '上品', '臻品'][Number(quality)] || `品质 ${quality}`;
+    function refiningConfig(slot) {
+        const saved = readJson(refiningConfigKey(slot), {});
+        return { recipeId: String(saved.recipeId || ''), inputQuality: Number(saved.inputQuality ?? 1),
+            targetQuality: Number(saved.targetQuality ?? 1), times: Number(saved.times ?? 1) };
+    }
+    const refiningSig = config => JSON.stringify([config.recipeId, config.inputQuality, config.targetQuality, config.times]);
+    function saveRefiningRun(slot, run) { setOverride(refiningRunKey(slot), run ? JSON.stringify(run) : ''); }
+    function refiningConfiguredRun(slot) {
+        const run = refiningRun(slot);
+        return run?.version === 1 && run.sig === refiningSig(refiningConfig(slot)) ? run : null;
+    }
+    function refiningRecipeCheck(state, config) {
+        const room = refiningRoom(state);
+        if (!room?.built || room.unlocked === false) return { reason: '精制房尚未建成或未解锁' };
+        const recipe = room.recipes?.find(row => sameId(row.id, config.recipeId));
+        if (!recipe || recipe.unlocked === false) return { reason: '请选择已解锁的精制配方' };
+        const option = recipe.options?.find(row => Number(row.quality) === config.inputQuality);
+        const inputId = refiningItemId(recipe.input_item), outputId = refiningItemId(recipe.item);
+        if (!option || inputId == null || outputId == null || !Number.isSafeInteger(Number(recipe.input_quantity)) || Number(recipe.input_quantity) <= 0) {
+            return { reason: '原料品质或配方数据不可用' };
+        }
+        if (!Number.isSafeInteger(config.times) || config.times < 1 || config.times > 99 ||
+            !Number.isSafeInteger(config.targetQuality) || config.targetQuality < 1 || config.targetQuality > 4) {
+            return { reason: '执行次数须为 1～99，领取品质须为 1～4' };
+        }
+        if (!Number.isSafeInteger(Number(room.max_quality)) || config.targetQuality > Number(room.max_quality) ||
+            !Array.isArray(option.quality_times) || !Number.isFinite(Number(option.quality_times[config.targetQuality - 1])) || Number(option.quality_times[config.targetQuality - 1]) <= 0) {
+            return { reason: `目标 ${refiningQualityName(config.targetQuality)} 超过当前可达上限，请调整目标或更换伙伴` };
+        }
+        return { recipe, option, inputId, outputId };
+    }
+    function refiningTargetTime(task, target) {
+        if (!task || !Number.isSafeInteger(target) || target < 1 || target > Number(task.max_quality)) return null;
+        const times = task.quality_times;
+        if (!Array.isArray(times) || times.length < target || times.slice(0, target).some((time, index) =>
+            !Number.isFinite(Number(time)) || Number(time) <= 0 || (index && Number(time) < Number(times[index - 1])))) return null;
+        return Number(times[target - 1]);
+    }
+    function startRefiningRun(state, slot) {
+        if (busy || !Array.isArray(refiningRoom(state)?.slots) || !Number.isInteger(slot) || slot < 0 || slot >= refiningRoom(state).slots.length) return false;
+        const config = refiningConfig(slot), old = refiningConfiguredRun(slot), task = refiningTask(state, slot);
+        if (old?.status === 'running' || old?.flight?.phase === 'uncertain') return false;
+        if (old?.status === 'stopped' && old.done < old.config.times) {
+            if (old.flight && (old.flight.phase !== 'active' || !task || !sameId(task.task_id, old.flight.taskId))) return false;
+            if (!old.flight && task) return false;
+            if (old.flight ? refiningTargetTime(task, old.config.targetQuality) == null :
+                !old.collectOnly && refiningRecipeCheck(state, config).reason) return false;
+            saveRefiningRun(slot, { ...old, status: 'running' }); return true;
+        }
+        if (task || refiningRun(slot)?.flight || refiningRecipeCheck(state, config).reason) return false;
+        saveRefiningRun(slot, { version: 1, id: crypto.randomUUID(), sig: refiningSig(config), config,
+            status: 'running', done: 0, flight: null, collectOnly: false });
+        return true;
+    }
+    function stopRefiningRun(slot) {
+        const run = refiningRun(slot);
+        if (!run || run.status !== 'running') return false;
+        saveRefiningRun(slot, { ...run, status: 'stopped' }); return true;
+    }
+    function adoptRefiningTask(state, slot) {
+        const task = refiningTask(state, slot), config = refiningConfig(slot), old = refiningRun(slot);
+        if (busy || !task || task.task_id == null || old?.flight || old?.status === 'running' || refiningTargetTime(task, config.targetQuality) == null) return false;
+        saveRefiningRun(slot, { version: 1, id: crypto.randomUUID(), sig: refiningSig(config),
+            config: { ...config, times: 1 }, status: 'running', done: 0, collectOnly: true,
+            flight: { phase: 'active', taskId: task.task_id } });
+        return true;
+    }
+    // 仅用于结果不确定后的人工核对；不会发送游戏请求。
+    function resolveRefiningUncertain(state, slot, action) {
+        const run = refiningRun(slot), task = refiningTask(state, slot);
+        if (busy || run?.flight?.phase !== 'uncertain') return false;
+        if (action === 'adopt') {
+            const recipe = refiningRoom(state)?.recipes?.find(row => sameId(row.id, run.config.recipeId));
+            if (!task || task.task_id == null || refiningTargetTime(task, run.config.targetQuality) == null ||
+                (!run.collectOnly && !sameId(refiningItemId(task.item), refiningItemId(recipe?.item)))) return false;
+            run.flight = { phase: 'active', taskId: task.task_id }; run.status = 'stopped';
+        } else {
+            if (task || !['collected', 'not-collected'].includes(action)) return false;
+            if (action === 'collected') run.done = Math.min(run.config.times, run.done + 1);
+            run.flight = null;
+            run.status = run.done >= run.config.times || run.collectOnly ? 'completed' : 'stopped';
+        }
+        saveRefiningRun(slot, run); return true;
+    }
+    function reconcileRefiningRun(state, slot) {
+        const run = refiningRun(slot);
+        if (!run?.flight || run.flight.phase === 'uncertain') return run;
+        const task = refiningTask(state, slot);
+        if (run.flight.phase !== 'active' || !task || !sameId(task.task_id, run.flight.taskId)) {
+            run.flight.phase = 'uncertain'; run.flight.reason = '上次请求或任务归属未确认，请核对本批是否已领取、取消或仍在精制';
+            saveRefiningRun(slot, run);
+        }
+        return run;
+    }
+    function refiningMaterialNeeds(state) {
+        if (!CONFIG.refining.enabled) return [];
+        const needs = [];
+        for (let slot = 0; slot < (refiningRoom(state)?.slots?.length || 0); slot++) {
+            const run = refiningConfiguredRun(slot);
+            if (run?.status !== 'running' || run.collectOnly) continue;
+            const recipe = refiningRoom(state).recipes?.find(row => sameId(row.id, run.config.recipeId));
+            const itemId = refiningItemId(recipe?.input_item), quantity = Number(recipe?.input_quantity);
+            if (itemId == null || !Number.isSafeInteger(quantity) || quantity <= 0) continue;
+            const task = refiningTask(state, slot);
+            const invested = task && run.flight?.taskId != null && sameId(task.task_id, run.flight.taskId) ? 1 : 0;
+            const remaining = Math.max(0, run.config.times - run.done - invested);
+            if (remaining) needs.push({ source: 'refining', slotId: String(slot), itemId, name: recipe.input_item.name || '',
+                minQuality: run.config.inputQuality, exactQuality: run.config.inputQuality, need: remaining * quantity });
+        }
+        return needs;
+    }
+    function refiningBlockReason(state, slot) {
+        const raw = refiningRun(slot), run = refiningConfiguredRun(slot), task = refiningTask(state, slot);
+        if (raw?.flight?.phase === 'uncertain' || raw?.flight && raw.flight.phase !== 'active') return raw.flight.reason || '本批请求待核对';
+        if (raw && !run && raw.status !== 'completed') return '配置已变化，本轮暂停；请恢复原配置或待本批结束后重新执行';
+        if (!run) {
+            const config = refiningConfig(slot);
+            if (task) return refiningTargetTime(task, config.targetQuality) == null ?
+                `本批无法达到${refiningQualityName(config.targetQuality)}（上限 ${refiningQualityName(task.max_quality)}），请降低领取目标` : '手动任务：选择领取品质后可接管本批';
+            return (config.recipeId && refiningRecipeCheck(state, config).reason) || '配置后点击执行一轮';
+        }
+        if (run.status === 'completed') return '本轮已完成，点击执行可重新开始';
+        if (run.status === 'stopped') return '已停止自动投料与领取，进度保留';
+        if (!CONFIG.refining.enabled) return '精制管理已关闭';
+        if (run.flight) {
+            if (!task || !sameId(task.task_id, run.flight.taskId)) return '任务已变化，请等待同步核对';
+            const readyAt = refiningTargetTime(task, run.config.targetQuality);
+            if (readyAt == null) return `本批无法达到${refiningQualityName(run.config.targetQuality)}（上限 ${refiningQualityName(task.max_quality)}），请停止后在游戏中处理`;
+            if (!CONFIG.refining.autoCollect) return '自动领取已关闭';
+            return readyAt <= serverNowSeconds() ? '已达目标品质，等待领取' : `距目标品质约 ${durationLabel(readyAt - serverNowSeconds())}`;
+        }
+        if (task) return '本格已有手动任务，不自动接管';
+        const check = refiningRecipeCheck(state, run.config);
+        if (check.reason) return check.reason;
+        if (!refiningRoom(state).assigned_partner) return '等待安排加工伙伴';
+        const available = refiningAvailableInputQty(state, check.inputId, run.config.inputQuality, slot);
+        return available < Number(check.recipe.input_quantity) ? `原料不足或已预留：${refiningQualityName(run.config.inputQuality)}可用 ${available}/${check.recipe.input_quantity}` : '原料就绪，等待投料';
+    }
+    function refiningNextReadyAt(state) {
+        if (!CONFIG.refining.enabled || !CONFIG.refining.autoCollect) return 0;
+        let next = Infinity;
+        for (let slot = 0; slot < (refiningRoom(state)?.slots?.length || 0); slot++) {
+            const run = refiningConfiguredRun(slot), task = refiningTask(state, slot);
+            if (run?.status !== 'running' || run.flight?.phase !== 'active' || !sameId(task?.task_id, run.flight.taskId)) continue;
+            const readyAt = refiningTargetTime(task, run.config.targetQuality);
+            if (readyAt != null && readyAt > serverNowSeconds()) next = Math.min(next, readyAt);
+        }
+        return Number.isFinite(next) ? next : 0;
+    }
+    async function assignConfiguredRefiningPartner() {
+        if (!CONFIG.refining.autoAssignPartner || !CONFIG.refining.partnerId) return;
+        const state = runtime.state, room = refiningRoom(state), wanted = CONFIG.refining.partnerId;
+        if (!room?.built || room.locked || room.slots?.some(Boolean)) return;
+        const current = partnerRecordId(room.assigned_partner);
+        if (sameId(current, wanted)) return;
+        const partner = state.partners?.find(row => sameId(partnerRecordId(row), wanted));
+        if (!partner || !hasTendency(partner, 'crafting') || !isPartnerIdle(partner, state) ||
+            (current == null && assignedCount(state, 'crafting') >= industryCapacity(state, 'crafting'))) {
+            logSkip('refining:partner', '精制房：指定伙伴忙碌、不具备加工倾向或加工编制已满'); return;
+        }
+        await mutate('/refining/partner', { method: 'PUT', payload: { partner_id: wanted }, beforeWrite() {
+            if (!CONFIG.refining.enabled || !CONFIG.refining.autoAssignPartner || CONFIG.refining.partnerId !== wanted || runtime.state !== state) {
+                throw new ApiError('精制派驻条件已变化，下一轮重新检查', { code: 'aborted' });
+            }
+        } });
+        clearSkip('refining:partner');
+        log(`精制房：已派驻 ${partner.name || wanted}`);
+    }
+    async function doRefining() {
+        const initialRoom = refiningRoom(runtime.state);
+        if (!initialRoom?.built || initialRoom.unlocked === false) return;
+        for (let slot = 0; slot < (initialRoom.slots?.length || 0); slot++) reconcileRefiningRun(runtime.state, slot);
+        if (!CONFIG.refining.enabled) return;
+        try { await assignConfiguredRefiningPartner(); }
+        catch (error) { if (shouldAbortTick(error)) throw error; logSkip('refining:assign-failed', `精制派驻失败：${error.message}`); }
+        for (let slot = 0; slot < (refiningRoom(runtime.state)?.slots?.length || 0); slot++) {
+            if (!CONFIG.refining.enabled) return;
+            const run = refiningConfiguredRun(slot);
+            if (run?.status !== 'running' || run.done >= run.config.times || run.flight?.phase === 'uncertain') continue;
+            const state = runtime.state, task = refiningTask(state, slot);
+            const guard = () => {
+                const fresh = refiningConfiguredRun(slot);
+                if (!CONFIG.refining.enabled || fresh?.id !== run.id || fresh.status !== 'running' || runtime.state !== state) {
+                    throw new ApiError('精制计划已变化，下一轮重新检查', { code: 'aborted' });
+                }
+            };
+            if (run.flight) {
+                const readyAt = refiningTargetTime(task, run.config.targetQuality);
+                if (!CONFIG.refining.autoCollect || !sameId(task?.task_id, run.flight.taskId) || readyAt == null || readyAt > serverNowSeconds()) continue;
+                const activeFlight = { ...run.flight };
+                run.flight.phase = 'finishing'; saveRefiningRun(slot, run);
+                try {
+                    await mutate(`/refining/${slot}/finish`, { payload: { task_id: task.task_id, cancel: false }, beforeWrite() {
+                        guard();
+                        if (!CONFIG.refining.autoCollect || !sameId(refiningTask(runtime.state, slot)?.task_id, task.task_id)) throw new ApiError('精制领取条件已变化', { code: 'aborted' });
+                    } });
+                    if (refiningTask(runtime.state, slot)) throw new ApiError('精制领取后本格未清空，请核对', { code: 'invalid_state' });
+                    const latest = refiningRun(slot);
+                    if (latest?.id !== run.id) continue;
+                    latest.done = Math.min(latest.config.times, latest.done + 1); latest.flight = null;
+                    if (latest.done >= latest.config.times) latest.status = 'completed';
+                    saveRefiningRun(slot, latest); log(`精制格 ${slot + 1}：已按品质目标领取，本轮 ${latest.done}/${latest.config.times}`);
+                } catch (error) {
+                    const latest = refiningRun(slot);
+                    if (latest?.id === run.id) {
+                        latest.flight = error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived) ? activeFlight :
+                            { ...activeFlight, phase: 'uncertain', reason: '领取结果未确认，请核对本批是否已领取' };
+                        saveRefiningRun(slot, latest);
+                    }
+                    if (shouldAbortTick(error)) throw error;
+                    logSkip(`refining:finish:${slot}`, `精制格 ${slot + 1} 领取失败：${error.message}`);
+                }
+                continue;
+            }
+            if (task || run.collectOnly) continue;
+            const check = refiningRecipeCheck(state, run.config);
+            if (check.reason || !refiningRoom(state).assigned_partner ||
+                refiningAvailableInputQty(state, check.inputId, run.config.inputQuality, slot) < Number(check.recipe.input_quantity)) continue;
+            run.flight = { phase: 'submitting', taskId: null }; saveRefiningRun(slot, run);
+            try {
+                await mutate(`/refining/${slot}/start`, { payload: { recipe_id: run.config.recipeId, quality: run.config.inputQuality }, beforeWrite() {
+                    guard();
+                    if (refiningTask(runtime.state, slot) || refiningRecipeCheck(runtime.state, run.config).reason ||
+                        !refiningRoom(runtime.state).assigned_partner ||
+                        refiningAvailableInputQty(runtime.state, check.inputId, run.config.inputQuality, slot) < Number(check.recipe.input_quantity)) {
+                        throw new ApiError('精制投料条件已变化', { code: 'aborted' });
+                    }
+                } });
+                const started = refiningTask(runtime.state, slot), latest = refiningRun(slot);
+                if (!started || started.task_id == null || !sameId(refiningItemId(started.item), check.outputId)) {
+                    throw new ApiError('精制开工响应缺少可确认的任务，请核对', { code: 'invalid_state' });
+                }
+                if (latest?.id === run.id) { latest.flight = { phase: 'active', taskId: started.task_id }; saveRefiningRun(slot, latest); }
+                log(`精制格 ${slot + 1}：已投入 ${check.recipe.input_item.name || check.inputId}，领取目标${refiningQualityName(run.config.targetQuality)}`);
+            } catch (error) {
+                const latest = refiningRun(slot);
+                if (latest?.id === run.id) {
+                    latest.flight = error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived) ? null :
+                        { phase: 'uncertain', taskId: null, reason: '投料结果未确认，请核对本格，未确认前不会再次投料' };
+                    saveRefiningRun(slot, latest);
+                }
+                if (shouldAbortTick(error)) throw error;
+                logSkip(`refining:start:${slot}`, `精制格 ${slot + 1} 投料失败：${error.message}`);
+            }
+        }
+    }
+    const refiningEditorExpansion = new Map();
+    function renderRefiningSettings(state) {
+        const { group, body } = makeGroup('精制房', 'refining');
+        appendSetting(body, state, 'refining.enabled', '精制管理');
+        appendSetting(body, state, 'refining.autoCollect', '按目标品质自动领取');
+        appendSetting(body, state, 'refining.autoAssignPartner', '自动派驻指定伙伴');
+        const room = refiningRoom(state);
+        if (room?.built) {
+            const partnerId = partnerRecordId(room.assigned_partner);
+            const name = room.assigned_partner?.name || (state.partners || []).find(partner => sameId(partnerRecordId(partner), partnerId))?.name || (partnerId == null ? '未派驻伙伴' : String(partnerId));
+            body.appendChild(workCard('精制房伙伴', name, null, `加工能力 ${room.ability ?? '?'} · 新批次上限 ${refiningQualityName(room.max_quality)}`));
+        }
+        const { row: partnerRow, select: partnerSelect } = makeSelectRow('指定加工伙伴', '仅在全部精制格清空后调整，不会抢走其他岗位伙伴');
+        fillSelect(partnerSelect, (state.partners || []).filter(partner => hasTendency(partner, 'crafting')).map(partner => ({
+            value: partnerRecordId(partner), text: `${partner.name || partnerRecordId(partner)}${isPartnerIdle(partner, state) ? '' : '（已占用）'}`,
+        })), CONFIG.refining.partnerId || null, '不指定（由游戏手动安排）');
+        partnerSelect.onchange = () => { CONFIG.refining.partnerId = partnerSelect.value; wakeSoon(); };
+        body.appendChild(partnerRow);
+        body.appendChild(uiElement('p', 'rlt-note', '每次精制产出 1 件，不耗体力。选择配方不会自动投料；执行一轮后按目标品质领取，领满次数即停止。手动任务需明确接管。停止本轮会同时暂停投料与领取。原料优先满足委托、门贡、设施及已启动加工。'));
+        if (!room?.built) body.appendChild(uiElement('p', 'rlt-note', '精制房尚未建成，请先在游戏中建造。'));
+        for (let slot = 0; slot < (room?.slots?.length || 0); slot++) {
+            const config = refiningConfig(slot), run = refiningRun(slot), task = refiningTask(state, slot);
+            const card = workCard(`精制格 ${slot + 1}`, task?.item?.name || '空闲', null,
+                `${refiningBlockReason(state, slot)}${run ? ` · 已领取 ${run.done}/${run.config.times}` : ''}`);
+            card.appendChild(uiElement('p', 'rlt-note', `领取目标：${refiningQualityName(run?.flight ? run.config.targetQuality : config.targetQuality)}`));
+            const editor = uiElement('details');
+            const editorHeading = uiElement('summary', '', '配置本格');
+            editor.open = refiningEditorExpansion.get(slot) === true;
+            editorHeading.onclick = () => refiningEditorExpansion.set(slot, !editor.open);
+            editor.ontoggle = () => { if (editor.isConnected) refiningEditorExpansion.set(slot, editor.open); };
+            editor.appendChild(editorHeading);
+            card.appendChild(editor);
+            const locked = run?.status === 'running' || !!run?.flight;
+            const save = values => {
+                const latest = refiningRun(slot), fresh = currentViewState(), currentTask = refiningTask(fresh, slot);
+                if (busy || latest?.status === 'running' || latest?.flight || !refiningRoom(fresh)?.built ||
+                    (currentTask && Object.keys(values).some(key => key !== 'targetQuality'))) return;
+                const next = { ...refiningConfig(slot), ...values };
+                const currentRecipe = refiningRoom(fresh).recipes?.find(recipe => sameId(recipe.id, next.recipeId));
+                if (next.recipeId && !currentRecipe || !Number.isSafeInteger(next.times) || next.times < 1 || next.times > 99 ||
+                    !Number.isSafeInteger(next.targetQuality) || next.targetQuality < 1 || next.targetQuality > 4 ||
+                    (next.recipeId && values.inputQuality != null && !currentRecipe?.options?.some(option => Number(option.quality) === next.inputQuality))) return;
+                setOverride(refiningConfigKey(slot), JSON.stringify(next)); wakeSoon();
+            };
+            const { row, select } = makeSelectRow('精制配方', '选择投入原料与产物');
+            fillSelect(select, (room.recipes || []).map(recipe => ({ value: recipe.id,
+                text: `${recipe.input_item?.name || '?'} ×${recipe.input_quantity} → ${recipe.item?.name || recipe.id} ×1`, disabled: recipe.unlocked === false })), config.recipeId || null, '请选择');
+            select.disabled = locked || !!task;
+            select.onchange = () => {
+                const recipe = room.recipes.find(recipe => sameId(recipe.id, select.value));
+                const quality = recipe?.options?.some(option => Number(option.quality) === config.inputQuality) ? config.inputQuality : Number(recipe?.options?.[0]?.quality ?? 1);
+                save({ recipeId: select.value, inputQuality: quality });
+            };
+            editor.appendChild(row);
+            const recipe = room.recipes.find(recipe => sameId(recipe.id, config.recipeId));
+            const { row: qualityRow, select: qualitySelect } = makeSelectRow('原料品质', '严格使用所选品质，不混用其他品质');
+            fillSelect(qualitySelect, (recipe?.options || []).map(option => ({ value: option.quality,
+                text: `${refiningQualityName(option.quality)}（${option.quality}）· 持有 ${option.owned ?? 0}` })), config.inputQuality, '请选择');
+            qualitySelect.disabled = locked || !!task;
+            qualitySelect.onchange = () => save({ inputQuality: Number(qualitySelect.value) }); editor.appendChild(qualityRow);
+            const { row: targetRow, select: targetSelect } = makeSelectRow('领取目标品质', '达到所选品质后领取；继续等待可能提升品质');
+            fillSelect(targetSelect, [1, 2, 3, 4].map(quality => ({ value: quality, text: `${refiningQualityName(quality)}（${quality}）` })), config.targetQuality, '请选择');
+            targetSelect.disabled = locked;
+            targetSelect.onchange = () => save({ targetQuality: Number(targetSelect.value) }); editor.appendChild(targetRow);
+            for (const [key, label, max] of [['times', '本轮执行次数', 99]]) {
+                const input = makeNumberInput(config[key], { min: 1, max, title: label, onchange: value => save({ [key]: value }) });
+                input.disabled = locked || (!!task && key === 'times');
+                const control = makeControlRow(label); control.row.append(control.label, input); editor.appendChild(control.row);
+            }
+            const actions = uiElement('div', 'rlt-craft-actions');
+            const action = (label, handler, disabled = false, className = '') => {
+                const button = uiElement('button', className, label); button.disabled = disabled;
+                button.dataset.focusKey = `refining:${slot}:${label.startsWith('核对') ? label : 'execute'}`;
+                button.setAttribute('aria-label', `精制格 ${slot + 1}：${label}`);
+                button.onclick = () => { handler(); wakeSoon(); lastConfigState = null; refreshConfigRows(currentViewState()); };
+                actions.appendChild(button);
+            };
+            if (run?.flight?.phase === 'uncertain' || run?.flight && run.flight.phase !== 'active') {
+                if (task) action('核对：确认接管此批', () => {
+                    if (window.confirm('确认本格任务属于本轮，并将其作为本轮一份计数？确认后仍需点击继续。')) resolveRefiningUncertain(currentViewState(), slot, 'adopt');
+                }, busy || run.flight.phase !== 'uncertain');
+                else for (const [label, type] of [['核对：本批已领取', 'collected'], ['核对：未投料或已取消', 'not-collected']]) action(label, () => {
+                    if (window.confirm(`${label}？将按此结果结算记录，未完成次数保留。`)) resolveRefiningUncertain(currentViewState(), slot, type);
+                }, busy || run.flight.phase !== 'uncertain');
+            } else if (run?.status === 'running') action('停止本轮', () => stopRefiningRun(slot), false, 'rlt-craft-stop');
+            else if (task && !run?.flight) action('接管当前批（仅领取）', () => {
+                if (window.confirm(`仅接管当前这一批，达到${refiningQualityName(refiningConfig(slot).targetQuality)}后领取，不继续投入原料。`)) adoptRefiningTask(currentViewState(), slot);
+            }, busy || refiningTargetTime(task, config.targetQuality) == null, 'rlt-craft-primary');
+            else {
+                const resumeTask = run?.status === 'stopped' && run.flight?.phase === 'active';
+                const disabled = busy || (run?.flight && !resumeTask) || (resumeTask ?
+                    !refiningConfiguredRun(slot) || !sameId(task?.task_id, run.flight.taskId) || refiningTargetTime(task, run.config.targetQuality) == null :
+                    !!refiningRecipeCheck(state, config).reason);
+                action(run?.status === 'stopped' ? '继续本轮' : '执行一轮', () => startRefiningRun(currentViewState(), slot), disabled, 'rlt-craft-primary');
+            }
+            card.appendChild(actions); body.appendChild(card);
+        }
+        configBox.appendChild(group);
+    }
+
+    const FACILITY_KINDS = ['farm', 'feed', 'refining'];
+    const facilityReserveKey = kind => `rlt-facility-reserve:${kind}`;
+    function selectedFacilityUpgrades(state) {
+        if (!CONFIG.facilities.reserveMaterials) return [];
+        return (state.facilities?.upgrades || []).filter(upgrade => FACILITY_KINDS.includes(upgrade.kind) &&
+            sameId(upgrade.id, getOverride(facilityReserveKey(upgrade.kind))));
+    }
+    function facilityMaterialNeeds(state) {
+        return selectedFacilityUpgrades(state).flatMap(upgrade => (upgrade.inputs || []).map(input => ({
+            source: 'facility', itemId: input.item_id ?? input.item?.item_id ?? null,
+            name: input.name || input.item?.name || '', minQuality: Number(input.min_quality || 0),
+            need: Number(input.quantity), purpose: `设施「${upgrade.name || upgrade.id}」`,
+        })).filter(need => need.itemId != null && Number.isFinite(need.need) && need.need > 0));
+    }
+    function renderFacilitySettings(state) {
+        const { group, body } = makeGroup('设施改良 · 材料预留', 'facilities');
+        appendSetting(body, state, 'facilities.reserveMaterials', '启用设施材料预留');
+        body.appendChild(uiElement('p', 'rlt-note', '选中一个改良阶段后，为它保留材料，售卖、投喂、接单、加工和精制都会避让。建造仍在游戏中操作；阶段完成后释放该阶段预留。'));
+        const upgrades = state.facilities?.upgrades || [];
+        const selectedMaterials = upgrades.filter(upgrade => FACILITY_KINDS.includes(upgrade.kind) &&
+            sameId(upgrade.id, getOverride(facilityReserveKey(upgrade.kind))))
+            .flatMap(upgrade => upgrade.inputs || []);
+        for (const [kind, label] of [['farm', '农田改良'], ['feed', '饲料设施'], ['refining', '精制房建设']]) {
+            const selected = getOverride(facilityReserveKey(kind));
+            const options = upgrades.filter(upgrade => upgrade.kind === kind);
+            const { row, select } = makeSelectRow(label, '只预留明确选择的这一阶段材料；不自动购买或建造');
+            fillSelect(select, options.map(upgrade => ({ value: upgrade.id,
+                text: `${upgrade.name || upgrade.id}${upgrade.unlocked === false ? '（可提前备料）' : ''}` })), selected, '不预留');
+            select.onchange = () => { setOverride(facilityReserveKey(kind), select.value); wakeSoon(); };
+            body.appendChild(row);
+            const upgrade = options.find(candidate => sameId(candidate.id, selected));
+            if (!upgrade) {
+                if (selected) body.appendChild(uiElement('p', 'rlt-note', '原阶段已完成或当前不可用；可重新选择下一阶段。'));
+                continue;
+            }
+            const materials = upgrade.inputs || [];
+            const card = workCard(upgrade.name || label, CONFIG.facilities.reserveMaterials ? '预留中' : '预留暂停',
+                null, `需要 ${materials.length} 项材料 · 建造费用 ${Number(upgrade.coins || 0)} 币`);
+            for (const input of materials) {
+                const id = input.item_id ?? input.item?.item_id;
+                const owned = inventoryQty(state, id, input.name || input.item?.name || '', input.min_quality || 0);
+                card.appendChild(uiElement('p', 'rlt-material-note',
+                    `${input.name || input.item?.name || id}：库存 ${owned} / 本项目 ${input.quantity}${Number(input.min_quality) > 0 ? `（品质 ≥ ${input.min_quality}）` : ''}`));
+                const shared = selectedMaterials.filter(row => sameId(row.item_id ?? row.item?.item_id, id));
+                if (shared.length > 1) {
+                    const required = shared.reduce((sum, row) => sum + Number(row.quantity), 0);
+                    const thresholds = [...new Set([0, ...shared.map(row => Number(row.min_quality || 0))])];
+                    // 每个品质门槛以上的需求累加，不能让两个项目重复使用同一份库存。
+                    const missing = Math.max(0, ...thresholds.map(quality =>
+                        shared.filter(row => Number(row.min_quality || 0) >= quality).reduce((sum, row) => sum + Number(row.quantity), 0) -
+                        inventoryQty(state, id, '', quality)));
+                    card.appendChild(uiElement('p', missing > 0 ? 'rlt-warning' : 'rlt-material-note',
+                        `已选项目合计 ${required} 件${missing > 0 ? `，尚缺 ${missing} 件（按品质门槛）` : '；库存由各项目共用'}`));
+                }
+            }
+            body.appendChild(card);
+        }
+        if (!state.facilities) body.appendChild(uiElement('p', 'rlt-note', '等待游戏设施数据。已选项目将在数据恢复后显示。'));
+        body.appendChild(uiElement('p', 'rlt-note', '多个项目需要同一物品时预留量累加；金币仅作建造参考，不锁定余额。'));
+        configBox.appendChild(group);
+    }
+
     function gatherNeeds(state, { productionOnly = false } = {}) {
         return memoizedForState(state, productionOnly ? 'needs:production' : 'needs',
             () => gatherNeedsUncached(state, { productionOnly }));
@@ -2631,7 +3123,7 @@
                 name: cm.item?.name || '', minQuality: 0, need: Number(cm.quantity || 0), commission: cm,
             });
         }
-        if (!productionOnly) needs.push(...sailingMaterialNeeds(state));
+        if (!productionOnly) needs.push(...sailingMaterialNeeds(state), ...facilityMaterialNeeds(state), ...refiningMaterialNeeds(state));
         return needs;
     }
 
@@ -2645,12 +3137,12 @@
     }
 
     function inFlightCropQty(state, need) {
-        if (need.minQuality > 0) return 0; // 品质尚未结算，不能把在途作物当作保证库存
+        if (need.minQuality > 1) return 0; // 普通品质为 1（兼容旧 0）；更高品质尚未结算，不能视为保证库存。
         let qty = 0;
         for (const plot of state.plots || []) {
             if (plot.empty || !plot.crop || !cropMatchesNeed(plot.crop, need)) continue;
             const minimum = Number(plot.crop.yield_min ?? 1);
-            if (Number.isFinite(minimum) && minimum > 0) qty += minimum;
+            if (Number.isFinite(minimum) && minimum > 0) qty += minimum * plotSize(plot);
         }
         return qty;
     }
@@ -2711,12 +3203,12 @@
                 const key = productionNeedKey(state, need);
                 if (!pending.has(key)) pending.set(key, inFlightCropQty(state, { ...need, minQuality: 0 }));
                 // 普通需求已分配的在途产物不能再用于高品质试种。
-                if (need.minQuality <= 0) pending.set(key, Math.max(0, pending.get(key) -
+                if (need.minQuality <= 1) pending.set(key, Math.max(0, pending.get(key) -
                     Math.max(0, (withoutCrops.get(need) || 0) - (shortages.get(need) || 0))));
             }
             return needs.map(need => {
                 const shortage = shortages.get(need) || 0, key = productionNeedKey(state, need);
-                const trial = need.minQuality > 0 ? Math.min(shortage, pending.get(key) || 0) : 0;
+                const trial = need.minQuality > 1 ? Math.min(shortage, pending.get(key) || 0) : 0;
                 pending.set(key, Math.max(0, (pending.get(key) || 0) - trial));
                 return { need, shortage, pending: trial };
             });
@@ -2755,16 +3247,18 @@
         let budget = null;
         const maxStamina = Math.max(Number(state.player?.stamina_cap ?? Infinity), liveStamina(state));
         const candidates = (state.crops || []).filter(crop => {
-            const cost = Number(crop.stamina_cost || 0);
+            const cost = Number(crop.stamina_cost || 0) * plotSize(plot);
             if (cropId(crop) == null || crop.seed_item_id == null || crop.unlocked === false || crop.locked ||
                 !Number.isFinite(cost) || cost < 0 || cost > maxStamina) return false;
-            if (seedQty(state, crop) > 0) return true;
+            const missing = seedMissing(state, crop, plot);
+            if (!missing) return true;
             if (!cfg.autoBuySeeds) return false;
             const entry = seedShopEntry(state, crop);
             if (!entry) return false;
-            if (Number(entry.price) <= playerCoins(state)) return true;
+            const price = Number(entry.price) * missing;
+            if (price <= playerCoins(state)) return true;
             budget ??= seedPurchaseBudget(state);
-            return Number(entry.price) <= budget;
+            return price <= budget;
         });
         const ability = farmingAbility(state, plot);
         if (CONFIG.commissions.enabled || cfg.seedStrategy !== 'profit') {
@@ -2775,7 +3269,7 @@
                 const matched = candidates.filter(crop => cropMatchesNeed(crop, need));
                 const duration = crop => {
                     const seconds = calcSeconds(crop.growth_seconds, crop.time_difficulty, ability, crop.minimum_duration_seconds ?? 1);
-                    const yieldMin = Number(crop.yield_min ?? 1);
+                    const yieldMin = Number(crop.yield_min ?? 1) * plotSize(plot);
                     return seconds > 0 && Number.isFinite(seconds) && Number.isFinite(yieldMin) && yieldMin > 0
                         ? seconds * Math.ceil(missing / yieldMin) : Infinity;
                 };
@@ -2784,7 +3278,7 @@
                 const reason = need.source === 'commission'
                     ? `今日委托缺 ${need.name || need.itemId} ×${shortage}`
                     : `传送门「${need.portal?.name || need.portal?.portal_id || ''}」缺 ${need.name || need.itemId} ×${shortage}`;
-                return { crop, reason: reason + (need.minQuality > 0 ? `（品质 ≥ ${need.minQuality}${pending > 0 ? `，在途试种 ${pending} 件` : ''}）` : ''), need };
+                return { crop, reason: reason + (need.minQuality > 1 ? `（品质 ≥ ${need.minQuality}${pending > 0 ? `，在途试种 ${pending} 件` : ''}）` : ''), need };
             }
         }
 
@@ -2917,16 +3411,19 @@
     }
 
     // 为一个物品的全部品质栈统一分配需求：高门槛需求优先，使用最低可满足品质。
-    function reservedStacksForItem(state, stacks, craftingReserves = null, { dedicatedFeed = false } = {}) {
-        const needs = gatherNeeds(state).filter(n => stacks.some(item => needMatchesItem(n, item)))
-            .sort((a, b) => b.minQuality - a.minQuality);
+    function reservedStacksForItem(state, stacks, craftingReserves = null, { dedicatedFeed = false, excludeRefiningSlot = null } = {}) {
+        const needs = gatherNeeds(state).filter(n =>
+            !(excludeRefiningSlot != null && n.source === 'refining' && Number(n.slotId) >= Number(excludeRefiningSlot)) &&
+            stacks.some(item => needMatchesItem(n, item)))
+            .sort((a, b) => Number(b.exactQuality != null) - Number(a.exactQuality != null) || b.minQuality - a.minQuality);
         const rows = stacks.map(item => ({ item, free: Number(item.quantity || 0), reserved: 0 }))
             .sort((a, b) => Number(a.item.quality || 0) - Number(b.item.quality || 0));
         for (const need of needs) {
             let remaining = need.need;
             for (const row of rows) {
                 if (remaining <= 0) break;
-                if (Number(row.item.quality || 0) < need.minQuality) continue;
+                const quality = Number(row.item.quality || 0);
+                if (need.exactQuality != null ? quality !== Number(need.exactQuality) : quality < need.minQuality) continue;
                 const take = Math.min(row.free, remaining);
                 row.free -= take;
                 row.reserved += take;
@@ -2944,6 +3441,30 @@
             keep -= take;
         }
         return rows;
+    }
+
+    function refiningAvailableInputQty(state, itemId, quality, slot) {
+        const stacks = (state.inventory || []).filter(item => sameId(item.item_id, itemId));
+        return reservedStacksForItem(state, stacks, craftingInputReserves(state),
+            { dedicatedFeed: true, excludeRefiningSlot: slot })
+            .filter(row => Number(row.item.quality || 0) === Number(quality))
+            .reduce((sum, row) => sum + Math.max(0, Math.floor(row.free)), 0);
+    }
+
+    // 不指定品质的接口可能先扣高品质：保证扣到精制所需的确切品质前必须停下。
+    function exactQualityConsumeCeiling(state, itemId, name, needs) {
+        const exact = new Map();
+        for (const need of needs) if (need.exactQuality != null) {
+            const quality = Number(need.exactQuality);
+            exact.set(quality, (exact.get(quality) || 0) + need.need);
+        }
+        let ceiling = Infinity;
+        for (const [quality, quantity] of exact) {
+            const atOrAbove = inventoryQty(state, itemId, name, quality);
+            const above = inventoryQty(state, itemId, name, quality + 1);
+            ceiling = Math.min(ceiling, above + Math.max(0, atOrAbove - above - quantity));
+        }
+        return ceiling;
     }
 
     // 探索物品硬保护：武器/饰品（equipment 字段）与探索携带道具（delve_use 字段）即使 id 进了白名单也永不出售。
@@ -2981,14 +3502,15 @@
     // applyKeep：是否套用 selling 的保留量（defaultKeep/keepByItemId）——售卖/接单场景要保留，
     // 加工投料场景不能保留，否则库存不足 defaultKeep 的合法原料会被误判为“材料不足”
     // 航海仅跳过默认售卖保留量；明确指定的保留量和加工预留仍然生效。
-    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, applyDefaultKeep = true, excludeSailing = false } = {}) {
+    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, applyDefaultKeep = true, excludeSailing = false, excludeRefining = false } = {}) {
         const stacks = (state.inventory || []).filter(i => itemId != null ? sameId(i.item_id, itemId) : i.name === name);
         if (!stacks.length) return 0;
-        const needs = gatherNeeds(state).filter(n => (!excludeSailing || n.source !== 'sailing') && stacks.some(item => needMatchesItem(n, item)));
+        const needs = gatherNeeds(state).filter(n => (!excludeSailing || n.source !== 'sailing') &&
+            (!excludeRefining || n.source !== 'refining') && stacks.some(item => needMatchesItem(n, item)));
         const thresholds = new Set([0, ...needs.map(n => Number(n.minQuality || 0))]);
         const craftingReserves = reserveCraftingInputs ? craftingInputReserves(state) : null;
         const keep = applyKeep ? configuredKeep(itemId, craftingReserves, { applyDefaultKeep }) : 0;
-        let safe = Infinity;
+        let safe = exactQualityConsumeCeiling(state, itemId, name, needs);
         for (const q of thresholds) {
             const eligible = stacks.filter(i => Number(i.quality || 0) >= q)
                 .reduce((sum, i) => sum + Number(i.quantity || 0), 0);
@@ -3035,35 +3557,40 @@
         return ok;
     }
 
-    async function buySeedForCrop(crop, reason, beforeWrite) {
+    async function buySeedForCrop(crop, reason, beforeWrite, plot = null) {
         let state = runtime.state;
         const cfg = CONFIG.farming;
         if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds) return false;
+        const quantity = seedMissing(state, crop, plot);
+        if (!quantity) return true;
         const entry = seedShopEntry(state, crop);
         if (!entry) {
             logSkip(`seed:unavailable:${cropId(crop)}`, `${crop.name || '目标作物'} 没有可购买的种子`);
             return false;
         }
-        const price = Number(entry.price || 0);
+        const price = Number(entry.price) * quantity;
         if (playerCoins(state) < price && cfg.autoSellForSeeds) {
-            log(`金币不足（${playerCoins(state)}/${price}），尝试安全售卖以购买 1 粒种子...`);
+            log(`金币不足（${playerCoins(state)}/${price}），尝试安全售卖以补足 ${quantity} 粒种子...`);
             await autoSellForCoins(price, beforeWrite);
             state = runtime.state;
         }
         beforeWrite?.();
         if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds) return false;
         if (playerCoins(state) < price) return false;
-        await buyItem(entry.id, 1, () => {
+        await buyItem(entry.id, quantity, () => {
             beforeWrite?.();
             const freshEntry = seedShopEntry(runtime.state, crop);
+            const freshPlot = plot == null ? null : (runtime.state.plots || []).find(candidate => sameId(candidate.slot, plot.slot));
             if (!cfg.enabled || !cfg.autoPlant || !cfg.autoBuySeeds || runtime.state !== state ||
-                !freshEntry || !sameId(freshEntry.id, entry.id) || Number(freshEntry.price) !== price) {
+                (plot != null && (!freshPlot?.empty || plotSize(freshPlot) !== plotSize(plot))) ||
+                seedMissing(runtime.state, crop, freshPlot) !== quantity ||
+                !freshEntry || !sameId(freshEntry.id, entry.id) || Number(freshEntry.price) * quantity !== price || playerCoins(runtime.state) < price) {
                 throw new ApiError('购种条件已变化，下一轮重新选种', { code: 'aborted' });
             }
-        }); // 按需逐粒购买，避免为了填满所有空地过度变卖
+        }); // 只补当前田的种子缺口；双倍田缺两粒时一次买齐。
         clearSkip('seed:poor');
         clearSkip(`seed:unavailable:${cropId(crop)}`);
-        log(`已购买 ${entry.item?.name || entry.id} ×1（${reason}，花费 ${price}）`);
+        log(`已购买 ${entry.item?.name || entry.id} ×${quantity}（${reason}，花费 ${price}）`);
         return true;
     }
 
@@ -3168,7 +3695,7 @@
             for (const plot of runtime.state.plots || []) {
                 if (!plot.empty && !plot.ready && hasActiveItem('farming', plot.slot)) {
                     targets.push({
-                        industry: 'farming', id: plot.slot, label: `土地 ${plot.slot + 1}`,
+                        industry: 'farming', id: plot.slot, label: plotLabel(plot),
                         current: () => (runtime.state.plots || []).find(p => p.slot === plot.slot),
                     });
                 }
@@ -3199,8 +3726,17 @@
             const threshold = Number(item?.value || 0);
             if (!item || readyAt <= 0 || remaining <= 0 || threshold <= 0 || remaining > threshold) continue;
             const itemId = taskItemRecordId(item);
+            const revision = settingsRevision;
             try {
-                await useTaskItem(target.industry, target.id, itemId);
+                await useTaskItem(target.industry, target.id, itemId, target.industry === 'farming' ? () => {
+                    const fresh = target.current(), remainingNow = taskReadyAt(fresh) - serverNowSeconds();
+                    const selected = slotTaskItem(runtime.state, 'farming', target.id, 'active', { notify: false });
+                    if (!CONFIG.farming.enabled || revision !== settingsRevision || !fresh || fresh.empty || fresh.ready ||
+                        plotSize(fresh) !== plotSize(node) || taskReadyAt(fresh) !== readyAt ||
+                        !sameId(taskItemRecordId(selected), itemId) || remainingNow <= 0 || remainingNow > Number(selected?.value || 0)) {
+                        throw new ApiError('农田道具条件已变化，下一轮重新核对', { code: 'aborted' });
+                    }
+                } : undefined);
                 used += 1;
                 clearSkip(`fail:active-item:${target.industry}:${target.id}:${itemId}`);
                 log(`${target.label}：已使用 ${item.name || '任务道具#' + itemId}（原剩余约 ${Math.ceil(remaining)} 秒）`);
@@ -3223,10 +3759,10 @@
             try {
                 await harvestPlot(slot);
                 clearSkip(`fail:harvest:${slot}`);
-                log(`土地 ${slot + 1}：已收获`);
+                log(`${plotLabel(plot)}：已收获`);
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
-                logSkip(`fail:harvest:${slot}`, `土地 ${slot + 1} 收获失败：${e.message}`);
+                logSkip(`fail:harvest:${slot}`, `${plotLabel(plot)} 收获失败：${e.message}`);
             }
         }
     }
@@ -3243,16 +3779,17 @@
             let state = runtime.state;
             let plot = (state.plots || []).find(p => p.slot === slot);
             if (!plot?.empty) continue;
+            const label = plotLabel(plot), size = plotSize(plot);
             const target = chooseCropTarget(state, plot);
             if (!target.crop) {
-                logSkip(`crop:blocked:${target.blocked}`, `土地 ${slot + 1}：${target.blocked || '没有可种作物'}`);
+                logSkip(`crop:blocked:${target.blocked}`, `${label}：${target.blocked || '没有可种作物'}`);
                 continue;
             }
             const { crop, reason } = target;
-            const cost = Number(crop.stamina_cost || 0);
+            const cost = Number(crop.stamina_cost || 0) * size;
             if (cost > liveStamina(state)) {
                 rememberStaminaNeed(state, cost, `种植 ${crop.name || cropId(crop)}`);
-                logSkip(`stamina:farming:${slot}`, `土地 ${slot + 1}：体力不足，等待种植 ${crop.name || cropId(crop)}`);
+                logSkip(`stamina:farming:${slot}`, `${label}：体力不足，等待种植 ${crop.name || cropId(crop)}（需 ${cost}）`);
                 continue;
             }
             clearSkip(`stamina:farming:${slot}`);
@@ -3264,17 +3801,21 @@
                     error.farmingPlanChanged = true;
                     throw error;
                 }
+                const freshPlot = (runtime.state.plots || []).find(candidate => sameId(candidate.slot, slot));
+                if (!freshPlot?.empty || plotSize(freshPlot) !== size) {
+                    throw new ApiError('田块已变化，下一轮重新选种', { code: 'aborted' });
+                }
             };
             try {
-                if (seedQty(state, crop) <= 0) {
+                if (seedMissing(state, crop, plot) > 0) {
                     if (!cfg.autoBuySeeds) {
                         logSkip(`seed:disabled:${cropId(crop)}`, `${crop.name || '目标作物'} 没有种子（可开启 autoBuySeeds）`);
                         continue;
                     }
-                    if (!await buySeedForCrop(crop, reason, checkChoice)) continue;
+                    if (!await buySeedForCrop(crop, reason, checkChoice, plot)) continue;
                     state = runtime.state;
                     plot = (state.plots || []).find(p => p.slot === slot);
-                    if (!plot?.empty || seedQty(state, crop) <= 0) continue;
+                    if (!plot?.empty || plotSize(plot) !== size || seedMissing(state, crop, plot) > 0) continue;
                 }
 
                 checkChoice();
@@ -3283,18 +3824,20 @@
                 await plantPlot(slot, cropId(crop), taskItemRecordId(startItem) ?? '', () => {
                     checkChoice();
                     const current = (runtime.state.plots || []).find(p => p.slot === slot);
-                    if (runtime.state !== state || !current?.empty || seedQty(runtime.state, crop) <= 0 || cost > liveStamina(runtime.state)) {
+                    const freshItem = slotTaskItem(runtime.state, 'farming', slot, 'start', { notify: false });
+                    if (runtime.state !== state || !current?.empty || plotSize(current) !== size || seedMissing(runtime.state, crop, current) > 0 ||
+                        cost > liveStamina(runtime.state) || (startItem && !sameId(taskItemRecordId(freshItem), taskItemRecordId(startItem)))) {
                         throw new ApiError('种植前状态已变化，下一轮重新选种', { code: 'aborted' });
                     }
                 });
                 clearSkip(`fail:plant:${slot}`);
                 clearSkip(`seed:disabled:${cropId(crop)}`);
                 const itemText = startItem ? `，使用 ${startItem.name || '任务道具#' + taskItemRecordId(startItem)}` : '';
-                log(`土地 ${slot + 1}：种下 ${crop.name || '作物#' + cropId(crop)}（${reason}${itemText}）`);
+                log(`${label}：种下 ${crop.name || '作物#' + cropId(crop)}（${reason}${itemText}）`);
             } catch (e) {
                 if (e.farmingPlanChanged) return;
                 if (shouldAbortTick(e)) throw e;
-                logSkip(`fail:plant:${slot}`, `土地 ${slot + 1} 购种或种植失败：${e.message}`);
+                logSkip(`fail:plant:${slot}`, `${label} 购种或种植失败：${e.message}`);
             }
         }
     }
@@ -3332,6 +3875,16 @@
             addPartnerIds(ids, facility.assigned_partners);
             addPartnerIds(ids, facility.pending_partner_ids);
             addPartnerIds(ids, facility.pending_partner ? [facility.pending_partner] : []);
+        }
+        return ids;
+    }
+
+    function refiningAssignedPartnerIds(state) {
+        const ids = new Set();
+        addPartnerIds(ids, [state?.facilities?.refining?.assigned_partner]);
+        for (const partner of state?.partners || []) {
+            const id = partnerRecordId(partner);
+            if (id != null && partner.assigned_refining) ids.add(String(id));
         }
         return ids;
     }
@@ -3692,7 +4245,10 @@
     // 当前已派驻到该产业的伙伴数
     function assignedCount(state, industry) {
         const field = ASSIGN_FIELD[industry];
-        return (state.partners || []).filter(p => p[field] != null).length;
+        const ids = new Set((state.partners || []).filter(p => p[field] != null)
+            .map(partnerRecordId).filter(id => id != null).map(String));
+        if (industry === 'crafting') for (const id of refiningAssignedPartnerIds(state)) ids.add(id);
+        return ids.size;
     }
 
     // 跳过类提示去重：同一原因只提示一次，条件解除后允许再次提示
@@ -3926,7 +4482,7 @@
         const actual = new Map(), pending = new Map(), uncertain = new Set();
         for (const item of state.inventory || []) {
             const id = String(item.item_id);
-            if (!actual.has(id)) actual.set(id, safeUnspecifiedConsumeQty(state, id, '', { reserveCraftingInputs: false, applyKeep: false }));
+            if (!actual.has(id)) actual.set(id, safeUnspecifiedConsumeQty(state, id, '', { reserveCraftingInputs: false, applyKeep: false, excludeRefining: true }));
         }
         for (const node of nodes) {
             const output = craftRecipeOutput(node.recipe || node.task_snapshot?.recipe ||
@@ -3955,14 +4511,14 @@
             const output = craftRecipeOutput(recipe); if (output) ids.add(output.id);
         }
         const protectedDebt = new Map(), growthRoom = new Map();
-        const needs = gatherNeeds(state);
+        const needs = gatherNeeds(state).filter(need => need.source !== 'refining');
         for (const id of ids) {
             const item = { item_id: id, name: itemMetadata(state, id)?.name || '' };
             const matching = needs.filter(need => needMatchesItem(need, item));
             const required = matching.reduce((sum, need) => sum + need.need, 0);
             const net = inventoryQty(state, id) + (pending.get(id) || 0) - required;
-            const thresholds = [...new Set(matching.map(need => need.minQuality).filter(quality => quality > 0))];
-            const ceiling = Math.min(Infinity, ...thresholds.map(quality => inventoryQty(state, id, '', quality) -
+            const thresholds = [...new Set(matching.map(need => need.minQuality).filter(quality => quality > 1))];
+            const ceiling = Math.min(exactQualityConsumeCeiling(state, id, '', matching), ...thresholds.map(quality => inventoryQty(state, id, '', quality) -
                 matching.filter(need => need.minQuality >= quality).reduce((sum, need) => sum + need.need, 0)));
             const safe = Math.max(0, Math.min(net, ceiling));
             pending.set(id, Math.max(0, safe - (actual.get(id) || 0)));
@@ -3978,8 +4534,9 @@
                 const stock = inventoryQty(state, input.id), safe = actual.get(input.id) || 0;
                 materialInfo.set(input.id, { stock, protected: Math.max(0, stock - safe), protections: needs
                     .filter(need => needMatchesItem(need, { item_id: input.id, name: input.name }))
-                    .map(need => ({ name: need.source === 'portal' ? `传送门「${need.portal?.name || need.portal?.portal_id || ''}」` :
-                        need.source === 'commission' ? '今日委托' : '航海用料', quantity: need.need, minQuality: need.minQuality })) });
+                    .map(need => ({ name: need.purpose || (need.source === 'portal' ? `传送门「${need.portal?.name || need.portal?.portal_id || ''}」` :
+                        need.source === 'commission' ? '今日委托' : need.source === 'refining' ? '精制用料' : '航海用料'),
+                        quantity: need.need, minQuality: need.minQuality, exactQuality: need.exactQuality })) });
             }
             return materialInfo.get(input.id);
         };
@@ -4321,12 +4878,12 @@
                     }
                     const recipe = node.recipe || node.task_snapshot?.recipe;
                     const future = Number(node.queued_count || 0) + (node.task_snapshot && !node.ready ? 1 : 0);
-                    if (recipe && future > 0 && !Number(need.minQuality || 0)) {
+                    if (recipe && future > 0 && Number(need.minQuality || 0) <= 1) {
                         for (const out of jobExpectedOutputs(recipe, 0, { conservative: true })) if (outputMatchesNeed(out, need)) qty += out.quantity * future;
                     }
                     continue;
                 }
-                if (node.empty || node.ready || Number(need.minQuality || 0) > 0) continue;
+                if (node.empty || node.ready || Number(need.minQuality || 0) > 1) continue;
                 const snapshot = node.task_snapshot;
                 const active = node.task || node.recipe || snapshot?.task || snapshot?.recipe || snapshot;
                 if (!active) continue;
@@ -4689,6 +5246,7 @@
         body.appendChild(row);
         if (CONFIG.feed.itemId && !selected.confirmed) body.appendChild(uiElement('p', 'rlt-warning', '所选物品尚未在本次游戏版本的可投喂列表中出现，等待游戏确认后再补充。'));
         else if (!selected.entry) body.appendChild(uiElement('p', 'rlt-note', `商店暂无「${selected.name}」，将使用可用库存；不足时等待补货或加工完成。`));
+        renderFeedQuality(body, state, selected);
     }
     function feedThresholds(slot) {
         const capacity = Number(slot?.capacity);
@@ -4711,7 +5269,8 @@
             const key = `${input.item_id}:${Number(input.quality || 0)}`;
             const previous = groups.get(key);
             if (!previous) groups.set(key, { input, conflict: false });
-            else if (Number(previous.input.units) !== Number(input.units)) previous.conflict = true;
+            else if (Number(previous.input.units) !== Number(input.units) || (CONFIG.feed.qualityTargetEnabled &&
+                feedUnitScore(previous.input) !== feedUnitScore(input))) previous.conflict = true;
         }
         // 同一品质是同一库存栈，重复条目不能重复计算库存；换算量冲突则等待兼容数据。
         return [...groups.values()].filter(row => !row.conflict).map(row => row.input);
@@ -4735,6 +5294,250 @@
             missing -= count * units; room -= count * units;
         }
         return { deposits, missing: Math.max(0, missing), room };
+    }
+    function feedUnitScore(input) {
+        if (input?.unit_score == null || input.unit_score === '') return null;
+        const value = Number(input.unit_score);
+        return Number.isFinite(value) && value >= 0 ? value : null;
+    }
+    function feedSettingsSignature() { return JSON.stringify(CONFIG.feed); }
+    function feedWriteGuard(state, revision, signature, build, onReady) {
+        return () => {
+            if (runtime.state !== state || settingsRevision !== revision || !CONFIG.feed.enabled ||
+                feedSettingsSignature() !== signature || detectedGameBuild() !== build) {
+                throw new ApiError('饲料状态或设置已变化，等待重新规划', { code: 'feed_replan' });
+            }
+            onReady?.();
+        };
+    }
+    // 整件投喂按份数做有界组合：相同份数仅保留品质最高的组合。
+    // 使用各品质的安全库存；只读计算，不假设品质编号等于单位品质分。
+    function feedQualityPlan(state, inputs, target) {
+        const slot = state.aquatic?.feed_slot, units = Number(slot?.units), capacity = Number(slot?.capacity);
+        const desired = Number(CONFIG.feed.qualityTarget), current = units === 0 ? 0 : feedUnitScore({ unit_score: slot?.quality_score });
+        const result = { feasible: false, deposits: [], units, quality: current, missing: Math.max(0, target - units), room: capacity - units, reason: '' };
+        if (!Number.isFinite(units) || units < 0 || !Number.isFinite(capacity) || capacity < units || current == null ||
+            !Number.isFinite(desired) || desired < 0 || !Number.isFinite(target)) {
+            result.reason = '饲料品质或容量数据不完整，等待确认'; return result;
+        }
+        const room = capacity - units, rows = inputs.map(input => ({ input, score: feedUnitScore(input),
+            count: Math.min(Math.floor(feedFreeQuantity(state, input)), Math.floor(room / Number(input.units))) }))
+            .filter(row => row.score != null && row.count > 0);
+        // 只有一种可用品质时直接解加权平均不等式，容量再大也不逐件枚举。
+        if (rows.length === 1) {
+            const row = rows[0], perItem = Number(row.input.units);
+            const margin = units * (current - desired), change = perItem * (row.score - desired);
+            if (!Number.isSafeInteger(row.count) || !Number.isFinite(margin) || !Number.isFinite(change)) {
+                result.reason = '饲料数量或品质数据超出可计算范围，等待确认'; return result;
+            }
+            let minimum = 0, maximum = row.count;
+            if (change > 0 && margin < 0) minimum = Math.ceil(-margin / change);
+            else if (change < 0) maximum = Math.min(maximum, Math.floor(margin / -change));
+            else if (change === 0 && margin < 0) maximum = -1;
+            if (minimum <= maximum) {
+                const count = Math.min(maximum, Math.max(minimum, Math.ceil(Math.max(0, target - units) / perItem)));
+                const added = count * perItem, total = units + added;
+                const quality = total > 0 ? (units * current + added * row.score) / total : 0;
+                if (Number.isFinite(quality) && quality + 1e-9 >= desired) {
+                    result.feasible = true; result.units = total; result.quality = quality;
+                    result.deposits = count > 0 ? [{ input: row.input, count }] : [];
+                    result.missing = Math.max(0, target - total); result.room = capacity - total;
+                    if (result.missing > 0) result.reason = '可用品质库存不足以补到水位目标';
+                    return result;
+                }
+            }
+            result.reason = '所选物品的安全库存无法在剩余容量内达到品质目标，等待合适品质补货或容量释放';
+            return result;
+        }
+        const plans = new Map([[0, { score: 0, tail: null }]]);
+        let work = 0;
+        for (const row of rows) {
+            let remaining = row.count;
+            for (let size = 1; remaining > 0; size *= 2) {
+                const count = Math.min(size, remaining); remaining -= count;
+                const added = count * Number(row.input.units), score = added * row.score;
+                for (const [amount, previous] of [...plans]) {
+                    if (++work > 1200000 || plans.size > 20000) {
+                        result.reason = '饲料品质组合过多，等待减少库存组合后重新检查'; return result;
+                    }
+                    const next = amount + added;
+                    if (next > room) continue;
+                    const value = previous.score + score;
+                    if (plans.has(next) && plans.get(next).score >= value) continue;
+                    plans.set(next, { score: value, tail: { previous: previous.tail, input: row.input, count } });
+                }
+            }
+        }
+        let best = null;
+        const wanted = Math.max(0, target - units);
+        for (const [amount, plan] of plans) {
+            const total = units + amount, quality = total > 0 ? (units * current + plan.score) / total : 0;
+            if (quality + 1e-9 < desired) continue;
+            const filled = amount >= wanted;
+            if (!best || (filled && !best.filled) || (filled === best.filled &&
+                (filled ? amount < best.amount : amount > best.amount))) best = { amount, plan, quality, filled };
+        }
+        if (!best) {
+            result.reason = room <= 0 ? '饲料槽已满，等待消耗腾出空间后提升品质' :
+                inputs.some(input => feedUnitScore(input) == null) ? '所选物品的部分单位品质分待确认，现有信息不足以达标' :
+                    '所选物品的安全库存无法在剩余容量内达到品质目标，等待合适品质补货或容量释放';
+            return result;
+        }
+        const deposits = new Map();
+        for (let part = best.plan.tail; part; part = part.previous) {
+            const key = Number(part.input.quality || 0), previous = deposits.get(key);
+            deposits.set(key, { input: part.input, count: (previous?.count || 0) + part.count });
+        }
+        // 高分先投入：已经达标时，每一步都不低于目标；原先未达标时先提高平均分。
+        result.deposits = [...deposits.values()].sort((a, b) => feedUnitScore(b.input) - feedUnitScore(a.input));
+        result.feasible = true; result.units = units + best.amount; result.quality = best.quality;
+        result.missing = Math.max(0, target - result.units); result.room = capacity - result.units;
+        if (result.missing > 0) result.reason = '可用品质库存不足以补到水位目标';
+        return result;
+    }
+    function feedQualityProductKey(feed, build) { return `rlt-feed-quality-product:${build || ''}:${feed.itemId}:${feed.entry?.id}`; }
+    function feedQualityProduct(state, feed, build) {
+        let product = readJson(feedQualityProductKey(feed, build));
+        const live = runtime.feedPurchase;
+        if (!product && live?.build === build && sameId(live.itemId, feed.itemId) && sameId(live.shopId, feed.entry?.id)) {
+            product = { quality: live.quality, units: live.units, attempted: true };
+        }
+        if (!product) return null;
+        product = { ...product };
+        if (product.quality == null && product.before) {
+            const before = { inventory: new Map(product.before.inventory), inputs: new Map(product.before.inputs) };
+            Object.assign(product, identifyPurchasedFeed(before, state, feed.itemId, product.quantity) || {});
+        }
+        const input = feedInputs(state, feed.itemId).find(row => product.quality != null && Number(row.quality || 0) === product.quality);
+        if (input) { product.units = Number(input.units); product.unit_score = feedUnitScore(input); }
+        else if ((state.aquatic?.feed_slot?.inputs || []).some(row => sameId(row.item_id, feed.itemId) &&
+            product.quality != null && Number(row.quality || 0) === product.quality)) {
+            product.units = 0; product.unit_score = null; // 当前数据冲突时不能用旧购买证据覆盖。
+        }
+        return product;
+    }
+    function feedQualityPurchaseState(state, feed, product, count) {
+        const inventory = (state.inventory || []).map(item => ({ ...item }));
+        let item = inventory.find(row => sameId(row.item_id, feed.itemId) && Number(row.quality || 0) === product.quality);
+        if (item) item.quantity = Number(item.quantity || 0) + count;
+        else inventory.push({ item_id: feed.itemId, name: feed.name, quality: product.quality, quantity: count });
+        const inputs = feedInputs(state, feed.itemId).map(input => ({ ...input }));
+        if (!inputs.some(input => Number(input.quality || 0) === product.quality)) {
+            inputs.push({ item_id: feed.itemId, item: { name: feed.name }, quality: product.quality,
+                units: product.units, unit_score: product.unit_score });
+        }
+        return { state: { ...state, inventory }, inputs };
+    }
+    function renderFeedQuality(body, state, feed = selectedFeed(state)) {
+        const slot = state.aquatic?.feed_slot;
+        if (!slot) return;
+        const format = value => value == null || !Number.isFinite(value) ? '待确认' : Number(value.toFixed(1)).toLocaleString();
+        const current = feedUnitScore({ unit_score: slot.quality_score }), inputs = feedInputs(state, feed.itemId);
+        const bounds = feedThresholds(slot);
+        const plan = CONFIG.feed.qualityTargetEnabled && bounds.valid ? feedQualityPlan(state, inputs, bounds.target) : null;
+        const rate = Number(slot.hourly_rate), endurance = units => Number.isFinite(rate) && rate > 0
+            ? durationLabel(units / rate * 3600) : rate === 0 ? '暂无消耗' : '待确认';
+        body.appendChild(uiElement('p', 'rlt-note', `品质分 ${format(current)}${CONFIG.feed.qualityTargetEnabled ? ` · 目标 ${format(Number(CONFIG.feed.qualityTarget))}` : ''}${plan?.deposits.length ? ` · 库存投喂后 ${format(plan.quality)}` : ''}`));
+        body.appendChild(uiElement('p', 'rlt-note', `当前续航 ${endurance(Number(slot.units))}${plan?.deposits.length ? ` → ${endurance(plan.units)}` : ''}`));
+        if (plan?.reason) body.appendChild(uiElement('p', 'rlt-warning', plan.reason));
+    }
+    async function doQualityFeed() {
+        const cfg = CONFIG.feed, signature = feedSettingsSignature(), build = detectedGameBuild();
+        let spent = 0;
+        for (let attempt = 0; attempt < 12 && running && cfg.enabled && feedSettingsSignature() === signature; attempt++) {
+            const state = runtime.state, revision = settingsRevision, slot = state.aquatic?.feed_slot;
+            if (!slot || !(state.aquatic?.unlocked || state.livestock?.unlocked)) return;
+            const bounds = feedThresholds(slot), feed = selectedFeed(state);
+            const wait = reason => { logSkip(`feed:quality:${reason}`, reason); };
+            if (!bounds.valid || !feed.confirmed) { wait('饲料上下限或所选物品数据待确认'); return; }
+            const current = Number(slot.units) === 0 ? 0 : feedUnitScore({ unit_score: slot.quality_score });
+            if (current == null || !Number.isFinite(cfg.qualityTarget) || cfg.qualityTarget < 0) { wait('饲料品质分或目标设置待确认'); return; }
+            const qualityLow = current + 1e-9 < cfg.qualityTarget;
+            if (!qualityLow && Number(slot.units) >= bounds.target) { setOverride(FEED_FILL_KEY, ''); return; }
+            if (!qualityLow && Number(slot.units) > bounds.low && getOverride(FEED_FILL_KEY) !== '1') return;
+            // 直接写标记不使设置修订号变化；本轮每次真正写入仍核对状态和所有库存保护设置。
+            localStorage.setItem(FEED_FILL_KEY, '1');
+            const inputs = feedInputs(state, feed.itemId), plan = feedQualityPlan(state, inputs, bounds.target);
+            const guard = onReady => feedWriteGuard(state, revision, signature, build, onReady);
+            let reason = plan.reason;
+            try {
+                if ((!plan.feasible || plan.missing > 0) && cfg.autoBuy && attempt < 11 && plan.room > 0) {
+                    const entry = feed.entry, price = Number(entry?.price);
+                    const allowance = Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent));
+                    const affordable = cfg.maxSpendPerTick > 0 && playerCoins(state) >= cfg.coinReserve && Number.isFinite(price) && price >= 0
+                        ? (price > 0 ? Math.floor(allowance / price) : 9999) : 0;
+                    if (!entry) reason = `商店暂无「${feed.name}」，等待符合品质目标的库存`;
+                    else if (!affordable) reason = '本轮饲料预算或金币保底不足，等待补充';
+                    else {
+                        const key = feedQualityProductKey(feed, build), product = feedQualityProduct(state, feed, build);
+                        const known = product?.quality != null && Number(product.units) > 0 && feedUnitScore(product) != null;
+                        let count = 0;
+                        if (!product) count = 1; // 每个商品/构建只允许一次未知品质识别，失败后等待同步。
+                        else if (!known) reason = '已购买识别商品，单位品质分或每件份数待确认，暂停重复购买';
+                        else {
+                            const maximum = Math.min(affordable, 100000);
+                            const evaluate = quantity => {
+                                const draft = feedQualityPurchaseState(state, feed, product, quantity);
+                                return feedQualityPlan(draft.state, draft.inputs, bounds.target);
+                            };
+                            const full = evaluate(maximum);
+                            if (full.feasible && (!plan.feasible || full.missing < plan.missing)) {
+                                let low = 1, high = maximum;
+                                while (low < high) {
+                                    const mid = Math.floor((low + high) / 2), candidate = evaluate(mid);
+                                    if (candidate.feasible && candidate.missing <= full.missing) high = mid;
+                                    else low = mid + 1;
+                                }
+                                count = Math.min(low, cfg.batchBuy ? 99 : 1);
+                            } else reason = full.reason || '商店所售品质无法改善当前补料计划，等待合适品质库存';
+                        }
+                        if (count > 0) {
+                            const before = feedPurchaseSnapshot(state, feed.itemId);
+                            const evidence = { ...product, attempted: true, before: { inventory: [...before.inventory], inputs: [...before.inputs] }, quantity: count };
+                            const previousEvidence = getOverride(key), submittedEvidence = JSON.stringify(evidence);
+                            let evidenceSaved = false;
+                            try {
+                                await buyItem(entry.id, count, guard(() => {
+                                    setOverride(key, submittedEvidence); evidenceSaved = true;
+                                }));
+                            } catch (error) {
+                                // 校准标记可能先于操作限额检查写入；确定未购买时恢复，避免永久等待不存在的商品。
+                                // 若其他操作已更新同一商品的证据，保留更新后的值。
+                                if (evidenceSaved && getOverride(key) === submittedEvidence &&
+                                    (error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived))) {
+                                    setOverride(key, previousEvidence);
+                                }
+                                throw error;
+                            }
+                            const observed = identifyPurchasedFeed(before, runtime.state, feed.itemId, count);
+                            const purchased = observed ? { ...evidence, ...observed } :
+                                { ...evidence, quality: null, units: 0, unit_score: null };
+                            const input = feedInputs(runtime.state, feed.itemId).find(row => purchased.quality != null && Number(row.quality || 0) === purchased.quality);
+                            if (input) { purchased.units = Number(input.units); purchased.unit_score = feedUnitScore(input); }
+                            setOverride(key, JSON.stringify(purchased));
+                            spent += price * count;
+                            log(`已购买${feed.name} ×${count}（${price * count} 金币，按品质目标检查后投喂）`);
+                            if (!observed) { wait('购买后的数量或品质尚未确认，暂停重复购买'); return; }
+                            continue;
+                        }
+                    }
+                }
+                if (plan.feasible && plan.deposits.length) {
+                    const { input, count } = plan.deposits[0];
+                    await depositFeed(input.item_id, Number(input.quality || 0), count, guard());
+                    const freshScore = feedUnitScore({ unit_score: runtime.state.aquatic?.feed_slot?.quality_score });
+                    log(`饲料槽：投入${feed.name} ×${count}，品质分 ${freshScore == null ? '待确认' : freshScore.toFixed(1)}`);
+                    if (Number(runtime.state.aquatic?.feed_slot?.units) <= Number(slot.units)) return;
+                    continue;
+                }
+                if (reason) wait(reason);
+                return;
+            } catch (error) {
+                if (error?.code === 'feed_replan') return;
+                if (shouldAbortTick(error)) throw error;
+                wait(`品质补料失败：${error.message}`); return;
+            }
+        }
     }
     function feedPurchaseSnapshot(state, itemId) {
         const quantities = rows => {
@@ -4774,13 +5577,15 @@
     async function doAquaticFeed() {
         const cfg = CONFIG.feed;
         if (!CONFIG.feed.enabled) return;
+        if (cfg.qualityTargetEnabled) return doQualityFeed();
+        const signature = feedSettingsSignature();
         let spent = 0;
         let calibrated = false;
         const build = detectedGameBuild();
         const selectedId = cfg.itemId;
         let purchasedFeed = runtime.feedPurchase?.build === build ? runtime.feedPurchase : null;
         const maxAttempts = 12;
-        for (let attempt = 0; attempt < maxAttempts && running && CONFIG.feed.enabled && cfg.itemId === selectedId; attempt++) {
+        for (let attempt = 0; attempt < maxAttempts && running && CONFIG.feed.enabled && cfg.itemId === selectedId && feedSettingsSignature() === signature; attempt++) {
             const state = runtime.state;
             const slot = state.aquatic?.feed_slot;
             if (!slot || !(state.aquatic?.unlocked || state.livestock?.unlocked)) return;
@@ -4832,7 +5637,7 @@
                             const count = Math.min(cfg.batchBuy ? 99 : 1, affordable, needed);
                             if (count > 0) {
                                 const before = feedPurchaseSnapshot(state, itemId);
-                                await buyItem(entry.id, count);
+                                await buyItem(entry.id, count, feedWriteGuard(state, settingsRevision, signature, build));
                                 const observed = identifyPurchasedFeed(before, runtime.state, itemId, count);
                                 // 已确认过商品时，单次响应的差值不明确不能抹掉已验证的换算量。
                                 purchasedFeed = { ...(sameProduct ? purchasedFeed : { itemId, quality: null, units: 0 }),
@@ -4852,7 +5657,7 @@
                 // 预算不足或购买不可用时，先投入现有可用库存，不要求整批买齐才投料。
                 if (plan.deposits.length) {
                     const { input, count } = plan.deposits[0];
-                    await depositFeed(input.item_id, Number(input.quality || 0), count);
+                    await depositFeed(input.item_id, Number(input.quality || 0), count, feedWriteGuard(state, settingsRevision, signature, build));
                     log(`饲料槽：投入${feed.name} ×${count}，余量 ${Math.floor(runtime.state.aquatic.feed_slot.units)} 份`);
                     if (Number(runtime.state.aquatic?.feed_slot?.units) <= Number(slot.units)) return;
                     continue;
@@ -4860,6 +5665,7 @@
                 if (blocked) logSkip(...blocked);
                 return;
             } catch (e) {
+                if (e?.code === 'feed_replan') return;
                 if (shouldAbortTick(e)) throw e;
                 logSkip('feed:failed', `「${feed.name}」补充失败：${e.message}`); return;
             }
@@ -4874,7 +5680,7 @@
         } catch { return []; }
     }
     function outsidePartnerIds(state, includeReserved = true) {
-        const ids = new Set();
+        const ids = new Set(refiningAssignedPartnerIds(state));
         addPartnerIds(ids, state?.exploration?.active_run?.partner_ids);
         addPartnerIds(ids, state?.sailing?.active_run?.partner_ids);
         if (includeReserved && CONFIG.sailing.enabled && CONFIG.sailing.autoStart && CONFIG.sailing.reservePartners) addPartnerIds(ids, sailingConfiguredIds());
@@ -5161,6 +5967,9 @@
     };
 
     function partnerPost(p, state = null) {
+        if (p.assigned_refining || (state && refiningAssignedPartnerIds(state).has(String(partnerRecordId(p))))) {
+            return p.locked ? '精制房·工作中' : '派驻于精制房';
+        }
         if (p.locked) return '任务中·已锁定';
         for (const [industry, field] of Object.entries(ASSIGN_FIELD)) {
             if (p[field] != null) return `派驻于${INDUSTRY_NAMES[industry] || industry}`;
@@ -5257,6 +6066,7 @@
             await useConfiguredActiveTaskItems();
             await collectReadyPlots();
             await collectReadyIndustries();
+            await doRefining();
             await doAquaticFeed();
             await doSailing();
             // 先把本轮新产物收入背包，再提交/承接委托，避免平白多等一轮。

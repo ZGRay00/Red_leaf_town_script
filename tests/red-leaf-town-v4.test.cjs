@@ -78,8 +78,10 @@ async function run() {
     await test('overflow stamina remains available', () => {
         const { h } = harness(); assert.equal(h.liveStamina(h.runtime.state), 150); assert.equal(h.staminaWaitSeconds(h.runtime.state, 130), 0);
     });
-    await test('six UI pages render, switches persist', () => {
-        const x = harness(); assert.equal(x.h.tabBar.children.length, 6); for (const b of x.h.tabBar.children) b.onclick();
+    await test('eight UI pages render, switches persist', () => {
+        const x = harness(); assert.deepEqual(Array.from(x.h.tabBar.children, b => b.dataset.page),
+            ['overview', 'production', 'crafting', 'refining', 'sailing', 'feed', 'facilities', 'settings']);
+        for (const b of x.h.tabBar.children) b.onclick();
         x.h.setSetting('crafting.enabled', false); assert.equal(x.h.CONFIG.crafting.enabled, false);
         assert.equal(harness(fixture(), [...x.storage]).h.CONFIG.crafting.enabled, false);
     });
