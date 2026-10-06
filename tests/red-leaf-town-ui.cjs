@@ -6,7 +6,22 @@ const state = fixture(), now = state.server_time;
 state.inventory.push({ item_id: 'pumpkin', name: '南瓜', quality: 1, quantity: 30 }, { item_id: 'grain_feed', name: '谷物饲料', quality: 0, quantity: 20 },
     { item_id: 'grape', name: '葡萄', quality: 1, quantity: 20 }, { item_id: 'wood', name: '木材', quality: 1, quantity: 30 });
 state.aquatic.feed_slot.inputs = [{ item_id: 'pumpkin', item: { name: '南瓜' }, quality: 1, quantity: 30, units: 30, unit_score: 60 }, { item_id: 'grain_feed', item: { name: '谷物饲料' }, quality: 0, quantity: 20, units: 90, unit_score: 80 }];
-state.plots = [{ slot: 0, size: 2, empty: false, ready: false, ready_at: now + 240, planted_at: now - 360, crop: { name: '南瓜' } }];
+state.plots = [{ slot: 0, size: 2, empty: false, ready: false, ready_at: now + 240, planted_at: now - 360, crop: { name: '南瓜' } },
+    { slot: 2, size: 1, empty: true, ready: false }, { slot: 3, size: 1, empty: true, ready: false }];
+state.next_plot_level = 8;
+state.player.coins = 5000;
+state.aquatic.ponds = [
+    { pond_id: 'pond1', definition: { name: '溪畔鱼塘', species_id: 'carp' }, stock: 40, population: 45, capacity: 50,
+        steady_stock: 30, fry: [{ count: 5, cycles_left: 2 }], last_settled_at: now - 300, next_cycle_seconds: 600 },
+    { pond_id: 'pond2', definition: { name: '山间鱼塘', species_id: 'trout' }, stock: 50, population: 60, capacity: 80,
+        steady_stock: 45, fry: [{ count: 10, cycles_left: 2 }], last_settled_at: now - 300, next_cycle_seconds: 900 },
+];
+state.aquatic.species = [
+    { id: 'carp', name: '鲤鱼', unlocked: true, owned_fry: 20 },
+    { id: 'trout', name: '鳟鱼', unlocked: true, owned_fry: 20 },
+];
+state.aquatic.buildable_ponds = [{ id: 'pond3', name: '第三口鱼塘', capacity: 100, min_level: 8,
+    unlocked: false, affordable: true, build_cost: 1000, build_materials: [{ item_id: 'wood', name: '木材', quantity: 8 }] }];
 state.crops = [{ id: 'pumpkin', name: '南瓜', seed_item_id: 'pumpkin_seed' }];
 state.partners = [{ partner_id: 'p1', name: '海风', tendencies: [{ industry: 'aquatic', effective_ability: 45 }] }, { partner_id: 'p2', name: '晨曦' }, { partner_id: 'p3', name: '林间' }];
 state.sailing.active_run = { run_id: 'demo', route_name: '芦苇湾', started_at: now - 1500, ready_at: now + 2100, partner_ids: ['p1'] };
@@ -16,7 +31,7 @@ state.crafting_stations.push({ ...structuredClone(state.crafting_stations[0]), s
     queue_remaining_seconds: 0, recipe: null, task_snapshot: null });
 state.facilities = {
     upgrades: [
-        { id: 'farm_2', kind: 'farm', name: '第二块双倍田', unlocked: true, coins: 1500, inputs: [{ item_id: 'wood', name: '木材', quantity: 20 }] },
+        { id: 'farm_2', kind: 'farm', stage: 2, name: '第二块双倍田', unlocked: true, affordable: true, coins: 1500, inputs: [{ item_id: 'wood', name: '木材', quantity: 20 }] },
         { id: 'feed_2', kind: 'feed', name: '扩充共用饲料槽', unlocked: true, coins: 1000, inputs: [{ item_id: 'wood', name: '木材', quantity: 10 }] },
     ],
     refining: { built: true, unlocked: true, ability: 120, max_quality: 4, locked: true,
@@ -31,7 +46,7 @@ state.facilities = {
 const source = fs.readFileSync(sourcePath, 'utf8').replace('if (CONFIG.ui.autoStart) start();', `window.__rltPreview = {
     runtime, refreshConfigRows, renderDashboard, setSetting, getOverride, start, stop, CONFIG,
     craftRun, startCraftRun, stopCraftRun, configuredCraftSteps, craftPipelineProgress, advanceCraftPipeline, finishCraftRun,
-    refiningConfig, refiningRun, startRefiningRun, stopRefiningRun
+    refiningConfig, refiningRun, startRefiningRun, stopRefiningRun, pondSettings, pondBuildEnabled, plotManagementMode
 };
 setOverride('rlt-node-job:crafting:kitchen', 'flour'); setOverride('rlt-craft-lock-times:kitchen', '3');
 setOverride('rlt-refining-config:1', JSON.stringify({recipeId:'grape_wine',inputQuality:1,targetQuality:3,times:2}));
@@ -52,6 +67,7 @@ async function main() {
     await send('Page.navigate', { url: pathToFileURL(preview).href });
     for (let tries = 0; tries < 50; tries++) { if (await evaluate('!!window.__rltPreview')) break; await new Promise(r => setTimeout(r, 100)); }
     assert.equal(await evaluate('!!window.__rltPreview'), true);
+    await evaluate('window.confirm=()=>true');
     async function screenshot(name) {
         const box = await evaluate(`(()=>{const r=document.querySelector('#rlt-auto-helper-panel').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,scale:1}})()`);
         const image = await send('Page.captureScreenshot', { format: 'png', clip: box }); fs.writeFileSync(path.join(__dirname, name + '.png'), Buffer.from(image.data, 'base64'));
@@ -64,6 +80,51 @@ async function main() {
         const overflow = await evaluate(`(()=>{const e=document.querySelector('#rlt-auto-helper-panel');return e.scrollWidth-e.clientWidth})()`); assert.ok(overflow <= 1, name + ' horizontal overflow');
         if (['crafting', 'feed', 'sailing', 'refining', 'facilities'].includes(name)) await screenshot('rlt-v4-' + name);
     }
+    // Actual single/double plots and ponds expose independent persistent controls.
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="production"]').click()`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('.rlt-config [data-plot-slot]')].map(e=>e.dataset.plotSlot)`), ['0', '2', '3']);
+    assert.equal(await evaluate(`document.querySelector('[data-plot-slot="0"]').textContent.includes('双倍田')`), true);
+    assert.equal(await evaluate(`document.querySelector('[data-plot-slot="0"]').textContent.includes('2 粒种子') || document.querySelector('[data-plot-slot="0"]').textContent.includes('2 倍用量')`), true);
+    const plotMode = '[data-plot-slot="0"] [data-control="plot-mode"]';
+    await evaluate(`(()=>{const e=document.querySelector('${plotMode}');e.focus();e.value='manual';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`window.__rltPreview.plotManagementMode(0)`), 'manual');
+    assert.equal(await evaluate(`window.__rltPreview.plotManagementMode(2)`), 'auto');
+    await evaluate(`(()=>{const e=document.querySelector('[data-plot-slot="0"] [data-control="plot-crop"]');e.focus();e.value='pumpkin';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`localStorage.getItem('rlt-plot-crop:0')`), 'pumpkin');
+    assert.equal(await evaluate(`localStorage.getItem('rlt-plot-crop:2')`), null);
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('等级 8 解锁')`), true);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    await evaluate(`document.querySelector('.rlt-config [data-plot-slot="0"]').scrollIntoView({block:'start'})`);
+    await screenshot('rlt-v451-double-plot');
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('.rlt-config [data-pond-id]')].map(e=>e.dataset.pondId)`), ['pond1', 'pond2']);
+    assert.deepEqual(await evaluate(`[...document.querySelector('[data-pond-id="pond2"] select[aria-label="投苗鱼种"]').options].map(e=>e.value)`), ['', 'trout']);
+    await evaluate(`(()=>{const e=document.querySelector('[data-pond-id="pond2"] input[data-pond-setting="keepStock"]');e.focus();e.value='46';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    await evaluate(`(()=>{const e=document.querySelector('[data-pond-id="pond2"] input[data-pond-setting="restockTarget"]');e.focus();e.value='0';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`window.__rltPreview.pondSettings('pond2').restockTarget`), 0, 'zero target must differ from inheriting the global default');
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    await evaluate(`(()=>{const e=document.querySelector('[data-pond-id="pond2"] input[data-pond-setting="restockTarget"]');e.focus();e.value='70';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    await evaluate(`(()=>{const e=document.querySelector('[data-pond-id="pond2"] select[aria-label="自动收鱼"]');e.focus();e.value='off';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.deepEqual(await evaluate(`(()=>{const a=window.__rltPreview;return [a.pondSettings('pond1').keepStock,a.pondSettings('pond2').keepStock,a.pondSettings('pond1').autoHarvest,a.pondSettings('pond2').autoHarvest]})()`), [30,46,true,false]);
+    await evaluate(`window.__rltPreview.setSetting('aquatic.pondKeepStock',12);window.__rltPreview.refreshConfigRows(window.fixtureState)`);
+    assert.deepEqual(await evaluate(`['pond1','pond2'].map(id=>window.__rltPreview.pondSettings(id).keepStock)`), [12,46], 'individual override survives a global default change');
+    await evaluate(`window.__rltPreview.setSetting('aquatic.pondKeepStock',30);window.__rltPreview.refreshConfigRows(window.fixtureState)`);
+    await evaluate(`(()=>{const e=document.querySelector('[data-pond-build-id="pond3"] select[aria-label="自动建造本塘"]');e.focus();e.value='on';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    assert.equal(await evaluate(`window.__rltPreview.pondBuildEnabled('pond3')`), true);
+    assert.equal(await evaluate(`window.__rltPreview.CONFIG.aquatic.autoBuildPonds`), false);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    await evaluate(`document.querySelector('.rlt-config [data-pond-id="pond2"]').scrollIntoView({block:'start'})`);
+    await screenshot('rlt-v451-second-pond');
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="overview"]').click()`);
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll('.rlt-dashboard [data-pond-id]')].map(e=>e.dataset.pondId)`), ['pond1','pond2']);
+    assert.equal(await evaluate(`document.querySelector('.rlt-dashboard [data-pond-id="pond2"]').textContent.includes('保留 46')`), true);
+    await evaluate(`document.querySelector('.rlt-tabs [data-page="production"]').click()`);
+    assert.equal(await evaluate(`document.querySelector('${plotMode}').value`), 'manual');
+    assert.equal(await evaluate(`document.querySelector('[data-pond-id="pond2"] input[data-pond-setting="restockTarget"]').value`), '70');
+    await evaluate(`document.querySelector('.rlt-config [data-focus-key="production:逐塘管理"]').click()`);
+    assert.equal(await evaluate(`(()=>{const e=document.querySelector('.rlt-config'),g=e.querySelector('[data-group="逐塘管理"]');return Math.abs(g.getBoundingClientRect().top-e.getBoundingClientRect().top)<2})()`), true, 'pond shortcut opens the correct section');
     // Real browser interaction: a module switch must update its ARIA state and persisted setting.
     await evaluate(`document.querySelector('.rlt-tabs [data-page="crafting"]').click()`);
     assert.equal(await evaluate(`document.querySelector('[aria-label="缺料自动加工"]').getAttribute('aria-checked')`), 'true');
@@ -140,7 +201,20 @@ async function main() {
     await evaluate(`new Promise(r=>setTimeout(r,40))`);
     assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('已选项目合计 30 件')`), true);
     assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('项备齐')`), false);
-    await screenshot('rlt-v450-facility-reservation');
+    const farmUpgrade = '[data-focus-key="facility:farm_2:execute"]';
+    assert.equal(await evaluate(`document.querySelector('${farmUpgrade}').disabled`), false);
+    await evaluate(`document.querySelector('${farmUpgrade}').click()`);
+    assert.equal(await evaluate(`window.__rltPreview.runtime.facilityUpgrade.projectId`), 'farm_2');
+    assert.equal(await evaluate(`document.querySelector('${farmUpgrade}').disabled`), true);
+    await evaluate(`[...document.querySelectorAll('button')].find(e=>e.textContent==='撤回本次安排').click()`);
+    assert.equal(await evaluate(`window.__rltPreview.runtime.facilityUpgrade`), null);
+    assert.equal(await evaluate(`localStorage.getItem('rlt-facility-upgrade-intent')`), null, 'queuing/cancelling offline must not send a game request');
+    await evaluate(`(()=>{const e=document.querySelector('select[aria-label="新鱼塘建设"]');e.value='pond3';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
+    await evaluate(`new Promise(r=>setTimeout(r,40))`);
+    assert.equal(await evaluate(`window.__rltPreview.getOverride('rlt-facility-reserve:pond')`), 'pond3');
+    assert.equal(await evaluate(`document.querySelector('.rlt-config').textContent.includes('已选项目合计 38 件')`), true);
+    assert.equal(await evaluate(`document.querySelector('${farmUpgrade}').disabled`), true, 'farm materials cannot consume the new pond reservation');
+    await screenshot('rlt-v451-facility-reservation');
     await evaluate(`document.querySelector('.rlt-tabs [data-page="feed"]').click();document.querySelector('[aria-label="启用品质目标"]').click()`);
     assert.equal(await evaluate(`window.__rltPreview.CONFIG.feed.qualityTargetEnabled`), true);
     await evaluate(`(()=>{const e=document.querySelector('input[aria-label="目标品质分"]');e.focus();e.value='65';e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();})()`);
@@ -198,7 +272,7 @@ async function main() {
     assert.equal(await evaluate(`getComputedStyle(document.querySelector('.rlt-dashboard')).display`), 'none');
     await evaluate(`document.querySelector('[aria-label="展开助手面板"]').click();window.__rltPreview.setSetting('ui.showGraphs',true);window.__rltPreview.refreshConfigRows(window.fixtureState)`);
     await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
-    for (const name of ['overview', 'crafting', 'refining', 'sailing', 'feed', 'facilities']) {
+    for (const name of ['overview', 'production', 'crafting', 'refining', 'sailing', 'feed', 'facilities']) {
         await evaluate(`document.querySelector('.rlt-tabs [data-page="${name}"]').click()`);
         assert.equal(await evaluate(`(()=>{const e=document.querySelector('#rlt-auto-helper-panel'),r=e.getBoundingClientRect();return r.right<=innerWidth && r.left>=0 && r.top>=0 && r.bottom<=innerHeight && e.scrollWidth-e.clientWidth<=1})()`), true, name + ' mobile bounds');
     }
@@ -230,10 +304,13 @@ async function main() {
         const small = await panelBox(); assert.equal(small.width, 48); assert.equal(small.height, 48);
         await evaluate(`document.querySelector('[aria-label="展开助手面板"]').click()`);
         const expanded = await panelBox(); assert.ok(expanded.left >= 0 && expanded.top >= 0 && expanded.right <= width && expanded.bottom <= height);
-        for (const name of ['refining', 'feed', 'facilities']) {
+        for (const name of ['production', 'refining', 'feed', 'facilities']) {
             await evaluate(`document.querySelector('.rlt-tabs [data-page="${name}"]').click()`);
             assert.equal(await evaluate(`(()=>{const e=document.querySelector('.rlt-config');return e.scrollWidth-e.clientWidth<=1})()`), true, name + ' narrow content overflow');
-            if (width === 320) await screenshot('rlt-v450-narrow-' + name);
+            if (width === 320) {
+                if (name === 'production') await evaluate(`document.querySelector('.rlt-config [data-pond-id="pond2"]').scrollIntoView({block:'start'})`);
+                await screenshot('rlt-v451-narrow-' + name);
+            }
         }
         await evaluate(`document.querySelector('[aria-label="收起助手面板"]').click()`);
     }

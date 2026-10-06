@@ -32,7 +32,7 @@ function setup(state = farm()) {
     fs.readFileSync = function (file, ...args) {
         const source = read.call(this, file, ...args);
         return file === sourcePath ? source.replace('if (CONFIG.ui.autoStart) start();',
-            `window.__doublePlots = { renderFarmSettings, useConfiguredActiveTaskItems,
+            `window.__doublePlots = { renderFarmSettings, useConfiguredActiveTaskItems, collectReadyPlots, plotManagementMode,
                 staminaNeed: () => pendingStaminaCost };
              if (CONFIG.ui.autoStart) start();`) : source;
     };
@@ -71,6 +71,11 @@ function setup(state = farm()) {
                 assert.ok(selected.quantity >= size); selected.quantity -= size;
             }
             Object.assign(plot, { empty: false, crop: structuredClone(crop), ready_at: x.backend.server_time + 60 });
+        } else if (/\/plots\/\d+\/harvest$/.test(req.url)) {
+            const slot = Number(req.url.match(/\/plots\/(\d+)\/harvest$/)[1]);
+            const plot = x.backend.plots.find(row => row.slot === slot);
+            assert.ok(plot.ready && !plot.empty);
+            Object.assign(plot, { empty: true, ready: false, crop: null, ready_at: 0 });
         } else if (req.url.endsWith('/tasks/use-item')) {
             const plot = x.backend.plots.find(row => String(row.slot) === req.payload.slot_id);
             const selected = x.backend.task_items.find(row => row.id === req.payload.task_item_id);
@@ -283,16 +288,21 @@ test('an uncertain purchase is resynchronized without blindly buying the second 
     assert.equal(x.buys().length, 1); assert.equal(x.plants().length, 1);
 });
 
-test('merged farm settings label occupied slots together and preconfigure the next actual slot', () => {
+test('farm settings render only actual plot types and retain historical presets when new plots appear', () => {
     const state = farm(); state.plots.push({ slot: 2, size: 2, empty: true, assigned_partner_ids: [] });
+    state.next_plot_level = 20;
     const x = setup(state);
+    x.h.setOverride('rlt-plot-crop:4', 'wheat');
     x.h.configBox.replaceChildren(); x.audit.renderFarmSettings(x.h.runtime.state);
     const walk = node => [node, ...node.children.flatMap(walk)];
     const selects = walk(x.h.configBox).filter(node => node.tagName === 'SELECT' && /^(土地|双倍田)/.test(node.attrs['aria-label'] || ''));
-    assert.deepEqual(selects.map(node => node.attrs['aria-label']), ['双倍田 1＋2:', '双倍田 3＋4:', '土地 5:']);
-    selects[2].value = 'wheat'; selects[2].onchange();
-    assert.equal(x.h.getOverride('rlt-plot-crop:4'), 'wheat');
+    assert.deepEqual(selects.map(node => node.attrs['aria-label']), ['双倍田 1＋2作物', '双倍田 3＋4作物']);
+    assert.ok(walk(x.h.configBox).some(node => /等级 20 解锁/.test(node.textContent || '')));
     assert.equal(x.h.getOverride('rlt-plot-crop:3'), null, 'the second half of a merged plot is not a new plot');
+    x.backend.plots.push({ slot: 4, size: 2, empty: true, assigned_partner_ids: [] }); x.sync();
+    x.h.configBox.replaceChildren(); x.audit.renderFarmSettings(x.h.runtime.state);
+    const fresh = walk(x.h.configBox).find(node => node.tagName === 'SELECT' && node.attrs['aria-label'] === '双倍田 5＋6作物');
+    assert.ok(fresh); assert.equal(fresh.value, 'wheat');
 });
 
 test('legacy plots without a size still buy and consume exactly one seed', async () => {
@@ -310,4 +320,93 @@ test('an explicit task-item requirement preserves compatibility with non-farming
     assert.ok(x.h.slotTaskItem(x.h.runtime.state, 'crafting', 'mill', 'start'));
     assert.ok(x.h.slotTaskItem(x.h.runtime.state, 'crafting', 'mill', 'start', { requiredQuantity: 2 }));
     assert.equal(x.h.slotTaskItem(x.h.runtime.state, 'crafting', 'mill', 'start', { requiredQuantity: 3 }), null);
+});
+
+test('manual plot mode overrides a crop lock and excludes seed purchases, planting and partner management', async () => {
+    const x = setup(); x.h.setOverride('rlt-plot-mode:0', 'manual'); x.h.setOverride('rlt-plot-crop:0', 'wheat');
+    await x.h.plantEmptyPlots(); assert.equal(x.calls.length, 0);
+    assert.equal(x.h.managedPartnerSlots(x.h.runtime.state).some(slot => slot.industry === 'farming'), false);
+});
+
+test('harvest-only mode collects the current double crop once without replanting or releasing its partner', async () => {
+    const state = farm(2); makeGrowing(state); state.plots[0].ready = true; state.plots[0].assigned_partner_ids = ['farmer'];
+    const x = setup(state); x.h.setOverride('rlt-plot-mode:0', 'harvest');
+    await x.audit.collectReadyPlots(); await x.h.plantEmptyPlots(); await x.audit.collectReadyPlots();
+    assert.deepEqual(x.calls.map(call => call.url.split('/').slice(-3).join('/')), ['plots/0/harvest']);
+    assert.deepEqual(x.backend.plots[0].assigned_partner_ids, ['farmer']);
+    assert.equal(x.h.managedPartnerSlots(x.h.runtime.state).some(slot => slot.industry === 'farming'), false);
+});
+
+test('manual mode leaves a ready crop untouched', async () => {
+    const state = farm(); makeGrowing(state); state.plots[0].ready = true;
+    const x = setup(state); x.h.setOverride('rlt-plot-mode:0', 'manual');
+    await x.audit.collectReadyPlots(); assert.equal(x.calls.length, 0); assert.equal(x.backend.plots[0].ready, true);
+});
+
+test('manual and harvest-only modes never spend configured active or start task items', async () => {
+    for (const mode of ['manual', 'harvest']) {
+        const state = farm(2); makeGrowing(state); state.task_items = [taskItem('active', 4), taskItem('start', 4)];
+        const x = setup(state); x.h.setOverride('rlt-plot-mode:0', mode);
+        x.h.setOverride('rlt-node-task-item:farming:0', 'active');
+        assert.equal(await x.audit.useConfiguredActiveTaskItems(), 0); assert.equal(x.calls.length, 0);
+        x.h.setOverride('rlt-node-task-item:farming:0', 'start');
+        assert.equal(x.h.slotTaskItem(x.h.runtime.state, 'farming', 0, 'start'), null);
+    }
+});
+
+test('per-plot control keeps another single plot productive while a double plot is manual', async () => {
+    const state = farm(3); state.plots.push({ slot: 2, size: 1, empty: true, assigned_partner_ids: [] });
+    const x = setup(state); x.h.setOverride('rlt-plot-mode:0', 'manual');
+    await x.h.plantEmptyPlots(); assert.equal(x.plants().length, 1); assert.ok(x.plants()[0].url.endsWith('/plots/2/plant'));
+    assert.equal(x.backend.plots[0].empty, true); assert.equal(x.backend.inventory[0].quantity, 2);
+});
+
+test('changing management mode during seed buying stops the pending planting plan', async () => {
+    const x = setup(); x.after(req => { if (req.url.endsWith('/shop/buy')) x.h.setOverride('rlt-plot-mode:0', 'manual'); });
+    await x.h.plantEmptyPlots(); assert.equal(x.buys().length, 1); assert.equal(x.plants().length, 0);
+    assert.equal(x.backend.inventory[0].quantity, 2);
+});
+
+test('harvest permission is checked again after the pre-write state refresh', async () => {
+    const state = farm(); makeGrowing(state); state.plots[0].ready = true;
+    const x = setup(state); x.h.runtime.stateUncertain = true;
+    x.before(req => { if (req.url.endsWith('/state')) x.h.setOverride('rlt-plot-mode:0', 'manual'); return null; });
+    await assert.rejects(x.audit.collectReadyPlots(), error => error.code === 'aborted');
+    assert.deepEqual(x.calls.map(call => call.method), ['GET']); assert.equal(x.backend.plots[0].ready, true);
+});
+
+test('an old partner plan cannot assign or release a plot after its mode changes during refresh', async () => {
+    const x = setup(), plan = x.h.managedPartnerSlots(x.h.runtime.state).find(slot => slot.industry === 'farming');
+    assert.ok(plan); x.h.runtime.stateUncertain = true;
+    x.before(req => { if (req.url.endsWith('/state')) x.h.setOverride('rlt-plot-mode:0', 'harvest'); return null; });
+    await assert.rejects(plan.assign(null), error => error.code === 'aborted');
+    assert.deepEqual(x.calls.map(call => call.method), ['GET']);
+});
+
+test('double plots use the leading slot mode and never reactivate the former right-hand slot', async () => {
+    const x = setup(farm(2)); x.h.setOverride('rlt-plot-mode:0', 'manual'); x.h.setOverride('rlt-plot-mode:1', 'auto');
+    await x.h.plantEmptyPlots(); assert.equal(x.calls.length, 0);
+    x.h.setOverride('rlt-plot-mode:0', 'auto'); x.h.setOverride('rlt-plot-mode:1', 'manual');
+    await x.h.plantEmptyPlots(); assert.equal(x.plants().length, 1); assert.ok(x.plants()[0].url.endsWith('/plots/0/plant'));
+});
+
+test('unknown saved modes fail closed and can be changed from each actual plot card', () => {
+    const x = setup(); x.h.setOverride('rlt-plot-mode:0', 'unsupported');
+    assert.equal(x.audit.plotManagementMode(0), 'manual'); x.h.setRunning(false);
+    x.h.configBox.replaceChildren(); x.audit.renderFarmSettings(x.h.runtime.state);
+    const walk = node => [node, ...node.children.flatMap(walk)];
+    const select = walk(x.h.configBox).find(node => node.tagName === 'SELECT' && /^管理模式/.test(node.attrs['aria-label'] || ''));
+    assert.equal(select.value, 'manual'); select.value = 'harvest'; select.onchange(); assert.equal(x.h.getOverride('rlt-plot-mode:0'), 'harvest');
+    select.value = 'auto'; select.onchange(); assert.equal(x.h.getOverride('rlt-plot-mode:0'), null);
+    assert.equal(x.calls.length, 0);
+});
+
+test('a pending farm improvement is clearly listed and only navigates to facilities', () => {
+    const state = farm(); state.facilities = { upgrades: [{ id: 'farm2', kind: 'farm', stage: 2, unlocked: true, inputs: [], coins: 100 }] };
+    const x = setup(state); x.h.setRunning(false); x.h.configBox.replaceChildren(); x.audit.renderFarmSettings(x.h.runtime.state);
+    const walk = node => [node, ...node.children.flatMap(walk)], nodes = walk(x.h.configBox);
+    assert.ok(nodes.some(node => node.textContent === '待改良：双倍田 3＋4'));
+    const button = nodes.find(node => node.tagName === 'BUTTON' && node.textContent === '前往设施改良'); assert.ok(button);
+    let visits = 0; const nav = x.h.tabBar.children.find(tab => tab.dataset.page === 'facilities'); assert.ok(nav); nav.onclick = () => visits++;
+    button.onclick(); assert.equal(visits, 1); assert.equal(x.calls.length, 0);
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      4.5.0
+// @version      5.0.0
 // @description  红叶镇物语自动生产、双倍田、递归加工与精制房、设施材料预留、饲料品质目标和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '4.5.0';
+    const SCRIPT_VERSION = '5.0.0';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -247,6 +247,13 @@
         return true;
     }
     const plotCropKey = slot => `rlt-plot-crop:${slot}`;
+    const plotModeKey = slot => `rlt-plot-mode:${slot}`;
+    function plotManagementMode(slot) {
+        const mode = getOverride(plotModeKey(slot)) || 'auto';
+        return ['auto', 'harvest', 'manual'].includes(mode) ? mode : 'manual';
+    }
+    const plotAutoManaged = slot => plotManagementMode(slot) === 'auto';
+    const plotAutoHarvest = slot => plotManagementMode(slot) !== 'manual';
     const nodeJobKey = (industry, id) => `rlt-node-job:${industry}:${id}`;
     const AQUATIC_SPOT_KEY = 'rlt-aquatic-spot';
     const nodeTaskItemKey = (industry, id) => `rlt-node-task-item:${industry}:${id}`;
@@ -648,10 +655,16 @@
         requireArray('shop', (CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds) || CONFIG.feed.enabled);
         requireArray('gathering_sites', CONFIG.gathering.enabled);
         requireArray('mining_sites', CONFIG.mining.enabled);
+        const managedPonds = CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && Array.isArray(state.aquatic?.ponds)
+            ? state.aquatic.ponds.filter(pond => pond?.pond_id != null && pondSettings(pond.pond_id).enabled) : [];
         const needsSafeInventory = (CONFIG.commissions.enabled && CONFIG.commissions.autoTake) ||
             (CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds && CONFIG.farming.autoSellForSeeds) ||
             (CONFIG.crafting.enabled && CONFIG.crafting.autoStart) || CONFIG.feed.enabled ||
-            (CONFIG.sailing.enabled && (CONFIG.sailing.autoStart || CONFIG.sailing.autoBuild || CONFIG.sailing.autoUpgrade));
+            (CONFIG.sailing.enabled && (CONFIG.sailing.autoStart || CONFIG.sailing.autoBuild || CONFIG.sailing.autoUpgrade)) ||
+            (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && (CONFIG.aquatic.autoBuildPonds ||
+                (Array.isArray(state.aquatic?.buildable_ponds) && state.aquatic.buildable_ponds.some(site => site?.id != null && pondBuildEnabled(site.id))))) ||
+            managedPonds.some(pond => pondSettings(pond.pond_id).autoStock) ||
+            !!runtime.facilityUpgrade;
         requireArray('crafting_stations', CONFIG.crafting.enabled ||
             (needsSafeInventory && CONFIG.selling.protectCraftingInputs));
         requireArray('portals', needsSafeInventory ||
@@ -659,9 +672,16 @@
         if (CONFIG.commissions.enabled && (!state.commissions || typeof state.commissions !== 'object')) {
             errors.push('commissions');
         }
+        if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && CONFIG.aquatic.autoBuildPonds &&
+            !Array.isArray(state.aquatic?.buildable_ponds)) errors.push('aquatic.buildable_ponds');
+        if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && state.aquatic?.unlocked &&
+            !Array.isArray(state.aquatic.ponds)) errors.push('aquatic.ponds');
         if (CONFIG.facilities.reserveMaterials && FACILITY_KINDS.some(kind => getOverride(facilityReserveKey(kind)))) {
-            if (!Array.isArray(state.facilities?.upgrades)) errors.push('facilities.upgrades');
-            else for (const upgrade of selectedFacilityUpgrades(state)) {
+            if (['farm', 'feed', 'refining'].some(kind => getOverride(facilityReserveKey(kind))) &&
+                !Array.isArray(state.facilities?.upgrades)) errors.push('facilities.upgrades');
+            if (getOverride(facilityReserveKey('pond')) &&
+                (!Array.isArray(state.aquatic?.ponds) || !Array.isArray(state.aquatic?.buildable_ponds))) errors.push('aquatic.pond_projects');
+            for (const upgrade of selectedFacilityUpgrades(state)) {
                 if (!Array.isArray(upgrade.inputs) || upgrade.inputs.some(input =>
                     !input || (input.item_id ?? input.item?.item_id) == null || !Number.isSafeInteger(Number(input.quantity)) || Number(input.quantity) <= 0 ||
                     !Number.isSafeInteger(Number(input.min_quality ?? 0)) || Number(input.min_quality ?? 0) < 0 || Number(input.min_quality ?? 0) > 5)) {
@@ -690,6 +710,7 @@
             (CONFIG.mining.enabled && CONFIG.mining.autoAssignPartner) ||
             (CONFIG.crafting.enabled && CONFIG.crafting.autoAssignPartner) ||
             (CONFIG.aquatic.enabled && CONFIG.aquatic.autoAssignPartner) ||
+            managedPonds.some(pond => pondSettings(pond.pond_id).autoAssignPartner) ||
             (CONFIG.livestock.enabled && CONFIG.livestock.autoAssignPartner) || CONFIG.sailing.enabled ||
             (CONFIG.refining.enabled && CONFIG.refining.autoAssignPartner);
         requireArray('partners', needsPartners);
@@ -892,7 +913,7 @@
     const plantPlot = (slot, cropId, taskItemId = '', beforeWrite) => mutate(`/plots/${slot}/plant`, {
         payload: { crop_id: cropId, task_item_id: taskItemId || '' }, cue: 'action:plant', beforeWrite,
     });
-    const harvestPlot = (slot) => mutate(`/plots/${slot}/harvest`, { cue: 'action:harvest' });
+    const harvestPlot = (slot, beforeWrite) => mutate(`/plots/${slot}/harvest`, { cue: 'action:harvest', beforeWrite });
     const buyItem = (shopId, qty = 1, beforeWrite) => mutate('/shop/buy', {
         payload: { shop_id: shopId, quantity: qty }, cue: 'action:buy', beforeWrite,
     });
@@ -908,8 +929,8 @@
     });
     const assignSitePartner = (industry, siteId, partnerId) =>
         mutate(`${siteUrl(industry, siteId)}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
-    const assignPlotPartner = (slot, partnerId) =>
-        mutate(`/plots/${slot}/partners`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
+    const assignPlotPartner = (slot, partnerId, beforeWrite) =>
+        mutate(`/plots/${slot}/partners`, { method: 'PUT', payload: { partner_id: partnerId ?? '' }, beforeWrite });
     const submitCommission = () => mutate('/commissions/submit', { cue: 'action:submit_commission' });
     const getCommissionBoard = () => api('/commissions/board');
     const takeCommission = (commissionId) => mutate(`/commissions/${commissionId}/take`, {
@@ -928,14 +949,14 @@
     });
     const assignFishingCompanion = (partnerId) =>
         mutate('/fishing/companion', { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
-    const buildPond = (siteId) => mutate(`/ponds/${siteId}/build`);
-    const assignPondPartner = (pondId, partnerId) =>
-        mutate(`/ponds/${pondId}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
-    const stockPond = (pondId, speciesId, qty) => mutate(`/ponds/${pondId}/stock`, {
-        payload: { species_id: speciesId, quantity: qty }, cue: 'action:stock_pond',
+    const buildPond = (siteId, beforeWrite) => mutate(`/ponds/${siteId}/build`, { beforeWrite });
+    const assignPondPartner = (pondId, partnerId, beforeWrite) =>
+        mutate(`/ponds/${pondId}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' }, beforeWrite });
+    const stockPond = (pondId, speciesId, qty, beforeWrite) => mutate(`/ponds/${pondId}/stock`, {
+        payload: { species_id: speciesId, quantity: qty }, cue: 'action:stock_pond', beforeWrite,
     });
-    const harvestPond = (pondId, qty) => mutate(`/ponds/${pondId}/harvest`, {
-        payload: { quantity: qty }, cue: 'action:harvest_pond',
+    const harvestPond = (pondId, qty, beforeWrite) => mutate(`/ponds/${pondId}/harvest`, {
+        payload: { quantity: qty }, cue: 'action:harvest_pond', beforeWrite,
     });
     const depositFeed = (itemId, quality, count, beforeWrite) => mutate('/feed-slot/deposit', {
         payload: { item_id: itemId, quality, count }, beforeWrite,
@@ -1281,6 +1302,20 @@
                             task ? '手动任务，未安排自动领取' : refiningBlockReason(state, slot));
                 }
             }
+            if (state.aquatic?.ponds?.length) text('pond-title', 'h3', 'rlt-section-label', '鱼塘');
+            for (const pond of state.aquatic?.ponds || []) {
+                if (pond.pond_id == null) continue;
+                const settings = pondSettings(pond.pond_id), stock = Number(pond.stock || 0);
+                const population = Number(pond.population ?? stock + (pond.fry || []).reduce((sum, row) => sum + Number(row.count || 0), 0));
+                const active = CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && settings.enabled;
+                const cycle = Number(pond.next_cycle_seconds || 0), readyAt = Number(pond.last_settled_at || 0) + cycle;
+                const status = !active ? '自动管理关闭' : readyAt > now ? `结算 ${durationLabel(readyAt - now)}` : '等待结算';
+                use(`pond:${pond.pond_id}`, () => {
+                    const view = dashboardCard(); view.element.dataset.pondId = String(pond.pond_id); return view;
+                }, view => view.update(pond.definition?.name || `鱼塘 ${pond.pond_id}`, status,
+                    pond.capacity > 0 ? population / pond.capacity * 100 : null,
+                    `成鱼 ${stock} · 总数 ${population} / ${pond.capacity ?? '?'} · 保留 ${Math.max(Number(pond.steady_stock || 0), settings.keepStock)} · 补至 ${Math.min(Number(pond.capacity ?? settings.restockTarget), settings.restockTarget)}`));
+            }
             text('sea-title', 'h3', 'rlt-section-label', '航海与饲料');
             const sail = state.sailing?.active_run;
             if (sail) {
@@ -1350,11 +1385,11 @@
             configBox.appendChild(group);
         }
         if (activePage !== 'production') return;
-        const { group, body } = makeGroup('鱼塘与大物设置', 'production');
+        const { group, body } = makeGroup('鱼塘默认值与大物设置', 'production');
         appendSetting(body, state, 'aquatic.autoHarvestPonds', '自动捞成鱼');
         appendSetting(body, state, 'aquatic.autoStockPonds', '自动补鱼苗');
-        appendSetting(body, state, 'aquatic.pondKeepStock', '成鱼保留尾数');
-        appendSetting(body, state, 'aquatic.pondRestockTarget', '补苗目标尾数');
+        appendSetting(body, state, 'aquatic.pondKeepStock', '默认成鱼保留尾数');
+        appendSetting(body, state, 'aquatic.pondRestockTarget', '默认补苗目标尾数');
         appendSetting(body, state, 'aquatic.bigCatch', '大物处理', { choices: [{ value: 'fight', text: '体力够时挑战' }, { value: 'release', text: '放线' }, { value: 'manual', text: '暂停并手动处理' }] });
         configBox.appendChild(group);
     }
@@ -1765,6 +1800,7 @@
         const group = document.createElement('div');
         group.className = 'rlt-group';
         group.dataset.page = page;
+        group.dataset.group = title;
         const header = document.createElement('button');
         header.className = 'rlt-group-title';
         header.style.cssText = 'margin-top:5px;cursor:pointer;user-select:none;font-weight:bold;opacity:.85;transition:opacity .15s';
@@ -1970,24 +2006,60 @@
             { value: 'profit', text: '委托优先，其余按净收益' },
         ] });
         body.appendChild(uiElement('p', 'rlt-note', '自动田先补需求，再按普通品质产量估算每小时净收益。已有种子不再计购种花费；买不起的种子会跳过。高品质门贡按缺口试种，收获后再核对品质。'));
-        // 未解锁的土地不在 state.plots 里，额外补一行“下一块地”，便于提前锁定作物（解锁后沿用同一 key）
-        const plots = [...(state.plots || [])];
-        const nextSlot = plots.length ? Math.max(...plots.map(plot => Number(plot.slot) + plotSize(plot))) : 0;
-        plots.push({ slot: nextSlot, size: 1 });
+        body.appendChild(uiElement('p', 'rlt-note', '每块田可独立选择管理模式，仍受农场总开关和各功能开关控制。仅收获不再种植、派驻或用道具；手动管理保留现有作物与伙伴。双倍田共用左侧土地的配置。'));
+        // 官网直接提供合并后的 plots；next_plot_level 只有解锁等级，不能据此猜测未来田块的 slot 或 size。
+        const plots = [...(state.plots || [])].sort((a, b) => Number(a.slot) - Number(b.slot));
         for (const plot of plots) {
-            const slot = plot.slot;
+            const slot = plot.slot, label = plotLabel(plot), size = plotSize(plot);
             const key = plotCropKey(slot);
-            const { row, select } = makeSelectRow(`${plotLabel(plot)}:`, '选择这块地要种的作物；双倍田每次消耗两份种子、体力和道具；「自动」先补需求再按净收益选择');
+            const mode = plotManagementMode(slot);
+            const readyAt = taskReadyAt(plot);
+            const status = plot.empty ? '空闲' : plot.ready ? '待收获' : readyAt > serverNowSeconds() ? `生长中 · ${durationLabel(readyAt - serverNowSeconds())}` : '生长中';
+            const card = workCard(label, status, null, plot.empty ? `每次种植消耗 ${size} 粒种子，产出按 ${size} 份结算` : `${plot.crop?.name || '作物'} · ${size} 份产出`);
+            card.dataset.plotSlot = String(slot);
+            const { row: modeRow, select: modeSelect } = makeSelectRow('管理模式', '自动管理沿用全局开关；仅收获与手动管理均不自动更换或释放伙伴');
+            modeSelect.dataset.control = 'plot-mode';
+            modeSelect.setAttribute('aria-label', `管理模式（${label}）`);
+            fillSelect(modeSelect, [
+                { value: 'auto', text: '自动管理' }, { value: 'harvest', text: '仅自动收获' }, { value: 'manual', text: '手动管理' },
+            ], mode, '请选择');
+            modeSelect.onchange = () => {
+                if (!['auto', 'harvest', 'manual'].includes(modeSelect.value)) { modeSelect.value = plotManagementMode(slot); return; }
+                setOverride(plotModeKey(slot), modeSelect.value === 'auto' ? '' : modeSelect.value);
+                log(`${label}：${modeSelect.value === 'auto' ? '恢复自动管理' : modeSelect.value === 'harvest' ? '仅自动收获，保留伙伴' : '改为手动管理，保留作物与伙伴'}`);
+                wakeSoon();
+            };
+            card.appendChild(modeRow);
+            const { row, select } = makeSelectRow('下次作物', '选择这块地要种的作物；双倍田每次消耗两份种子、体力和道具；「自动」先补需求再按净收益选择');
+            select.dataset.control = 'plot-crop';
+            select.setAttribute('aria-label', `${label}作物`);
             fillSelect(select, (state.crops || []).map(c => ({
                 value: cropId(c), text: c.name || `作物#${cropId(c)}`,
             })), getOverride(key), '自动');
             select.onchange = () => {
                 setOverride(key, select.value);
-                log(`${plotLabel(plot)}：${select.value ? '已锁定作物' : '恢复自动选种'}`);
+                log(`${label}：${select.value ? '已锁定作物' : '恢复自动选种'}`);
             };
-            body.appendChild(row);
+            card.appendChild(row);
+            const selected = (state.crops || []).find(crop => sameId(cropId(crop), getOverride(key) ?? CONFIG.farming.cropId));
+            card.appendChild(uiElement('p', 'rlt-note', selected ?
+                `下次 ${selected.name || cropId(selected)}：种子 ${size} 粒 · 体力 ${Number(selected.stamina_cost || 0) * size} · 携带道具时消耗 ${size} 份` :
+                `自动选种时按本田 ${size} 倍用量检查种子、体力和道具`));
+            if (mode !== 'auto') card.appendChild(uiElement('p', 'rlt-note', '作物和道具选择会保留，恢复自动管理后用于后续种植。'));
             const itemRow = makeTaskItemRow(state, 'farming', slot);
-            if (itemRow) body.appendChild(itemRow);
+            if (itemRow) card.appendChild(itemRow);
+            body.appendChild(card);
+        }
+        if (!plots.length) body.appendChild(uiElement('p', 'rlt-note', '当前没有已解锁田块。'));
+        if (state.next_plot_level) body.appendChild(uiElement('p', 'rlt-note', `下一块待开垦土地：等级 ${state.next_plot_level} 解锁。解锁后将按游戏返回的实际田块显示控制项。`));
+        const upgrade = (state.facilities?.upgrades || []).find(item => item.kind === 'farm');
+        const stage = Number(upgrade?.stage);
+        if (upgrade && Number.isSafeInteger(stage) && stage > 0) {
+            const card = workCard(`待改良：双倍田 ${stage * 2 - 1}＋${stage * 2}`, upgrade.unlocked ? '可查看改良条件' : '尚未解锁', null,
+                '合并后同种同收，由一位伙伴照看两份产出；需要两块田均为空。前往设施页查看材料与保留伙伴，当前页面不会自动付费改良。');
+            const button = uiElement('button', '', '前往设施改良');
+            button.onclick = () => [...tabBar.children].find(tab => tab.dataset.page === 'facilities')?.onclick?.();
+            card.appendChild(button); body.appendChild(card);
         }
         configBox.appendChild(group);
     }
@@ -2083,8 +2155,24 @@
         if (lastConfigPage === activeDashboardPage) pageScroll.set(activeDashboardPage, configBox.scrollTop);
         configBox.replaceChildren();
         if (activeDashboardPage === 'production') {
-            renderModuleSettings(state, 'production');
+            const shortcuts = uiElement('div', 'rlt-actions');
+            shortcuts.dataset.page = 'production';
+            for (const [label, title] of [['农田', '农场'], ['鱼塘', '逐塘管理'], ['总开关', '农场开关']]) {
+                const button = uiElement('button', 'rlt-craft-preview', label);
+                button.dataset.focusKey = `production:${title}`;
+                button.onclick = () => {
+                    const group = [...configBox.querySelectorAll('.rlt-group')].find(row => row.dataset.group === title);
+                    if (!group) return;
+                    const header = group.querySelector('.rlt-group-title');
+                    if (header?.getAttribute('aria-expanded') === 'false') header.click();
+                    configBox.scrollTop += group.getBoundingClientRect().top - configBox.getBoundingClientRect().top;
+                };
+                shortcuts.appendChild(button);
+            }
+            configBox.appendChild(shortcuts);
             renderFarmSettings(state);
+            renderPondSettings(state);
+            renderModuleSettings(state, 'production');
             renderIndustrySettings(state, ['gathering', 'mining']);
             renderFishingSettings(state);
         } else if (activeDashboardPage === 'crafting') {
@@ -2461,6 +2549,7 @@
         // 鱼塘周期：对齐最近的繁殖/投喂结算时刻，及时补料和处理
         if (CONFIG.aquatic.enabled && CONFIG.aquatic.ponds) {
             for (const pond of state.aquatic?.ponds || []) {
+                if (!pondSettings(pond.pond_id).enabled) continue;
                 const readyAt = Number(pond.last_settled_at || 0) + Number(pond.next_cycle_seconds || 0);
                 if (readyAt > now) wait = Math.min(wait, readyAt - now);
             }
@@ -2498,6 +2587,7 @@
     // 槽位级任务道具：只认面板锁定的道具（支持保留数量），未锁定即不使用
     // forcedId：加工流程步骤单独指定的道具 id，传入时跳过槽位配置查找
     function slotTaskItem(state, industry, slotId, timing, { notify = true, forcedId = null, requiredQuantity = null } = {}) {
+        if (industry === 'farming' && !plotAutoManaged(slotId)) return null;
         if (!CONFIG.taskItems.enabled || (industry === 'crafting' && !CONFIG.crafting.useTaskItems)) return null;
         const override = forcedId != null ? forcedId :
             (industry === 'crafting' && timing === 'active' ? craftFlight(slotId)?.taskItemChoice : null) ?? getOverride(nodeTaskItemKey(industry, slotId));
@@ -3036,29 +3126,150 @@
         configBox.appendChild(group);
     }
 
-    const FACILITY_KINDS = ['farm', 'feed', 'refining'];
+    const FACILITY_KINDS = ['farm', 'feed', 'refining', 'pond'];
     const facilityReserveKey = kind => `rlt-facility-reserve:${kind}`;
+    const FACILITY_INTENT_KEY = 'rlt-facility-upgrade-intent';
+    function farmUpgradePlots(state, upgrade) {
+        const stage = Number(upgrade?.stage);
+        if (!Number.isSafeInteger(stage) || stage < 1) return [];
+        return [2 * (stage - 1), 2 * stage - 1].map(slot => (state.plots || []).find(plot => sameId(plot.slot, slot))).filter(Boolean);
+    }
+    function facilityUpgradeFingerprint(upgrade) {
+        return JSON.stringify([upgrade.id, upgrade.kind, upgrade.stage, Number(upgrade.coins),
+            (upgrade.inputs || []).map(input => [input.item_id ?? input.item?.item_id, Number(input.quantity), Number(input.min_quality || 0)])]);
+    }
+    function facilityUpgradeBlock(state, upgrade, partnerId = '') {
+        if (!upgrade || upgrade.kind !== 'farm' || !upgrade.unlocked) return '双倍田改良尚未解锁';
+        const plots = farmUpgradePlots(state, upgrade);
+        if (plots.length !== 2 || plots.some(plot => !plot.empty || plotSize(plot) !== 1 || plot.assignment_locked)) {
+            return '需要对应两块单倍田均为空闲';
+        }
+        const partners = plots.map(currentPartnerId).filter(id => id != null);
+        if (partnerId && !partners.some(id => sameId(id, partnerId))) return '所选保留伙伴已不在这两块田上';
+        const coins = Number(upgrade.coins);
+        if (!Number.isFinite(coins) || coins < 0 || playerCoins(state) < coins) return '改良金币不足或费用待确认';
+        if (!Array.isArray(upgrade.inputs)) return '改良材料信息待确认';
+        const totals = new Map();
+        for (const input of upgrade.inputs) {
+            const id = input?.item_id ?? input?.item?.item_id, quantity = Number(input?.quantity);
+            const quality = Number(input?.min_quality ?? 0);
+            if (id == null || String(id).trim() === '' || !Number.isSafeInteger(quantity) || quantity <= 0 ||
+                !Number.isSafeInteger(quality) || quality < 0 || quality > 5) return '改良材料信息待确认';
+            const key = String(id); totals.set(key, (totals.get(key) || 0) + quantity);
+        }
+        for (const [id, quantity] of totals) {
+            if (!Number.isSafeInteger(quantity) || safeUnspecifiedConsumeQty(state, id, '', { applyDefaultKeep: false,
+                excludeFacilityProject: { kind: upgrade.kind, id: upgrade.id } }) < quantity) return '材料不足或已为其他用途预留';
+        }
+        if (upgrade.affordable === false) return '游戏判定改良所需材料或金币不足';
+        return '';
+    }
+    function queueFacilityUpgrade(state, id, partnerId = '') {
+        if (busy || runtime.facilityUpgrade || readJson(FACILITY_INTENT_KEY)) return false;
+        const upgrade = (state.facilities?.upgrades || []).find(row => sameId(row.id, id));
+        if (facilityUpgradeBlock(state, upgrade, partnerId)) return false;
+        runtime.facilityUpgrade = { projectId: id, kind: 'farm', stage: upgrade.stage, partnerId,
+            fingerprint: facilityUpgradeFingerprint(upgrade) };
+        wakeSoon(); return true;
+    }
+    async function processFacilityUpgrade() {
+        const request = runtime.facilityUpgrade;
+        if (!request) return;
+        const state = runtime.state, revision = settingsRevision;
+        const upgrade = (state.facilities?.upgrades || []).find(row => sameId(row.id, request.projectId));
+        const blocked = facilityUpgradeBlock(state, upgrade, request.partnerId);
+        if (blocked || facilityUpgradeFingerprint(upgrade) !== request.fingerprint || readJson(FACILITY_INTENT_KEY)) {
+            runtime.facilityUpgrade = null; log(`双倍田改良未执行：${blocked || '项目已变化或上次结果待核对'}，请重新查看设施页`); return;
+        }
+        try {
+            await mutate(`/facilities/${request.projectId}`, { payload: { partner_id: request.partnerId || '' }, beforeWrite() {
+                if (runtime.facilityUpgrade !== request || runtime.state !== state || settingsRevision !== revision ||
+                    facilityUpgradeBlock(runtime.state, upgrade, request.partnerId)) {
+                    throw new ApiError('改良状态或设置已变化，未提交请求', { code: 'aborted' });
+                }
+                setOverride(FACILITY_INTENT_KEY, JSON.stringify({ ...request, phase: 'submitting' }));
+            } });
+            const slot = 2 * (Number(request.stage) - 1);
+            if (!(runtime.state.plots || []).some(plot => sameId(plot.slot, slot) && plotSize(plot) === 2)) {
+                throw new ApiError('改良响应尚不能确认双倍田，请在游戏中核对', { code: 'invalid_state' });
+            }
+            setOverride(FACILITY_INTENT_KEY, ''); log(`已完成「${upgrade.name || upgrade.id}」，本次单次改良结束`);
+        } catch (error) {
+            if (error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived)) setOverride(FACILITY_INTENT_KEY, '');
+            else setOverride(FACILITY_INTENT_KEY, JSON.stringify({ ...request, phase: 'uncertain' }));
+            if (shouldAbortTick(error)) throw error;
+            log(`双倍田改良失败：${error.message}`);
+        } finally { runtime.facilityUpgrade = null; }
+    }
+    function facilityUpgradeOptions(state) {
+        const upgrades = Array.isArray(state.facilities?.upgrades) ? state.facilities.upgrades : [];
+        const sites = Array.isArray(state.aquatic?.buildable_ponds) ? state.aquatic.buildable_ponds : [];
+        const ponds = Array.isArray(state.aquatic?.ponds) ? state.aquatic.ponds : [];
+        return [...upgrades, ...sites
+            .filter(site => site && site.id != null && !ponds.some(pond => sameId(pond?.pond_id, site.id)))
+            .map(site => ({ id: site.id, kind: 'pond', name: site.name || `鱼塘 ${site.id}`,
+                unlocked: site.unlocked, coins: site.build_cost, inputs: site.build_materials }))];
+    }
     function selectedFacilityUpgrades(state) {
         if (!CONFIG.facilities.reserveMaterials) return [];
-        return (state.facilities?.upgrades || []).filter(upgrade => FACILITY_KINDS.includes(upgrade.kind) &&
+        return facilityUpgradeOptions(state).filter(upgrade => FACILITY_KINDS.includes(upgrade.kind) &&
             sameId(upgrade.id, getOverride(facilityReserveKey(upgrade.kind))));
     }
     function facilityMaterialNeeds(state) {
         return selectedFacilityUpgrades(state).flatMap(upgrade => (upgrade.inputs || []).map(input => ({
-            source: 'facility', itemId: input.item_id ?? input.item?.item_id ?? null,
+            source: 'facility', projectKind: upgrade.kind, projectId: upgrade.id,
+            itemId: input.item_id ?? input.item?.item_id ?? null,
             name: input.name || input.item?.name || '', minQuality: Number(input.min_quality || 0),
             need: Number(input.quantity), purpose: `设施「${upgrade.name || upgrade.id}」`,
         })).filter(need => need.itemId != null && Number.isFinite(need.need) && need.need > 0));
     }
+    function appendFarmUpgradeAction(state, container, upgrade) {
+        const plots = farmUpgradePlots(state, upgrade), ids = [...new Set(plots.map(currentPartnerId).filter(id => id != null).map(String))];
+        const partnerKey = `rlt-farm-upgrade-partner:${upgrade.id}`;
+        const partnerId = getOverride(partnerKey) || '';
+        const { row, select } = makeSelectRow('改良后保留伙伴', '合并两块田时最多保留一位原驻场伙伴');
+        fillSelect(select, ids.map(id => ({ value: id,
+            text: (state.partners || []).find(partner => sameId(partnerRecordId(partner), id))?.name || `伙伴 ${id}` })), partnerId || null, '不保留（回到空闲）');
+        select.onchange = () => {
+            setOverride(partnerKey, select.value);
+            if (sameId(runtime.facilityUpgrade?.projectId, upgrade.id)) runtime.facilityUpgrade = null;
+            wakeSoon();
+        };
+        container.appendChild(row);
+        const reason = facilityUpgradeBlock(state, upgrade, partnerId), pending = sameId(runtime.facilityUpgrade?.projectId, upgrade.id);
+        if (reason) container.appendChild(uiElement('p', 'rlt-note', reason));
+        container.appendChild(uiElement('p', 'rlt-note', '合并后沿用左侧田块的作物、道具与管理模式。改良一次，不自动推进下一阶段。'));
+        const actions = uiElement('div', 'rlt-craft-actions');
+        const execute = uiElement('button', 'rlt-craft-primary', pending ? '已安排本次改良' : '改良为双倍田（一次）');
+        execute.dataset.focusKey = `facility:${upgrade.id}:execute`;
+        execute.disabled = busy || !!reason || !!runtime.facilityUpgrade || !!readJson(FACILITY_INTENT_KEY);
+        execute.onclick = () => {
+            const fresh = currentViewState(), current = (fresh.facilities?.upgrades || []).find(row => sameId(row.id, upgrade.id));
+            if (!current || busy || facilityUpgradeBlock(fresh, current, getOverride(partnerKey) || '')) return;
+            if (!window.confirm(`将对应两块空闲单倍田合并为双倍田，花费 ${current.coins} 红叶币及下方材料；最多保留一位原驻场伙伴。确认执行本次改良？`)) return;
+            if (queueFacilityUpgrade(fresh, current.id, getOverride(partnerKey) || '')) {
+                log(`已安排「${current.name || current.id}」单次改良${!running ? '；请启动助手以执行' : ''}`);
+                lastConfigState = null; refreshConfigRows(fresh);
+            }
+        };
+        actions.appendChild(execute);
+        if (pending) {
+            const cancel = uiElement('button', 'rlt-craft-stop', '撤回本次安排');
+            cancel.disabled = busy;
+            cancel.onclick = () => { runtime.facilityUpgrade = null; lastConfigState = null; refreshConfigRows(currentViewState()); };
+            actions.appendChild(cancel);
+        }
+        container.appendChild(actions);
+    }
     function renderFacilitySettings(state) {
         const { group, body } = makeGroup('设施改良 · 材料预留', 'facilities');
         appendSetting(body, state, 'facilities.reserveMaterials', '启用设施材料预留');
-        body.appendChild(uiElement('p', 'rlt-note', '选中一个改良阶段后，为它保留材料，售卖、投喂、接单、加工和精制都会避让。建造仍在游戏中操作；阶段完成后释放该阶段预留。'));
-        const upgrades = state.facilities?.upgrades || [];
+        body.appendChild(uiElement('p', 'rlt-note', '选中改良或建塘项目后，为它保留材料，售卖、投喂、接单、加工和精制都会避让。农田可在此单次改良；鱼塘需另行授权自动建造，其余设施在游戏中建造。'));
+        const upgrades = facilityUpgradeOptions(state);
         const selectedMaterials = upgrades.filter(upgrade => FACILITY_KINDS.includes(upgrade.kind) &&
             sameId(upgrade.id, getOverride(facilityReserveKey(upgrade.kind))))
             .flatMap(upgrade => upgrade.inputs || []);
-        for (const [kind, label] of [['farm', '农田改良'], ['feed', '饲料设施'], ['refining', '精制房建设']]) {
+        for (const [kind, label] of [['farm', '农田改良'], ['feed', '饲料设施'], ['refining', '精制房建设'], ['pond', '新鱼塘建设']]) {
             const selected = getOverride(facilityReserveKey(kind));
             const options = upgrades.filter(upgrade => upgrade.kind === kind);
             const { row, select } = makeSelectRow(label, '只预留明确选择的这一阶段材料；不自动购买或建造');
@@ -3069,6 +3280,12 @@
             const upgrade = options.find(candidate => sameId(candidate.id, selected));
             if (!upgrade) {
                 if (selected) body.appendChild(uiElement('p', 'rlt-note', '原阶段已完成或当前不可用；可重新选择下一阶段。'));
+                if (kind === 'farm' && options.length) {
+                    const next = options[0], card = workCard(next.name || '双倍田改良', '待改良', null, `改良费用 ${Number(next.coins || 0)} 币`);
+                    for (const input of next.inputs || []) card.appendChild(uiElement('p', 'rlt-material-note',
+                        `${input.name || input.item?.name || input.item_id}：库存 ${inventoryQty(state, input.item_id ?? input.item?.item_id)} / 改良需 ${input.quantity}`));
+                    appendFarmUpgradeAction(state, card, next); body.appendChild(card);
+                }
                 continue;
             }
             const materials = upgrade.inputs || [];
@@ -3091,9 +3308,20 @@
                         `已选项目合计 ${required} 件${missing > 0 ? `，尚缺 ${missing} 件（按品质门槛）` : '；库存由各项目共用'}`));
                 }
             }
+            if (kind === 'farm') appendFarmUpgradeAction(state, card, upgrade);
             body.appendChild(card);
         }
-        if (!state.facilities) body.appendChild(uiElement('p', 'rlt-note', '等待游戏设施数据。已选项目将在数据恢复后显示。'));
+        const intent = readJson(FACILITY_INTENT_KEY);
+        if (intent) {
+            body.appendChild(uiElement('p', 'rlt-warning', '上次田块改良结果待核对，确认前不会再次提交。请先查看游戏中的田块。'));
+            const settle = uiElement('button', '', '已在游戏核对改良结果'); settle.disabled = busy;
+            settle.onclick = () => {
+                if (busy || !window.confirm('确认已经检查游戏中的田块和消耗情况？清除后仍需重新点击改良按钮，不自动重试。')) return;
+                setOverride(FACILITY_INTENT_KEY, ''); lastConfigState = null; refreshConfigRows(currentViewState());
+            };
+            body.appendChild(settle);
+        }
+        if (!state.facilities && !state.aquatic?.buildable_ponds) body.appendChild(uiElement('p', 'rlt-note', '等待游戏设施数据。已选项目将在数据恢复后显示。'));
         body.appendChild(uiElement('p', 'rlt-note', '多个项目需要同一物品时预留量累加；金币仅作建造参考，不锁定余额。'));
         configBox.appendChild(group);
     }
@@ -3502,11 +3730,13 @@
     // applyKeep：是否套用 selling 的保留量（defaultKeep/keepByItemId）——售卖/接单场景要保留，
     // 加工投料场景不能保留，否则库存不足 defaultKeep 的合法原料会被误判为“材料不足”
     // 航海仅跳过默认售卖保留量；明确指定的保留量和加工预留仍然生效。
-    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, applyDefaultKeep = true, excludeSailing = false, excludeRefining = false } = {}) {
+    function safeUnspecifiedConsumeQty(state, itemId, name = '', { reserveCraftingInputs = true, applyKeep = true, applyDefaultKeep = true, excludeSailing = false, excludeRefining = false, excludeFacilityProject = null } = {}) {
         const stacks = (state.inventory || []).filter(i => itemId != null ? sameId(i.item_id, itemId) : i.name === name);
         if (!stacks.length) return 0;
         const needs = gatherNeeds(state).filter(n => (!excludeSailing || n.source !== 'sailing') &&
-            (!excludeRefining || n.source !== 'refining') && stacks.some(item => needMatchesItem(n, item)));
+            (!excludeRefining || n.source !== 'refining') &&
+            !(excludeFacilityProject && n.source === 'facility' && n.projectKind === excludeFacilityProject.kind &&
+                sameId(n.projectId, excludeFacilityProject.id)) && stacks.some(item => needMatchesItem(n, item)));
         const thresholds = new Set([0, ...needs.map(n => Number(n.minQuality || 0))]);
         const craftingReserves = reserveCraftingInputs ? craftingInputReserves(state) : null;
         const keep = applyKeep ? configuredKeep(itemId, craftingReserves, { applyDefaultKeep }) : 0;
@@ -3693,7 +3923,7 @@
         };
         if (CONFIG.farming.enabled) {
             for (const plot of runtime.state.plots || []) {
-                if (!plot.empty && !plot.ready && hasActiveItem('farming', plot.slot)) {
+                if (plotAutoManaged(plot.slot) && !plot.empty && !plot.ready && hasActiveItem('farming', plot.slot)) {
                     targets.push({
                         industry: 'farming', id: plot.slot, label: plotLabel(plot),
                         current: () => (runtime.state.plots || []).find(p => p.slot === plot.slot),
@@ -3731,7 +3961,7 @@
                 await useTaskItem(target.industry, target.id, itemId, target.industry === 'farming' ? () => {
                     const fresh = target.current(), remainingNow = taskReadyAt(fresh) - serverNowSeconds();
                     const selected = slotTaskItem(runtime.state, 'farming', target.id, 'active', { notify: false });
-                    if (!CONFIG.farming.enabled || revision !== settingsRevision || !fresh || fresh.empty || fresh.ready ||
+                    if (!CONFIG.farming.enabled || !plotAutoManaged(target.id) || revision !== settingsRevision || !fresh || fresh.empty || fresh.ready ||
                         plotSize(fresh) !== plotSize(node) || taskReadyAt(fresh) !== readyAt ||
                         !sameId(taskItemRecordId(selected), itemId) || remainingNow <= 0 || remainingNow > Number(selected?.value || 0)) {
                         throw new ApiError('农田道具条件已变化，下一轮重新核对', { code: 'aborted' });
@@ -3751,13 +3981,20 @@
 
     async function collectReadyPlots() {
         if (!CONFIG.farming.enabled || !CONFIG.farming.autoCollect) return;
-        const slots = (runtime.state.plots || []).filter(p => p.ready && !p.empty).map(p => p.slot);
+        const slots = (runtime.state.plots || []).filter(p => p.ready && !p.empty && plotAutoHarvest(p.slot)).map(p => p.slot);
         for (const slot of slots) {
             if (!CONFIG.farming.enabled || !CONFIG.farming.autoCollect) return;
             const plot = (runtime.state.plots || []).find(p => p.slot === slot);
-            if (!plot || !plot.ready || plot.empty) continue;
+            if (!plot || !plot.ready || plot.empty || !plotAutoHarvest(slot)) continue;
+            const state = runtime.state, revision = settingsRevision;
             try {
-                await harvestPlot(slot);
+                await harvestPlot(slot, () => {
+                    const fresh = (runtime.state.plots || []).find(candidate => sameId(candidate.slot, slot));
+                    if (!CONFIG.farming.enabled || !CONFIG.farming.autoCollect || !plotAutoHarvest(slot) ||
+                        runtime.state !== state || settingsRevision !== revision || !fresh?.ready || fresh.empty || plotSize(fresh) !== plotSize(plot)) {
+                        throw new ApiError('农田收获条件已变化，下一轮重新核对', { code: 'aborted' });
+                    }
+                });
                 clearSkip(`fail:harvest:${slot}`);
                 log(`${plotLabel(plot)}：已收获`);
             } catch (e) {
@@ -3772,13 +4009,13 @@
         const cfg = CONFIG.farming;
         if (!cfg.enabled) return;
         // 先落实手动锁定田，再让自动田使用写响应里的在途产量补缺，避免抢种同一份需求。
-        const slots = (runtime.state.plots || []).filter(p => p.empty).map(p => p.slot)
+        const slots = (runtime.state.plots || []).filter(p => p.empty && plotAutoManaged(p.slot)).map(p => p.slot)
             .sort((a, b) => Number(plotCropOverride(b) != null) - Number(plotCropOverride(a) != null));
         for (const slot of slots) {
             if (!cfg.enabled || !cfg.autoPlant) return;
             let state = runtime.state;
             let plot = (state.plots || []).find(p => p.slot === slot);
-            if (!plot?.empty) continue;
+            if (!plot?.empty || !plotAutoManaged(slot)) continue;
             const label = plotLabel(plot), size = plotSize(plot);
             const target = chooseCropTarget(state, plot);
             if (!target.crop) {
@@ -3796,7 +4033,7 @@
 
             const revision = settingsRevision;
             const checkChoice = () => {
-                if (settingsRevision !== revision || !cfg.enabled || !cfg.autoPlant) {
+                if (settingsRevision !== revision || !cfg.enabled || !cfg.autoPlant || !plotAutoManaged(slot)) {
                     const error = new ApiError('种植设置已变化，下一轮重新选种', { code: 'aborted' });
                     error.farmingPlanChanged = true;
                     throw error;
@@ -3998,14 +4235,20 @@
         const slots = [];
         if (CONFIG.farming.enabled && CONFIG.farming.autoAssignPartner) {
             for (const plot of state.plots || []) {
-                if (!plot.empty || plot.assignment_locked) continue;
+                if (!plot.empty || plot.assignment_locked || !plotAutoManaged(plot.slot)) continue;
                 if (outsidePartnerIds(state).has(String(currentPartnerId(plot)))) continue;
                 slots.push({
                     key: `farming:${plot.slot}`, industry: 'farming', id: plot.slot,
-                    label: `土地 ${plot.slot + 1}`, node: plot, mandatory: false,
+                    label: plotLabel(plot), node: plot, mandatory: false,
                     difficulty: Math.max(0, ...(state.crops || [])
                         .map(c => Number(c.time_difficulty || 0)).filter(Number.isFinite)),
-                    assign: pid => assignPlotPartner(plot.slot, pid),
+                    assign: pid => assignPlotPartner(plot.slot, pid, () => {
+                        const fresh = (runtime.state.plots || []).find(candidate => sameId(candidate.slot, plot.slot));
+                        if (!CONFIG.farming.enabled || !CONFIG.farming.autoAssignPartner || !plotAutoManaged(plot.slot) ||
+                            !fresh?.empty || fresh.assignment_locked || plotSize(fresh) !== plotSize(plot)) {
+                            throw new ApiError('农田派驻条件已变化，下一轮重新核对', { code: 'aborted' });
+                        }
+                    }),
                 });
             }
         }
@@ -5120,69 +5363,204 @@
         }
     }
 
-    // 鱼塘：捞走超出保留线的成鱼（保持世代加值），捞后用手头鱼苗把鱼塘补到目标尾数（不从商店购买鱼苗）
+    const pondConfigKey = id => `rlt-pond-config:${id}`;
+    const pondBuildKey = id => `rlt-pond-build:${id}`;
+    function pondSettings(id) {
+        const saved = readJson(pondConfigKey(id), {}), cfg = CONFIG.aquatic;
+        const flag = (key, fallback) => typeof saved?.[key] === 'boolean' ? saved[key] : fallback;
+        const count = (key, fallback) => Number.isSafeInteger(saved?.[key]) && saved[key] >= 0 ? saved[key] :
+            Math.max(0, Math.floor(Number(fallback) || 0));
+        return { enabled: flag('enabled', true), autoHarvest: flag('autoHarvest', cfg.autoHarvestPonds),
+            autoStock: flag('autoStock', cfg.autoStockPonds), autoAssignPartner: flag('autoAssignPartner', cfg.autoAssignPartner),
+            keepStock: count('keepStock', cfg.pondKeepStock), restockTarget: count('restockTarget', cfg.pondRestockTarget),
+            speciesId: typeof saved?.speciesId === 'string' ? saved.speciesId : '' };
+    }
+    function setPondSetting(id, key, value) {
+        const current = readJson(pondConfigKey(id), {});
+        const next = current && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {};
+        if (value == null || value === '') delete next[key]; else next[key] = value;
+        setOverride(pondConfigKey(id), Object.keys(next).length ? JSON.stringify(next) : '');
+    }
+    function pondBuildEnabled(id) {
+        const value = getOverride(pondBuildKey(id));
+        return value === 'on' ? true : value === 'off' ? false : CONFIG.aquatic.autoBuildPonds;
+    }
+    function pondById(state, id) { return (state.aquatic?.ponds || []).find(pond => sameId(pond.pond_id, id)) || null; }
+    function pondWriteGuard(state, revision, check) {
+        return () => {
+            if (runtime.state !== state || settingsRevision !== revision || !CONFIG.aquatic.enabled ||
+                !CONFIG.aquatic.ponds || !state.aquatic?.unlocked || !check()) {
+                throw new ApiError('鱼塘状态或设置已变化，等待重新规划', { code: 'pond_replan' });
+            }
+        };
+    }
+    function pondSpecies(state, pond, settings = pondSettings(pond.pond_id)) {
+        const species = state.aquatic?.species || [];
+        const current = pond.species_id ?? pond.species?.id;
+        const fixed = pond.definition?.species_id;
+        const eligible = species.filter(row => row.unlocked !== false);
+        // 新鱼塘由定义指定鱼种；旧数据只有一个候选时仍可兼容，不凭列表顺序挑错第二塘鱼种。
+        const supported = current ?? fixed ?? (eligible.length === 1 ? eligible[0].id : null);
+        if (settings.speciesId && supported != null && !sameId(settings.speciesId, supported)) {
+            return { reason: '所选鱼种与本塘当前或支持的鱼种不符，请调整设置；不会自动换种', choices: species.filter(row => sameId(row.id, supported)) };
+        }
+        const choices = supported == null ? [] : species.filter(row => sameId(row.id, supported));
+        const selected = choices.find(row => row.unlocked !== false && (!settings.speciesId || sameId(row.id, settings.speciesId)));
+        return selected ? { species: selected, choices } : { choices, reason: '本塘鱼种数据尚未确认或未解锁，等待游戏同步' };
+    }
+    function pondStockPlan(state, pond, settings = pondSettings(pond.pond_id)) {
+        const selection = pondSpecies(state, pond, settings);
+        if (!selection.species) return { ...selection, quantity: 0 };
+        const species = selection.species, capacity = Number(pond.capacity);
+        const population = Number(pond.population ?? (Number(pond.stock || 0) + (pond.fry || []).reduce((sum, row) => sum + Number(row.count || 0), 0)));
+        if (!Number.isSafeInteger(capacity) || capacity < 0 || !Number.isSafeInteger(population) || population < 0) {
+            return { ...selection, quantity: 0, reason: '本塘容量或鱼群数量待确认' };
+        }
+        const target = Math.min(capacity, settings.restockTarget);
+        let owned = Math.max(0, Math.floor(Number(species.owned_fry) || 0));
+        const fryId = species.fry_item?.item_id ?? species.fry_item?.id;
+        if (fryId != null) owned = Math.min(owned, safeUnspecifiedConsumeQty(state, fryId, '', { applyDefaultKeep: false }));
+        const quantity = Math.max(0, Math.min(target - population, owned));
+        return { ...selection, target, quantity, reason: target > population && !quantity ? '鱼苗不足或已预留，等待库存补充' : '' };
+    }
+    function pondBuildPlan(state, site) {
+        if (site?.id != null && pondById(state, site.id)) return { reason: '本塘已建成' };
+        if (!site?.unlocked || !site.affordable) return { reason: '未解锁或建造资源不足' };
+        const price = Number(site.build_cost ?? 0), totals = new Map();
+        if (!Number.isFinite(price) || price < 0 || playerCoins(state) < price) return { reason: '建塘金币不足或费用待确认' };
+        if (Object.prototype.hasOwnProperty.call(site, 'build_materials') && !Array.isArray(site.build_materials)) return { reason: '建塘材料数据待确认' };
+        for (const row of site.build_materials || []) {
+            const itemId = row?.item_id ?? row?.item?.item_id ?? row?.item?.id, quantity = Number(row?.quantity);
+            if (!(typeof itemId === 'string' && itemId.trim() || typeof itemId === 'number' && Number.isFinite(itemId)) || !Number.isSafeInteger(quantity) || quantity <= 0) {
+                return { reason: '建塘材料数据待确认' };
+            }
+            const key = String(itemId), previous = totals.get(key);
+            totals.set(key, { itemId, name: row.name || row.item?.name || key, quantity: (previous?.quantity || 0) + quantity });
+        }
+        for (const row of totals.values()) {
+            if (!Number.isSafeInteger(row.quantity) || safeUnspecifiedConsumeQty(state, row.itemId, '',
+                { applyDefaultKeep: false, excludeFacilityProject: { kind: 'pond', id: site.id } }) < row.quantity) {
+                return { reason: `建塘材料「${row.name}」不足或已预留` };
+            }
+        }
+        return { price, materials: [...totals.values()], reason: '' };
+    }
+    function renderPondSettings(state) {
+        const { group, body } = makeGroup('逐塘管理', 'production');
+        body.appendChild(uiElement('p', 'rlt-note', '水产和鱼塘管理总开关仍生效。未单独设置时沿用全局；关闭某塘会保留现有鱼群和伙伴。'));
+        const preview = compute => { try { return compute(); } catch (error) { return { reason: error.message }; } };
+        const toggle = (card, id, key, label, fallback) => {
+            const { row, select } = makeSelectRow(label, '留空沿用全局设置');
+            const saved = readJson(pondConfigKey(id), {})?.[key];
+            fillSelect(select, [{ value: 'on', text: '开启' }, { value: 'off', text: '关闭' }],
+                typeof saved === 'boolean' ? saved ? 'on' : 'off' : null, `跟随全局（${fallback ? '开启' : '关闭'}）`);
+            select.onchange = () => { setPondSetting(id, key, select.value ? select.value === 'on' : null); wakeSoon(); };
+            card.appendChild(row);
+        };
+        for (const pond of state.aquatic?.ponds || []) {
+            const id = pond.pond_id;
+            if (id == null) continue;
+            const settings = pondSettings(id), plan = preview(() => pondStockPlan(state, pond, settings));
+            const card = workCard(pond.definition?.name || `鱼塘 ${id}`, !settings.enabled ? '已暂停' :
+                !CONFIG.aquatic.enabled || !CONFIG.aquatic.ponds ? '总开关已关闭' : '管理中', null,
+                `成鱼 ${pond.stock ?? 0} · 总数 ${pond.population ?? '?'} / ${pond.capacity ?? '?'} · 稳态线 ${pond.steady_stock ?? 0}`);
+            card.dataset.pondId = String(id);
+            toggle(card, id, 'enabled', '本塘管理', CONFIG.aquatic.ponds);
+            toggle(card, id, 'autoHarvest', '自动收鱼', CONFIG.aquatic.autoHarvestPonds);
+            toggle(card, id, 'autoStock', '自动补苗', CONFIG.aquatic.autoStockPonds);
+            toggle(card, id, 'autoAssignPartner', '自动派驻', CONFIG.aquatic.autoAssignPartner);
+            for (const [key, label, fallback] of [['keepStock', '成鱼保留线', CONFIG.aquatic.pondKeepStock], ['restockTarget', '补苗目标', CONFIG.aquatic.pondRestockTarget]]) {
+                const { row, label: text } = makeControlRow(label), saved = readJson(pondConfigKey(id), {})?.[key];
+                const input = makeNumberInput(Number.isSafeInteger(saved) && saved >= 0 ? saved : '', { min: 0, title: `${label}：留空跟随全局 ${fallback}；补苗目标 0 表示不投苗`, placeholder: `全局 ${fallback}`, width: '112px' });
+                input.setAttribute('aria-label', label); input.dataset.pondSetting = key;
+                input.onchange = () => {
+                    const value = input.value.trim() === '' ? null : Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(Number(input.value) || 0)));
+                    setPondSetting(id, key, value); input.value = value == null ? '' : String(value); wakeSoon();
+                };
+                row.append(text, input); card.appendChild(row);
+            }
+            const { row, select } = makeSelectRow('投苗鱼种', '沿用当前鱼种；空塘只使用游戏为本塘指定的鱼种，不自动换种');
+            fillSelect(select, (plan.choices || []).map(species => ({ value: species.id, text: species.name || species.id, disabled: species.unlocked === false })),
+                settings.speciesId || null, `自动沿用本塘${plan.species ? `（${plan.species.name || plan.species.id}）` : ''}`);
+            select.onchange = () => { setPondSetting(id, 'speciesId', select.value); wakeSoon(); }; card.appendChild(row);
+            if (plan.reason && settings.enabled && settings.autoStock) card.appendChild(uiElement('p', 'rlt-note', plan.reason));
+            body.appendChild(card);
+        }
+        for (const site of state.aquatic?.buildable_ponds || []) {
+            if (site.id == null) continue;
+            const plan = preview(() => pondBuildPlan(state, site)), card = workCard(site.name || `鱼塘 ${site.id}`, site.unlocked ? '待建造' : '尚未解锁', null,
+                `容量 ${site.capacity ?? '?'} 尾 · 建造费用 ${site.build_cost ?? '?'} 币`);
+            card.dataset.pondBuildId = String(site.id);
+            for (const material of Array.isArray(site.build_materials) ? site.build_materials : []) card.appendChild(uiElement('p', 'rlt-note',
+                `${material.name || material.item?.name || material.item_id || '材料待确认'} ×${material.quantity ?? '?'}`));
+            const { row, select } = makeSelectRow('自动建造本塘', '开启即授权满足条件后支付金币和材料建造；仍保护其他用途预留');
+            fillSelect(select, [{ value: 'on', text: '授权自动建造' }, { value: 'off', text: '不自动建造' }],
+                getOverride(pondBuildKey(site.id)), `跟随全局（${CONFIG.aquatic.autoBuildPonds ? '已授权' : '未授权'}）`);
+            select.onchange = () => { setOverride(pondBuildKey(site.id), select.value); wakeSoon(); }; card.appendChild(row);
+            if (plan.reason) card.appendChild(uiElement('p', 'rlt-note', plan.reason));
+            body.appendChild(card);
+        }
+        if (!(state.aquatic?.ponds?.length || state.aquatic?.buildable_ponds?.length)) body.appendChild(uiElement('p', 'rlt-note', '尚无已建鱼塘或可建项目，等待游戏解锁。'));
+        configBox.appendChild(group);
+    }
+    // 每次动作都重新读取这口塘；收鱼响应之后才按新的总数计算投苗。
     async function doPonds() {
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
         if (!cfg.enabled || !cfg.ponds || !aq?.unlocked) return;
-        if (cfg.autoBuildPonds) {
-            for (const site of aq.buildable_ponds || []) {
-                if (!cfg.enabled || !cfg.ponds || !cfg.autoBuildPonds) break;
-                if (!site.unlocked || !site.affordable) continue;
+        for (const id of (aq.buildable_ponds || []).map(site => site.id).filter(id => id != null)) {
+                if (!cfg.enabled || !cfg.ponds) return;
+                const state = runtime.state, revision = settingsRevision;
+                const site = (state.aquatic?.buildable_ponds || []).find(row => sameId(row.id, id));
+                if (!site || !pondBuildEnabled(id)) continue;
+                const plan = pondBuildPlan(state, site);
+                if (plan.reason) { logSkip(`build-pond:${id}:${plan.reason}`, `鱼塘「${site.name || id}」：${plan.reason}`); continue; }
                 try {
-                    await buildPond(site.id);
+                    await buildPond(site.id, pondWriteGuard(state, revision, () => pondBuildEnabled(id) && !pondBuildPlan(runtime.state, site).reason));
                     clearSkip(`fail:build-pond:${site.id}`);
-                    log(`已挖好新鱼塘「${site.name || site.id}」（${site.build_cost} 红叶币）`);
+                    log(`已挖好新鱼塘「${site.name || site.id}」（${plan.price} 红叶币）`);
                 } catch (e) {
+                    if (e.code === 'pond_replan') return;
                     if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:build-pond:${site.id}`, `挖塘「${site.name || site.id}」失败：${e.message}`);
                 }
-            }
         }
-        for (const pond of runtime.state.aquatic?.ponds || []) {
+        for (const id of (runtime.state.aquatic?.ponds || []).map(pond => pond.pond_id).filter(id => id != null)) {
             if (!cfg.enabled || !cfg.ponds) return;
-            if (pond.pond_id == null) continue;
+            let state = runtime.state, revision = settingsRevision, pond = pondById(state, id), settings = pondSettings(id);
+            if (!pond || !settings.enabled) continue;
             const label = `鱼塘「${pond.definition?.name || pond.pond_id}」`;
             const stock = Math.max(0, Number(pond.stock || 0));
             // 保留线 = 游戏稳态线与配置 pondKeepStock 的较大者（稳态线以下会掉世代加值）
-            const keep = Math.max(Math.max(0, Number(pond.steady_stock || 0)), Number(cfg.pondKeepStock || 0));
+            const keep = Math.max(Math.max(0, Math.ceil(Number(pond.steady_stock || 0))), settings.keepStock);
             // 捞鱼：只捞超出保留线的部分，捞鱼不消耗体力
             const surplus = stock - keep;
-            if (cfg.autoHarvestPonds && surplus > 0) {
+            if (settings.autoHarvest && Number.isSafeInteger(surplus) && surplus > 0) {
                 try {
-                    await harvestPond(pond.pond_id, surplus);
+                    await harvestPond(id, surplus, pondWriteGuard(state, revision, () => pondSettings(id).enabled && pondSettings(id).autoHarvest));
                     clearSkip(`fail:harvest-pond:${pond.pond_id}`);
                     log(`${label}：捞鱼 ×${surplus}（保留 ${keep} 尾）`);
                 } catch (e) {
+                    if (e.code === 'pond_replan') return;
                     if (shouldAbortTick(e)) throw e;
                     logSkip(`fail:harvest-pond:${pond.pond_id}`, `${label} 捞鱼失败：${e.message}`);
                 }
             }
             if (!cfg.enabled || !cfg.ponds) return;
-            // 投苗补齐：捞鱼后若低于目标尾数，用手头现有鱼苗补到目标（只用手头鱼苗，不从商店购买；
-            // 沿用官方选种：塘里已有品种优先，否则第一个已解锁品种）。捞鱼会刷新 state，需重新取该塘数据
-            const fresh = (runtime.state.aquatic?.ponds || []).find(p => sameId(p.pond_id, pond.pond_id)) || pond;
-            const species = fresh.species_id != null
-                ? (runtime.state.aquatic.species || []).find(s => sameId(s.id, fresh.species_id))
-                : (runtime.state.aquatic.species || []).find(s => s.unlocked);
-            if (cfg.autoStockPonds && species && species.id != null && Number(species.owned_fry || 0) > 0) {
-                const freshStock = Math.max(0, Number(fresh.stock || 0));
-                const freshFry = (fresh.fry || []).reduce((sum, f) => sum + Number(f.count || 0), 0);
-                const capacity = Number(fresh.capacity || 0);
-                // 补苗目标 = 配置 pondRestockTarget 与容量的较小者
-                const target = Math.min(capacity, Math.max(0, Math.floor(Number(cfg.pondRestockTarget) || 0)));
-                const room = Math.max(0, target - Number(fresh.population ?? (freshStock + freshFry)));
-                const qty = Math.min(room, Number(species.owned_fry || 0));
-                if (qty > 0) {
+            state = runtime.state; revision = settingsRevision; pond = pondById(state, id); settings = pondSettings(id);
+            if (!pond || !settings.enabled || !settings.autoStock) continue;
+            const plan = pondStockPlan(state, pond, settings), species = plan.species;
+            if (plan.reason) logSkip(`stock-pond:${id}:${plan.reason}`, `${label}：${plan.reason}`);
+            if (plan.quantity > 0) {
                     try {
-                        await stockPond(fresh.pond_id, species.id, qty);
-                        clearSkip(`fail:stock:${fresh.pond_id}`);
-                        log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${qty}（补至 ${target} 尾）`);
+                        await stockPond(id, species.id, plan.quantity, pondWriteGuard(state, revision, () => pondSettings(id).enabled && pondSettings(id).autoStock));
+                        clearSkip(`fail:stock:${id}`);
+                        log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${plan.quantity}（补至 ${plan.target} 尾）`);
                     } catch (e) {
+                        if (e.code === 'pond_replan') return;
                         if (shouldAbortTick(e)) throw e;
-                        logSkip(`fail:stock:${fresh.pond_id}`, `${label} 投苗失败：${e.message}`);
+                        logSkip(`fail:stock:${id}`, `${label} 投苗失败：${e.message}`);
                     }
-                }
             }
         }
     }
@@ -5812,7 +6190,7 @@
     async function doAquaticPartners() {
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
-        if (!cfg.enabled || !cfg.autoAssignPartner || !aq?.unlocked) return;
+        if (!cfg.enabled || !aq?.unlocked) return;
         const capacity = industryCapacity(runtime.state, 'aquatic');
         const aquaticIds = aquaticAssignedPartnerIds(runtime.state);
         if (aquaticIds.size >= capacity) return;
@@ -5822,7 +6200,7 @@
             .sort((a, b) => partnerIndustryScore(b, 'aquatic') - partnerIndustryScore(a, 'aquatic'));
         if (!idle.length) return;
         const takeNext = () => idle.shift();
-        if (fishingEnabled() && aq.companion == null) {
+        if (cfg.autoAssignPartner && fishingEnabled() && aq.companion == null) {
             const partner = takeNext();
             if (partner) {
                 const pid = partner.partner_id ?? partner.id;
@@ -5837,19 +6215,28 @@
                 }
             }
         }
-        for (const pond of runtime.state.aquatic?.ponds || []) {
-            if (!cfg.enabled || !cfg.autoAssignPartner || !cfg.ponds) break;
-            if (pond.pond_id == null || nodeHasAssignedOrPendingPartner(pond)) continue;
-            if (aquaticIds.size >= capacity) break;
-            const partner = takeNext();
+        for (const id of (runtime.state.aquatic?.ponds || []).map(pond => pond.pond_id).filter(id => id != null)) {
+            if (!cfg.enabled || !cfg.ponds) break;
+            const state = runtime.state, revision = settingsRevision, pond = pondById(state, id), settings = pondSettings(id);
+            if (!pond || !settings.enabled || !settings.autoAssignPartner || nodeHasAssignedOrPendingPartner(pond)) continue;
+            const occupied = new Set([...aquaticIds, ...aquaticAssignedPartnerIds(state)]);
+            if (occupied.size >= industryCapacity(state, 'aquatic')) break;
+            const partner = (state.partners || []).filter(candidate => isPartnerIdle(candidate, state) && hasTendency(candidate, 'aquatic') &&
+                !occupied.has(String(partnerRecordId(candidate))))
+                .sort((a, b) => partnerIndustryScore(b, 'aquatic') - partnerIndustryScore(a, 'aquatic'))[0];
             if (!partner) break;
             const pid = partner.partner_id ?? partner.id;
             try {
-                await assignPondPartner(pond.pond_id, pid);
+                await assignPondPartner(id, pid, pondWriteGuard(state, revision, () => {
+                    const current = pondSettings(id);
+                    return current.enabled && current.autoAssignPartner && !nodeHasAssignedOrPendingPartner(pondById(runtime.state, id)) &&
+                        isPartnerIdle(partner, runtime.state) && occupied.size < industryCapacity(runtime.state, 'aquatic');
+                }));
                 clearSkip(`fail:assign-pond:${pond.pond_id}`);
                 aquaticIds.add(String(pid));
                 log(`已安排 ${partner.name || '伙伴#' + pid} 看塘「${pond.definition?.name || pond.pond_id}」（水产 ${partnerAbility(partner, 'aquatic')}）`);
             } catch (e) {
+                if (e.code === 'pond_replan') return;
                 if (shouldAbortTick(e)) throw e;
                 logSkip(`fail:assign-pond:${pond.pond_id}`, `安排看塘伙伴失败：${e.message}`);
             }
@@ -6045,6 +6432,7 @@
             if (!running) return;
             reconcileCraftFlights(state);
             await processCraftCancel();
+            await processFacilityUpgrade();
             clearSkip('story:active');
             clearSkip('environment:paused');
             if (state.aquatic?.pending_big_catch) {
@@ -6202,6 +6590,7 @@
         running = false;
         starting = false;
         wakeRequested = false;
+        runtime.facilityUpgrade = null;
         clearTimeout(timer);
         runtime.controller?.abort(new DOMException('已停止', 'AbortError'));
         if (!busy) releaseStoppedRun();
