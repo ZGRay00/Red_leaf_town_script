@@ -29,6 +29,7 @@
 !tests/red-leaf-town-partner-audit.test.cjs
 !tests/red-leaf-town-aquatic-audit.test.cjs
 !tests/red-leaf-town-multi-pond.test.cjs
+!tests/red-leaf-town-pond-fry.test.cjs
 !tests/red-leaf-town-v451-audit.test.cjs
 !红叶镇助手深度检查-2026-09-25.md
 !tests/red-leaf-town-ui.cjs

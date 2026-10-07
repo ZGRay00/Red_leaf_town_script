@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.1.0
+// @version      5.1.1
 // @description  红叶镇物语自动生产、双倍田、递归加工与精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -15,7 +15,7 @@
 
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.1.0';
+    const SCRIPT_VERSION = '5.1.1';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -107,11 +107,14 @@
             reserveBigCatch: true,    // 每次连钓为大物搏斗预留一竿体力（大物消耗 = 当前钓点单竿消耗；仅 bigCatch 为 'fight' 时生效）
             bigCatch: 'fight',        // 大物处理: 'fight' 搏一把 | 'release' 放线 | 'manual' 暂停等人工
             fightMinChance: 0,        // 大物成功率（0~1）低于该值时直接放线
-            ponds: true,              // 鱼塘：捞走超出保留线的成鱼（保持世代加值），再用手头鱼苗补到目标尾数
+            ponds: true,              // 鱼塘：收取多余成鱼，按各塘鱼种补苗至目标数量
             autoHarvestPonds: true,
             autoStockPonds: true,
+            autoBuyFry: true,         // 补苗库存不足时，只购买本塘鱼种对应的鱼苗；可逐塘关闭
+            pondCoinReserve: 1000,    // 购买鱼苗后至少保留的金币
+            pondMaxSpendPerTick: 1000, // 本轮所有鱼塘共用的鱼苗购买预算；0 = 不购买
             pondKeepStock: 30,        // 捞鱼保留线：成鱼捞到剩 N 尾为止（同时不低于游戏稳态线，取两者较大值）
-            pondRestockTarget: 37,    // 投苗目标：捞鱼后用手头鱼苗把塘内总数补到 N（0 = 不投苗，不超过鱼塘容量）
+            pondRestockTarget: 37,    // 投苗目标：塘内总数补到 N（0 = 不投苗，不超过鱼塘容量）
             autoBuildPonds: false,    // 自动挖塘（一次性投入红叶币，默认关闭）
             autoAssignPartner: true,  // 自动安排陪钓/看塘伙伴（水产倾向中挑特性最贴合、能力最强的）
         },
@@ -666,6 +669,10 @@
         requireArray('mining_sites', CONFIG.mining.enabled);
         const managedPonds = CONFIG.aquatic.enabled && CONFIG.aquatic.ponds && Array.isArray(state.aquatic?.ponds)
             ? state.aquatic.ponds.filter(pond => pond?.pond_id != null && pondSettings(pond.pond_id).enabled) : [];
+        requireArray('shop', managedPonds.some(pond => {
+            const settings = pondSettings(pond.pond_id);
+            return settings.autoStock && settings.autoBuyFry;
+        }));
         const needsSafeInventory = (CONFIG.commissions.enabled && CONFIG.commissions.autoTake) ||
             (CONFIG.farming.enabled && CONFIG.farming.autoBuySeeds && CONFIG.farming.autoSellForSeeds) ||
             (CONFIG.crafting.enabled && CONFIG.crafting.autoStart) || CONFIG.feed.enabled ||
@@ -1409,6 +1416,9 @@
         const { group, body } = makeGroup('鱼塘默认值与大物设置', 'production');
         appendSetting(body, state, 'aquatic.autoHarvestPonds', '自动捞成鱼');
         appendSetting(body, state, 'aquatic.autoStockPonds', '自动补鱼苗');
+        appendSetting(body, state, 'aquatic.autoBuyFry', '缺苗自动购买');
+        appendSetting(body, state, 'aquatic.pondCoinReserve', '买苗后金币保底');
+        appendSetting(body, state, 'aquatic.pondMaxSpendPerTick', '每轮鱼苗购买预算');
         appendSetting(body, state, 'aquatic.pondKeepStock', '默认成鱼保留尾数');
         appendSetting(body, state, 'aquatic.pondRestockTarget', '默认补苗目标尾数');
         appendSetting(body, state, 'aquatic.bigCatch', '大物处理', { choices: [{ value: 'fight', text: '体力够时挑战' }, { value: 'release', text: '放线' }, { value: 'manual', text: '暂停并手动处理' }] });
@@ -5392,7 +5402,8 @@
         const count = (key, fallback) => Number.isSafeInteger(saved?.[key]) && saved[key] >= 0 ? saved[key] :
             Math.max(0, Math.floor(Number(fallback) || 0));
         return { enabled: flag('enabled', true), autoHarvest: flag('autoHarvest', cfg.autoHarvestPonds),
-            autoStock: flag('autoStock', cfg.autoStockPonds), autoAssignPartner: flag('autoAssignPartner', cfg.autoAssignPartner),
+            autoStock: flag('autoStock', cfg.autoStockPonds), autoBuyFry: flag('autoBuyFry', cfg.autoBuyFry),
+            autoAssignPartner: flag('autoAssignPartner', cfg.autoAssignPartner),
             keepStock: count('keepStock', cfg.pondKeepStock), restockTarget: count('restockTarget', cfg.pondRestockTarget),
             speciesId: typeof saved?.speciesId === 'string' ? saved.speciesId : '' };
     }
@@ -5442,7 +5453,104 @@
         const fryId = species.fry_item?.item_id ?? species.fry_item?.id;
         if (fryId != null) owned = Math.min(owned, safeUnspecifiedConsumeQty(state, fryId, '', { applyDefaultKeep: false }));
         const quantity = Math.max(0, Math.min(target - population, owned));
-        return { ...selection, target, quantity, reason: target > population && !quantity ? '鱼苗不足或已预留，等待库存补充' : '' };
+        const need = Math.max(0, target - population), missing = Math.max(0, need - quantity);
+        return { ...selection, target, population, need, owned, fryId, quantity, missing,
+            reason: missing > 0 ? `鱼苗不足或已预留，可投 ${quantity} 尾，还缺 ${missing} 尾` : '' };
+    }
+    const pondFryIntentKey = id => `rlt-pond-fry-intent:${id}`;
+    function pondFryIntent(id) {
+        if (!getOverride(pondFryIntentKey(id))) return null;
+        const intent = readJson(pondFryIntentKey(id));
+        return intent && typeof intent === 'object' && ['submitting', 'uncertain'].includes(intent.phase) ? intent :
+            { phase: 'uncertain', reason: '上次鱼苗操作记录待核对' };
+    }
+    function clearPondFryIntent(id) { setOverride(pondFryIntentKey(id), ''); }
+    const pondFryHoldKey = id => `rlt-pond-fry-hold:${id}`;
+    function pondFryHoldSignature(state, itemId) {
+        const stacks = (state.inventory || []).filter(item => sameId(item.item_id, itemId));
+        const quantities = new Map();
+        for (const item of stacks) {
+            const quality = Number(item.quality || 0);
+            quantities.set(quality, (quantities.get(quality) || 0) + Number(item.quantity || 0));
+        }
+        const needs = gatherNeeds(state).filter(need => stacks.some(item => needMatchesItem(need, item)))
+            .map(need => [need.minQuality, need.exactQuality ?? null, need.need]).sort();
+        return JSON.stringify([[...quantities].sort((a, b) => a[0] - b[0]), needs,
+            configuredKeep(itemId, craftingInputReserves(state), { applyDefaultKeep: false })]);
+    }
+    function pondFryShopEntry(state, itemId) {
+        if (itemId == null) return null;
+        return (state.shop || []).filter(entry => sameId(shopEntryItemId(entry), itemId) && entry.id != null &&
+            String(entry.id) !== '' && !entry.locked && entry.unlocked !== false && entry.price != null && entry.price !== '' &&
+            Number.isFinite(Number(entry.price)) && Number(entry.price) >= 0)
+            .sort((a, b) => Number(a.price) - Number(b.price))[0] || null;
+    }
+    function pondFryPurchasePlan(state, pond, spent = 0, settings = pondSettings(pond.pond_id)) {
+        const plan = pondStockPlan(state, pond, settings), cfg = CONFIG.aquatic;
+        const result = { plan, quantity: 0, reason: '' };
+        if (!settings.enabled || !settings.autoStock || !settings.autoBuyFry || !plan.species || !(plan.missing > 0)) return result;
+        if (pondFryIntent(pond.pond_id)) return { ...result, reason: '上次鱼苗操作结果待核对，已暂停重复购买和投苗' };
+        if (plan.fryId == null) return { ...result, reason: '本塘鱼苗物品编号待确认，未购买其他鱼苗' };
+        const hold = readJson(pondFryHoldKey(pond.pond_id));
+        if (sameId(hold?.itemId, plan.fryId) && sameId(hold?.speciesId, plan.species.id) &&
+            hold.signature === pondFryHoldSignature(state, plan.fryId)) {
+            return { ...result, reason: '已购鱼苗仍受材料或品质预留保护，等待库存或预留变化后重新采购' };
+        }
+        const rawOwned = plan.species.owned_fry, owned = Number(rawOwned);
+        if (rawOwned == null || typeof rawOwned === 'string' && rawOwned.trim() === '' ||
+            !Number.isSafeInteger(owned) || owned < 0 || inventoryQty(state, plan.fryId) > owned) {
+            return { ...result, reason: '本塘鱼苗数量与背包尚未同步，等待确认后购买' };
+        }
+        const entry = pondFryShopEntry(state, plan.fryId);
+        if (!entry) return { ...result, reason: `${plan.species.fry_item?.name || '本塘鱼苗'} 暂无可购买的商店条目` };
+        const reserve = Number(cfg.pondCoinReserve), limit = Number(cfg.pondMaxSpendPerTick), coins = playerCoins(state);
+        if (!Number.isFinite(reserve) || reserve < 0 || !Number.isFinite(limit) || limit <= 0 || !Number.isFinite(coins)) {
+            return { ...result, reason: '鱼苗购买预算为 0 或设置无效，等待库存' };
+        }
+        const price = Number(entry.price), allowance = Math.max(0, Math.min(coins - reserve, limit - spent));
+        const quantity = Math.min(99, plan.missing, price > 0 ? Math.floor(allowance / price) : coins >= reserve && limit > spent ? 99 : 0);
+        return { ...result, entry, price, quantity, reason: quantity > 0 ? '' : '鱼苗共享预算或金币保底不足，暂不购买' };
+    }
+    // 买苗、投苗均先记意图；网络或状态返回不确定时，不凭下一轮余额/鱼群数量猜测后重发。
+    async function writePondFryAction(state, id, action, quantity, plan, beforeWrite, purchase = null) {
+        const key = pondFryIntentKey(id), beforeQty = inventoryQty(state, plan.fryId);
+        const intent = { version: 1, phase: 'submitting', action, itemId: plan.fryId ?? null,
+            speciesId: plan.species.id, quantity, beforeQty, beforePopulation: plan.population };
+        const submitted = JSON.stringify(intent);
+        let saved = false;
+        const guard = () => {
+            beforeWrite();
+            if (pondFryIntent(id)) throw new ApiError('上次鱼苗操作待核对', { code: 'pond_replan' });
+            setOverride(key, submitted); saved = true;
+        };
+        try {
+            if (action === 'buy') await buyItem(purchase.entry.id, quantity, guard);
+            else await stockPond(id, plan.species.id, quantity, guard);
+            // 回执确认使用塘内实际鱼种；用户在请求期间改锁定鱼种，只影响接下来的补苗规划。
+            const fresh = pondById(runtime.state, id), next = fresh ? pondStockPlan(runtime.state, fresh, { ...pondSettings(id), speciesId: '' }) : null;
+            if (getOverride(key) !== submitted) return false;
+            const confirmed = action === 'buy' ? inventoryQty(runtime.state, plan.fryId) >= beforeQty + quantity :
+                next && sameId(next.species?.id, plan.species.id) && next.population >= plan.population + quantity;
+            if (!confirmed) {
+                setOverride(key, JSON.stringify({ ...intent, phase: 'uncertain', reason: action === 'buy' ?
+                    '买苗后库存未确认增加，请核对背包鱼苗' : '投苗后鱼群数量未确认增加，请核对鱼塘' }));
+                return false;
+            }
+            // 成功买入但新苗仍被预留时，自动等待条件变化；不把已知成功误报为网络结果待核对。
+            if (action === 'buy') {
+                setOverride(pondFryHoldKey(id), next && sameId(next.species?.id, plan.species.id) && next.owned <= plan.owned ?
+                    JSON.stringify({ itemId: plan.fryId, speciesId: plan.species.id,
+                        signature: pondFryHoldSignature(runtime.state, plan.fryId) }) : '');
+            }
+            clearPondFryIntent(id);
+            return true;
+        } catch (error) {
+            if (saved && getOverride(key) === submitted) {
+                if (error.writeNotSent || (!uncertainWrite(error) && !error.writeResponseReceived)) clearPondFryIntent(id);
+                else setOverride(key, JSON.stringify({ ...intent, phase: 'uncertain', reason: `${action === 'buy' ? '买苗' : '投苗'}结果待核对，请先检查游戏中的实际库存和鱼群` }));
+            }
+            throw error;
+        }
     }
     function pondBuildPlan(state, site) {
         if (site?.id != null && pondById(state, site.id)) return { reason: '本塘已建成' };
@@ -5481,14 +5589,15 @@
         for (const pond of state.aquatic?.ponds || []) {
             const id = pond.pond_id;
             if (id == null) continue;
-            const settings = pondSettings(id), plan = preview(() => pondStockPlan(state, pond, settings));
+            const settings = pondSettings(id), plan = preview(() => pondStockPlan(state, pond, settings)), intent = pondFryIntent(id);
             const card = workCard(pond.definition?.name || `鱼塘 ${id}`, !settings.enabled ? '已暂停' :
-                !CONFIG.aquatic.enabled || !CONFIG.aquatic.ponds ? '总开关已关闭' : '管理中', null,
+                !CONFIG.aquatic.enabled || !CONFIG.aquatic.ponds ? '总开关已关闭' : intent ? '补苗待核对' : '管理中', null,
                 `成鱼 ${pond.stock ?? 0} · 总数 ${pond.population ?? '?'} / ${pond.capacity ?? '?'} · 稳态线 ${pond.steady_stock ?? 0}`);
             card.dataset.pondId = String(id);
             toggle(card, id, 'enabled', '本塘管理', CONFIG.aquatic.ponds);
             toggle(card, id, 'autoHarvest', '自动收鱼', CONFIG.aquatic.autoHarvestPonds);
             toggle(card, id, 'autoStock', '自动补苗', CONFIG.aquatic.autoStockPonds);
+            toggle(card, id, 'autoBuyFry', '缺苗自动购买', CONFIG.aquatic.autoBuyFry);
             toggle(card, id, 'autoAssignPartner', '自动派驻', CONFIG.aquatic.autoAssignPartner);
             for (const [key, label, fallback] of [['keepStock', '成鱼保留线', CONFIG.aquatic.pondKeepStock], ['restockTarget', '补苗目标', CONFIG.aquatic.pondRestockTarget]]) {
                 const { row, label: text } = makeControlRow(label), saved = readJson(pondConfigKey(id), {})?.[key];
@@ -5505,6 +5614,22 @@
                 settings.speciesId || null, `自动沿用本塘${plan.species ? `（${plan.species.name || plan.species.id}）` : ''}`);
             select.onchange = () => { setPondSetting(id, 'speciesId', select.value); wakeSoon(); }; card.appendChild(row);
             if (plan.reason && settings.enabled && settings.autoStock) card.appendChild(uiElement('p', 'rlt-note', plan.reason));
+            if (plan.missing > 0 && settings.enabled && settings.autoStock && settings.autoBuyFry && !intent) {
+                const purchase = preview(() => pondFryPurchasePlan(state, pond, 0, settings));
+                card.appendChild(uiElement('p', 'rlt-note', purchase.quantity > 0 ?
+                    `可购买 ${plan.species.fry_item?.name || '本塘鱼苗'}，每尾 ${purchase.price} 币，本塘本轮最多 ${purchase.quantity} 尾；各塘共用预算` : purchase.reason || '等待可用鱼苗'));
+            }
+            if (intent) {
+                card.appendChild(uiElement('p', 'rlt-warning', intent.reason || '上次鱼苗操作结果待核对，已暂停本塘重复购买和投苗。'));
+                const reset = uiElement('button', '', '确认鱼苗操作结果');
+                reset.disabled = busy; reset.dataset.pondFryReset = String(id);
+                reset.onclick = () => {
+                    if (busy || !pondFryIntent(id)) return;
+                    if (!window.confirm('请先在游戏中核对本塘鱼群和背包鱼苗的实际数量。清除记录后按最新状态重新补苗，不会重发旧请求。确认已核对？')) return;
+                    clearPondFryIntent(id); lastConfigState = null; wakeSoon(); refreshConfigRows(currentViewState());
+                };
+                card.appendChild(reset);
+            }
             body.appendChild(card);
         }
         for (const site of state.aquatic?.buildable_ponds || []) {
@@ -5529,6 +5654,7 @@
         const cfg = CONFIG.aquatic;
         const aq = runtime.state?.aquatic;
         if (!cfg.enabled || !cfg.ponds || !aq?.unlocked) return;
+        let frySpent = 0;
         for (const id of (aq.buildable_ponds || []).map(site => site.id).filter(id => id != null)) {
                 if (!cfg.enabled || !cfg.ponds) return;
                 const state = runtime.state, revision = settingsRevision;
@@ -5570,11 +5696,47 @@
             if (!cfg.enabled || !cfg.ponds) return;
             state = runtime.state; revision = settingsRevision; pond = pondById(state, id); settings = pondSettings(id);
             if (!pond || !settings.enabled || !settings.autoStock) continue;
-            const plan = pondStockPlan(state, pond, settings), species = plan.species;
+            const pending = pondFryIntent(id);
+            if (pending) { logSkip(`fry-pending:${id}`, `${label}：${pending.reason || '上次鱼苗操作待核对'}，补苗已暂停`); continue; }
+            let plan = pondStockPlan(state, pond, settings);
+            if (plan.missing > 0 && settings.autoBuyFry) {
+                const purchase = pondFryPurchasePlan(state, pond, frySpent, settings);
+                if (purchase.reason) logSkip(`fry-buy:${id}:${purchase.reason}`, `${label}：${purchase.reason}`);
+                if (purchase.quantity > 0) {
+                    try {
+                        const confirmed = await writePondFryAction(state, id, 'buy', purchase.quantity, plan,
+                            pondWriteGuard(state, revision, () => {
+                                const current = pondById(runtime.state, id), next = current && pondFryPurchasePlan(runtime.state, current, frySpent);
+                                return next?.quantity >= purchase.quantity && sameId(next.plan.species?.id, plan.species.id) &&
+                                    sameId(next.entry?.id, purchase.entry.id) && next.price === purchase.price;
+                            }), purchase);
+                        frySpent += purchase.price * purchase.quantity;
+                        log(`${label}：购买 ${plan.species.fry_item?.name || '鱼苗'} ×${purchase.quantity}（${purchase.price * purchase.quantity} 金币）`);
+                        if (!confirmed) { logSkip(`fry-pending:${id}`, `${label}：${pondFryIntent(id)?.reason || '购买结果待核对'}`); continue; }
+                        clearSkip(`fry-pending:${id}`);
+                    } catch (error) {
+                        if (error.code === 'pond_replan') return;
+                        if (shouldAbortTick(error)) throw error;
+                        logSkip(`fail:fry-buy:${id}`, `${label} 买苗失败：${error.message}`);
+                    }
+                    // 购买后不可沿用旧人口、鱼种或库存；设置改动也必须立即生效。
+                    state = runtime.state; revision = settingsRevision; pond = pondById(state, id); settings = pondSettings(id);
+                    if (!cfg.enabled || !cfg.ponds || !pond || !settings.enabled || !settings.autoStock || pondFryIntent(id)) continue;
+                    plan = pondStockPlan(state, pond, settings);
+                }
+            }
+            const species = plan.species;
             if (plan.reason) logSkip(`stock-pond:${id}:${plan.reason}`, `${label}：${plan.reason}`);
             if (plan.quantity > 0) {
                     try {
-                        await stockPond(id, species.id, plan.quantity, pondWriteGuard(state, revision, () => pondSettings(id).enabled && pondSettings(id).autoStock));
+                        const confirmed = await writePondFryAction(state, id, 'stock', plan.quantity, plan,
+                            pondWriteGuard(state, revision, () => {
+                                const current = pondById(runtime.state, id), next = current && pondStockPlan(runtime.state, current);
+                                const options = pondSettings(id);
+                                return options.enabled && options.autoStock && next?.quantity >= plan.quantity && sameId(next.species?.id, species.id);
+                            }));
+                        if (!confirmed) { logSkip(`fry-pending:${id}`, `${label}：${pondFryIntent(id)?.reason || '投苗结果待核对'}`); continue; }
+                        clearSkip(`fry-pending:${id}`);
                         clearSkip(`fail:stock:${id}`);
                         log(`${label}：投苗 ${species.fry_item?.name || species.name || species.id} ×${plan.quantity}（补至 ${plan.target} 尾）`);
                     } catch (e) {
