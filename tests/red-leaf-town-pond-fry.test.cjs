@@ -166,7 +166,7 @@ test('an exact high-quality reservation cannot cause repeated useless ordinary-f
     assert.equal(x.backend.inventory.find(row => row.quality === 3).quantity, 1);
 });
 
-test('a confirmed purchase newly protected by a keep setting stays confirmed and is not repeated after reload', async () => {
+test('a confirmed purchase newly protected by a keep setting stays confirmed and replenishes only the finite remaining deficit', async () => {
     const x = setup();
     x.after(req => {
         if (req.url.endsWith('/shop/buy')) x.h.CONFIG.selling.keepByItemId.green_carp_fry = 37;
@@ -177,13 +177,16 @@ test('a confirmed purchase newly protected by a keep setting stays confirmed and
     assert.equal(x.intent(), null, 'confirmed inventory delivery does not require manual uncertainty recovery');
     assert.equal(x.stocks().length, 0);
     for (let pass = 0; pass < 3; pass++) await x.step();
-    assert.equal(x.buys().length, 1); assert.equal(x.stocks().length, 0); assert.equal(x.intent(), null);
+    assert.deepEqual(x.buys().map(req => req.payload.quantity), [37, 37]);
+    assert.deepEqual(x.stocks().map(req => req.payload.quantity), [37]); assert.equal(x.intent(), null);
+    assert.equal(x.backend.inventory.find(row => row.item_id === 'green_carp_fry').quantity, 37);
+    assert.equal(x.pond('pond2').population, 37);
     const restored = x.reload();
     // keepByItemId is script configuration rather than a persisted scalar setting.
     restored.h.CONFIG.selling.keepByItemId.green_carp_fry = 37;
     for (let pass = 0; pass < 3; pass++) await restored.step();
     assert.equal(restored.calls.length, 0); assert.equal(restored.intent(), null);
-    assert.equal(restored.pond('pond2').population, 0);
+    assert.equal(restored.pond('pond2').population, 37);
 });
 
 test('confirmed ordinary fry held behind a protected high-quality stack resume stocking when the protection ends', async () => {

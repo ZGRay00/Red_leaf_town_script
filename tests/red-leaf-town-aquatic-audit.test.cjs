@@ -67,14 +67,16 @@ test('disabling livestock assignment during the first request prevents the next 
 
 test('a restock target of zero cannot turn into filling the entire pond', async () => {
     const state = fixture(); state.aquatic.ponds = [{ pond_id: 'pond1', stock: 0, population: 0, capacity: 50 }];
-    state.aquatic.species = [{ id: 'fish1', unlocked: true, owned_fry: 50 }];
+    state.aquatic.species = [{ id: 'fish1', unlocked: true, owned_fry: 50, fry_item: { item_id: 'fish1_fry', name: '鱼苗1' } }];
+    state.inventory.push({ item_id: 'fish1_fry', name: '鱼苗1', quality: 1, quantity: 50 });
     const x = harness(state); x.h.CONFIG.aquatic.pondRestockTarget = 0;
     await x.h.doPonds(); assert.equal(x.calls.length, 0);
 });
 
 test('positive restock target is still bounded by capacity and current population', async () => {
     const state = fixture(); state.aquatic.ponds = [{ pond_id: 'pond1', stock: 5, population: 10, capacity: 30 }];
-    state.aquatic.species = [{ id: 'fish1', unlocked: true, owned_fry: 50 }];
+    state.aquatic.species = [{ id: 'fish1', unlocked: true, owned_fry: 50, fry_item: { item_id: 'fish1_fry', name: '鱼苗1' } }];
+    state.inventory.push({ item_id: 'fish1_fry', name: '鱼苗1', quality: 1, quantity: 50 });
     const x = harness(state); x.h.CONFIG.aquatic.pondRestockTarget = 37; x.setResponder(() => x.response());
     await x.h.doPonds(); assert.equal(x.calls.length, 1); assert.equal(x.calls[0].payload.quantity, 20);
 });

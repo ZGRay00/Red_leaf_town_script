@@ -20,6 +20,7 @@
 !tests/red-leaf-town-farming.test.cjs
 !tests/red-leaf-town-double-plots.test.cjs
 !tests/red-leaf-town-refining.test.cjs
+!tests/red-leaf-town-refining-loop.test.cjs
 !tests/red-leaf-town-facilities.test.cjs
 !tests/red-leaf-town-feed-quality.test.cjs
 !tests/red-leaf-town-feed-mix.test.cjs
@@ -30,6 +31,7 @@
 !tests/red-leaf-town-aquatic-audit.test.cjs
 !tests/red-leaf-town-multi-pond.test.cjs
 !tests/red-leaf-town-pond-fry.test.cjs
+!tests/red-leaf-town-pond-fry-recovery.test.cjs
 !tests/red-leaf-town-v451-audit.test.cjs
 !红叶镇助手深度检查-2026-09-25.md
 !tests/red-leaf-town-ui.cjs
