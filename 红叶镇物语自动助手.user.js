@@ -1,12 +1,11 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.2.3
+// @version      5.2.4
 // @description  红叶镇物语自动生产、双倍田、递归加工与循环精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @match        https://game.diving-fish.com/red-leaf-town/*
-// @match        https://game.diving-fish.com/aether/*
 // @downloadURL  none
 // @grant        unsafeWindow
 // @sandbox      raw
@@ -20,7 +19,7 @@
     const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (PAGE_WINDOW[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.2.3';
+    const SCRIPT_VERSION = '5.2.4';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
