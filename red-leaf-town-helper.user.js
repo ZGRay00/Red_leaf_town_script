@@ -1,23 +1,26 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.2.2
+// @version      5.2.3
 // @description  红叶镇物语自动生产、双倍田、递归加工与循环精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
 // @match        https://game.diving-fish.com/red-leaf-town/*
 // @match        https://game.diving-fish.com/aether/*
 // @downloadURL  none
-// @grant        none
+// @grant        unsafeWindow
+// @sandbox      raw
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
 
+    // 优先使用页面上下文；脚本管理器隔离执行时仍读取官网自己的 Vue / Pinia 对象。
+    const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
-    if (window[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.2.2';
+    if (PAGE_WINDOW[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
+    const SCRIPT_VERSION = '5.2.3';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -30,7 +33,7 @@
         { name: 'jsDelivr Fastly', url: 'https://fastly.jsdelivr.net/gh/ZGRay00/Red_leaf_town_script@main/red-leaf-town-helper.user.js' },
         { name: 'GitHub Raw', url: 'https://raw.githubusercontent.com/ZGRay00/Red_leaf_town_script/main/red-leaf-town-helper.user.js' },
     ];
-    window[INSTANCE_KEY] = { version: SCRIPT_VERSION };
+    PAGE_WINDOW[INSTANCE_KEY] = { version: SCRIPT_VERSION };
 
     /******************** 配置区 ********************/
     const CONFIG = {
@@ -614,14 +617,39 @@
         });
     }
 
-    function getPageStore(id) {
+    function getPageApp() {
         try {
-            const app = document.querySelector('#app')?.__vue_app__;
-            const pinia = app?._context?.config?.globalProperties?.$pinia;
-            return pinia?._s?.get(id) || null;
+            return (PAGE_WINDOW.document || document).querySelector('#app')?.__vue_app__ || null;
         } catch (_) {
             return null;
         }
+    }
+
+    function getPagePinia() {
+        try {
+            const context = getPageApp()?._context;
+            const direct = context?.config?.globalProperties?.$pinia;
+            if (typeof direct?._s?.get === 'function') return direct;
+            // Pinia 同时通过 Vue 的 provide 注册；全局属性未暴露时读取同一实例，不新建 store。
+            const provides = context?.provides;
+            for (const key of provides ? Reflect.ownKeys(provides) : []) {
+                const candidate = provides[key];
+                if (typeof candidate?._s?.get === 'function') return candidate;
+            }
+        } catch (_) { /* 页面未挂载或上下文尚不可访问，下一次检查会重新读取 */ }
+        return null;
+    }
+
+    function getPageStore(id) {
+        try { return getPagePinia()?._s.get(id) || null; }
+        catch (_) { return null; }
+    }
+
+    function pageBridgeDiagnostic() {
+        const app = getPageApp(), pinia = getPagePinia(), story = getPageStore('story');
+        return `页面${app ? '已挂载' : '未挂载'}，Pinia${pinia ? '可访问' : '不可访问'}，` +
+            `游戏状态${getPageStore('game') ? '已连接' : '未连接'}，` +
+            `剧情${story ? `cue 类型为 ${typeof story.cue}` : '未连接'}`;
     }
 
     function detectedGameBuild() {
@@ -633,6 +661,7 @@
     }
 
     let buildBaseline = null; // 本次运行识别到的官网构建基线（CONFIG.expectedBuild 为空时启用）
+    let clientBridgeWaitStarted = null;
 
     function validateClientEnvironment() {
         const build = detectedGameBuild();
@@ -651,10 +680,15 @@
         }
         const story = getPageStore('story');
         if (typeof story?.cue !== 'function') {
-            throw new ApiError('无法连接游戏官网剧情系统，已安全暂停，避免遗漏剧情奖励', {
-                code: 'invalid_story_bridge',
+            clientBridgeWaitStarted ??= performance.now();
+            // document-idle 不保证异步模块已经挂载；短间隔重连，期间禁止发送游戏写请求。
+            const loading = !getPagePinia() && performance.now() - clientBridgeWaitStarted < 15000;
+            throw new ApiError(loading ? '等待游戏官网加载完成，自动重连中' :
+                `无法连接游戏官网剧情系统（${pageBridgeDiagnostic()}）；已暂停写操作并自动重连，请检查脚本管理器的页面注入设置`, {
+                code: loading ? 'client_loading' : 'invalid_story_bridge', retryAfter: loading ? 1000 : 5000,
             });
         }
+        clientBridgeWaitStarted = null;
     }
 
     function validateStateSchema(state) {
@@ -794,7 +828,7 @@
     }
 
     function isControlFlowError(error) {
-        return error?.code === 'aborted' || error?.code === 'story_active';
+        return error?.code === 'aborted' || error?.code === 'story_active' || error?.code === 'client_loading';
     }
 
     function isFatalTickError(error) {
@@ -2491,9 +2525,7 @@
     // 触发游戏自带的 state 刷新（调用页面 Pinia store 的 refresh，而非刷新网页）
     async function refreshGameUI() {
         try {
-            const app = document.querySelector('#app')?.__vue_app__;
-            const pinia = app?._context?.config?.globalProperties?.$pinia;
-            const store = pinia?._s?.get('game');
+            const store = getPageStore('game');
             if (typeof store?.refresh === 'function') {
                 await Promise.resolve(store.refresh());
                 clearSkip('fail:ui-refresh');
@@ -7328,7 +7360,7 @@
             await processCraftCancel();
             await processFacilityUpgrade();
             clearSkip('story:active');
-            clearSkip('environment:paused');
+            for (const key of skipNotices) if (key.startsWith('environment:')) clearSkip(key);
             if (state.aquatic?.pending_big_catch) {
                 const manualBigCatch = !CONFIG.aquatic.enabled || CONFIG.aquatic.bigCatch === 'manual';
                 if (manualBigCatch && CONFIG.pauseOnPendingBigCatch) {
@@ -7389,10 +7421,11 @@
                 stop();
                 return;
             }
-            if (e.code === 'unknown_build' || e.code === 'invalid_story_bridge') {
-                statusLine.textContent = '安全暂停 · 游戏已更新，请刷新页面';
-                delay = CONFIG.maxPollInterval;
-                logSkip('environment:paused', e.message);
+            if (['unknown_build', 'invalid_story_bridge', 'client_loading'].includes(e.code)) {
+                statusLine.textContent = e.code === 'unknown_build' ? '安全暂停 · 游戏已更新，请刷新页面' :
+                    e.code === 'client_loading' ? '等待游戏页面加载 · 自动重连中' : '安全暂停 · 剧情连接失败，自动重连中';
+                delay = e.code === 'unknown_build' ? CONFIG.maxPollInterval : Number(e.retryAfter || 5000);
+                logSkip(`environment:${e.code}:${e.message}`, e.message);
                 return;
             }
             if (e.status === 429 || e.retryAfter != null) {
