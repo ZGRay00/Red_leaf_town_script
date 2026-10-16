@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.2.4
+// @version      5.2.6
 // @description  红叶镇物语自动生产、双倍田、递归加工与循环精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -19,7 +19,7 @@
     const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (PAGE_WINDOW[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.2.4';
+    const SCRIPT_VERSION = '5.2.6';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -1423,7 +1423,7 @@
             ['采集与采矿开关', 'production', [['gathering.enabled', '采集总开关'], ['gathering.autoCollect', '采集自动领取'], ['gathering.autoStart', '采集自动开工'], ['gathering.autoAssignPartner', '采集伙伴派驻'], ['mining.enabled', '采矿总开关'], ['mining.autoCollect', '采矿自动领取'], ['mining.autoStart', '采矿自动开工'], ['mining.autoAssignPartner', '采矿伙伴派驻']]],
             ['水产与畜牧开关', 'production', [['aquatic.enabled', '水产总开关'], ['aquatic.fishing', '自动垂钓'], ['aquatic.ponds', '鱼塘管理'], ['aquatic.autoBuildPonds', '自动挖塘'], ['aquatic.autoAssignPartner', '水产伙伴派驻'], ['livestock.enabled', '畜牧总开关'], ['livestock.autoCollect', '畜牧自动收取'], ['livestock.autoCare', '畜牧自动照料'], ['livestock.autoAssignPartner', '畜牧伙伴派驻']]],
             ['加工策略', 'crafting', [['crafting.enabled', '加工总开关'], ['crafting.autoStart', '执行已启动的本轮'], ['crafting.autoCollect', '自动领取成品'], ['crafting.batchEnabled', '批量加工'], ['crafting.autoAssignPartner', '加工伙伴派驻'], ['crafting.useTaskItems', '加工使用道具'], ['crafting.partialTaskItems', '道具不足时部分使用'], ['crafting.batchLimit', '每次最多提交次数', { min: 1, max: 99 }], ['crafting.staminaReserve', '加工体力保底']]],
-            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '库存不足自动购买'], ['feed.batchBuy', '批量购买'], ['feed.qualityTarget', '目标品质分', { min: 41 }], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
+            ['饲料补充策略', 'feed', [['feed.enabled', '自动补充饲料'], ['feed.autoBuy', '自动购买配料'], ['feed.batchBuy', '批量购买'], ['feed.qualityTarget', '目标品质分', { min: 41 }], ['feed.thresholdMode', '上下限单位', { choices: [{ value: 'percent', text: '容量百分比（%）' }, { value: 'units', text: '饲料份数' }] }], ['feed.low', '触发底限', { max: CONFIG.feed.thresholdMode === 'percent' ? 99 : Number.MAX_SAFE_INTEGER }], ['feed.target', '填充至', { min: 1, max: CONFIG.feed.thresholdMode === 'percent' ? 100 : Number.MAX_SAFE_INTEGER }], ['feed.coinReserve', '购买后金币保底'], ['feed.maxSpendPerTick', '每轮购买预算']]],
             ['每日事务', 'settings', [['commissions.enabled', '委托总开关'], ['commissions.autoSubmit', '自动交付自己的委托'], ['commissions.autoTake', '自动接取转发委托'], ['achievements.enabled', '自动领取成就']]],
             ['显示与工具', 'settings', [['ui.showGraphs', '图形进度与航线'], ['ui.showLogs', '显示操作日志'], ['ui.compact', '紧凑布局'], ['ui.autoStart', '刷新后自动启动'], ['taskItems.enabled', '特殊道具总开关'], ['partnerAutoSwap', '允许自动换人']]],
         ];
@@ -6028,6 +6028,8 @@
             body.appendChild(row); renderFeedStock(body, state, selected.itemId);
         } else {
             body.appendChild(uiElement('p', 'rlt-note', '从游戏已确认、名称包含“饲料”的物品中自动配料。南瓜等农产品须在自定义组合或单一物品中明确选择。'));
+            body.appendChild(uiElement('p', 'rlt-note', '保证不低于目标品质，优先使用低分饲料和必要的高分饲料搭配，尽量贴近目标；不为稀释品质额外灌满饲料槽。'));
+            body.appendChild(uiElement('p', 'rlt-note', '开启自动购买后，也可在金币保底与本轮预算内补购低分配料，节省高分库存；未知均衡饲料最多先买一件识别。'));
             for (const item of selection.items || []) {
                 const card = uiElement('div', 'rlt-work'); card.dataset.feedCandidate = String(item.itemId);
                 card.appendChild(uiElement('strong', '', item.name || item.itemId)); renderFeedStock(card, state, item.itemId); body.appendChild(card);
@@ -6142,9 +6144,17 @@
         if (selection.reason) return { feasible: false, deposits: [], units: Number(slot?.units), quality: Number(slot?.quality_score),
             room: Number(slot?.capacity) - Number(slot?.units), missing: Math.max(0, target - Number(slot?.units)), reason: selection.reason };
         return selection.mode === 'mix' ? feedMixPlan(state, selection.inputs, target, configuredFeedMix().rows) :
-            feedQualityPlan(state, selection.inputs, target);
+            selection.mode === 'smart' ? feedSmartPlan(state, selection.inputs, target) : feedQualityPlan(state, selection.inputs, target);
     }
-    function feedSettingsSignature() { return JSON.stringify(CONFIG.feed); }
+    function feedSettingsSignature() {
+        const settings = JSON.stringify(CONFIG.feed);
+        // 旧自动批次重新按目标配料；自定义组合仍完成已经投入高分成分后承诺的剩余比例。
+        return feedMode() === 'smart' ? `${settings}:near-target-v2` : settings;
+    }
+    function feedSmartPurchaseOpportunity(selection, plan) {
+        return selection.mode === 'smart' && plan?.feasible && plan.missing <= 1e-7 &&
+            plan.quality > feedGoal() + 1 && plan.deposits.some(row => feedUnitScore(row.input) > feedGoal());
+    }
     function feedWriteGuard(state, revision, signature, build, onReady) {
         return () => {
             if (runtime.state !== state || settingsRevision !== revision || !CONFIG.feed.enabled ||
@@ -6239,6 +6249,146 @@
         if (result.missing > 0) result.reason = '可用品质库存不足以补到水位目标';
         return result;
     }
+    // 智能模式先满足水位，再在不可删减整件的方案中贴近品质目标；明确单品/配比另走各自规划。
+    function feedSmartPlan(state, inputs, target) {
+        const fallback = feedQualityPlan(state, inputs, target);
+        const slot = state.aquatic?.feed_slot, units = Number(slot?.units), capacity = Number(slot?.capacity);
+        const current = units === 0 ? 0 : feedUnitScore({ unit_score: slot?.quality_score }), goal = feedGoal();
+        if (!Number.isFinite(units) || units < 0 || !Number.isFinite(capacity) || capacity < units ||
+            current == null || !Number.isFinite(target)) return fallback;
+        const room = capacity - units, wanted = Math.max(0, target - units);
+        if (!wanted && current + 1e-9 >= goal) return fallback;
+        const rows = inputs.map(input => {
+            const perItem = Number(input.units), score = feedUnitScore(input);
+            return { input, perItem, score, count: Math.min(Math.floor(feedFreeQuantity(state, input)), Math.floor(room / perItem)) };
+        }).filter(row => row.score != null && Number.isFinite(row.perItem) && row.perItem > 0 && row.count > 0);
+        if (rows.length <= 1 || rows.some(row => !Number.isSafeInteger(row.count))) return fallback;
+        let best = null, limited = false;
+        const penalty = row => row.perItem * Math.max(0, row.score - goal) ** 2;
+        const better = candidate => !best || (candidate.filled !== best.filled ? candidate.filled :
+            !candidate.filled && candidate.amount !== best.amount ? candidate.amount > best.amount :
+                Math.abs(candidate.quality - best.quality) > 1e-9 ? candidate.quality < best.quality :
+                    candidate.amount !== best.amount ? candidate.amount < best.amount : candidate.penalty < best.penalty);
+        const consider = candidate => {
+            const total = units + candidate.amount;
+            candidate.quality = total > 0 ? (units * current + candidate.score) / total : 0;
+            candidate.filled = candidate.amount >= wanted;
+            if (candidate.amount < 0 || candidate.amount > room || !Number.isFinite(candidate.quality) ||
+                candidate.quality + 1e-9 < goal || !better(candidate)) return;
+            if (candidate.filled && candidate.amount > wanted) {
+                const counts = countsOf(candidate);
+                if (rows.some((row, index) => {
+                    const amount = candidate.amount - row.perItem, total = units + amount;
+                    return counts[index] > 0 && amount >= wanted && total > 0 &&
+                        (units * current + candidate.score - row.perItem * row.score) / total + 1e-9 >= goal;
+                })) return; // 不为稀释品质额外多投本可省下的整件。
+            }
+            best = candidate;
+        };
+        const considerCounts = counts => {
+            if (counts.some((count, index) => !Number.isSafeInteger(count) || count < 0 || count > rows[index].count)) return;
+            consider({ counts, amount: counts.reduce((sum, count, index) => sum + count * rows[index].perItem, 0),
+                score: counts.reduce((sum, count, index) => sum + count * rows[index].perItem * rows[index].score, 0),
+                penalty: counts.reduce((sum, count, index) => sum + count * penalty(rows[index]), 0) });
+        };
+        const countsOf = candidate => {
+            if (candidate.counts) return [...candidate.counts];
+            const counts = rows.map(() => 0);
+            for (let part = candidate.tail; part; part = part.previous) counts[part.index] += part.count;
+            return counts;
+        };
+        if (fallback.feasible) considerCounts(rows.map(row => (fallback.deposits || []).filter(deposit =>
+            sameId(deposit.input.item_id, row.input.item_id) && Number(deposit.input.quality || 0) === Number(row.input.quality || 0))
+            .reduce((sum, deposit) => sum + deposit.count, 0)));
+        // 单件规格不同也允许比较，例如缺 71 份时一件 100 份低分料和两件 40 份高分料。
+        for (const [index, row] of rows.entries()) {
+            const single = feedQualityPlan(state, [row.input], target);
+            if (!single.feasible) continue;
+            const counts = rows.map(() => 0); counts[index] = single.deposits.reduce((sum, deposit) => sum + deposit.count, 0);
+            considerCounts(counts);
+        }
+
+        // 原有组合搜索到达计算上限时，仍可使用已验证的高分优先方案，不因优化规模停喂。
+        if (!best) {
+            const counts = rows.map(() => 0);
+            let amount = 0, margin = units * (current - goal);
+            const order = rows.map((_, index) => index).sort((a, b) => rows[b].score - rows[a].score || rows[a].perItem - rows[b].perItem);
+            for (const index of order) {
+                const row = rows[index], change = row.perItem * (row.score - goal);
+                let maximum = Math.min(row.count, Math.floor((room - amount) / row.perItem));
+                if (change < 0) maximum = Math.min(maximum, Math.floor(margin / -change));
+                const repair = change > 0 && margin < 0 ? Math.ceil(-margin / change) : 0;
+                const count = Math.max(0, Math.min(maximum, Math.max(repair, Math.ceil(Math.max(0, wanted - amount) / row.perItem))));
+                counts[index] = count; amount += count * row.perItem; margin += count * change;
+            }
+            considerCounts(counts);
+        }
+        // 等量交换不随容量枚举：两种整件按最大公约数换算，直接求达到目标的边界。
+        const improvePairs = () => {
+            if (!best || !rows.every(row => Number.isSafeInteger(row.perItem))) return;
+            const gcd = (a, b) => { while (b) { const next = a % b; a = b; b = next; } return a; };
+            let pairs = 0;
+            for (let pass = 0; pass < 3; pass++) {
+                const before = best;
+                for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
+                    if (++pairs > 4000) { limited = true; return; }
+                    const counts = countsOf(best), common = gcd(rows[i].perItem, rows[j].perItem);
+                    const left = rows[j].perItem / common, right = rows[i].perItem / common;
+                    const low = Math.max(Math.ceil(-counts[i] / left), Math.ceil((counts[j] - rows[j].count) / right));
+                    const high = Math.min(Math.floor((rows[i].count - counts[i]) / left), Math.floor(counts[j] / right));
+                    const delta = left * rows[i].perItem * (rows[i].score - rows[j].score);
+                    const boundary = delta ? (goal * (units + best.amount) - units * current - best.score) / delta : 0;
+                    for (const value of new Set([low, high, Math.floor(boundary) - 1, Math.floor(boundary), Math.ceil(boundary), Math.ceil(boundary) + 1])) {
+                        if (!Number.isSafeInteger(value) || value < low || value > high) continue;
+                        const next = [...counts]; next[i] += value * left; next[j] -= value * right;
+                        considerCounts(next);
+                    }
+                }
+                if (best === before) break;
+            }
+        };
+        improvePairs();
+
+        const maximum = room;
+        const smallest = Math.min(...rows.map(row => row.perItem));
+        if (rows.length <= 24 && maximum / smallest <= 256) {
+            const plans = new Map([[0, new Map([['0:0', { score: 0, mask: 0, penalty: 0, tail: null }]])]]);
+            let work = 0, labels = 1;
+            search: for (const [index, row] of rows.entries()) {
+                let remaining = Math.min(row.count, Math.floor(maximum / row.perItem));
+                for (let size = 1; remaining > 0; size *= 2) {
+                    const count = Math.min(size, remaining); remaining -= count;
+                    const added = count * row.perItem, score = added * row.score, addedPenalty = count * penalty(row);
+                    // 每组仅使用加入它之前的标签，避免同一份库存被反复计入。
+                    const previous = [...plans].flatMap(([amount, values]) => [...values.values()].map(value => [amount, value]));
+                    for (const [amount, value] of previous) {
+                        if (++work > 180000 || labels >= 12000) { limited = true; break search; }
+                        const next = amount + added;
+                        if (next > maximum) continue;
+                        const candidate = { score: value.score + score, mask: value.mask | (1 << index), penalty: value.penalty + addedPenalty,
+                            tail: { previous: value.tail, index, count } };
+                        let group = plans.get(next);
+                        // 同份数/总分仍需保留不同整件组合：是否能省下一件取决于所用规格。
+                        const key = `${candidate.score}:${candidate.mask}`;
+                        const same = group?.get(key);
+                        if (same && same.penalty <= candidate.penalty) continue;
+                        if (!group) { group = new Map(); plans.set(next, group); }
+                        if (!same) labels++;
+                        group.set(key, candidate);
+                        consider({ ...candidate, amount: next });
+                    }
+                }
+            }
+        } else limited = true;
+        improvePairs();
+        if (!best) return { ...fallback, optimizationLimited: limited };
+        const counts = countsOf(best), filledUnits = units + best.amount;
+        return { ...fallback, feasible: true, deposits: rows.map((row, index) => ({ input: row.input, count: counts[index] }))
+            .filter(row => row.count > 0).sort((a, b) => feedUnitScore(b.input) - feedUnitScore(a.input)),
+        units: filledUnits, quality: best.quality, missing: Math.max(0, target - filledUnits), room: capacity - filledUnits,
+        reason: filledUnits < target ? '可用品质库存不足以补到水位目标' : '', optimizationLimited: limited,
+        note: limited ? '已按可用库存优化配料；组合较多时使用已确认安全的方案' : '' };
+    }
     // 混合比例按本次新增份数计算。总量只检查水位、库存/品质拐点及整件边界，不逐份穷举大槽。
     function feedMixPlan(state, inputs, target, mixRows) {
         const slot = state.aquatic?.feed_slot, units = Number(slot?.units), capacity = Number(slot?.capacity);
@@ -6330,34 +6480,85 @@
             const count = reference * item.ratio / row.perItem;
             for (const offset of [-1, 0, 1, 2]) addTotal((Math.floor(count) + offset) * row.perItem / item.ratio);
         }
-        // 每项只留少量不同份数的整件方案；同份数优先分值最高者。
-        const trim = (values, limit, desired) => {
-            const byAmount = new Map();
+        // 品质上下沿只用于定位候选；是否可投入仍由整件库存、比例和最终均分共同确认。
+        const scoreRange = (item, amount) => {
+            const sum = rows => {
+                let left = amount, score = 0;
+                for (const row of rows) {
+                    const take = Math.min(left, row.count * row.perItem);
+                    score += take * row.score; left -= take;
+                    if (left <= epsilon) break;
+                }
+                return score;
+            };
+            return { low: sum([...item.rows].reverse()), high: sum(item.rows) };
+        };
+        const requiredScore = total => goal * total - units * (current - goal);
+        // 同份数也保留不同分值，避免只留最高分浪费高品质，或只留最低分误删唯一达标路线。
+        const trim = (values, limit, desired, rates) => {
+            const distinct = new Map();
             for (const value of values) {
-                const key = `${value.amount.toPrecision(14)}:${value.maxUnit}`, previous = byAmount.get(key);
-                if (!previous || value.score > previous.score) byAmount.set(key, value);
+                const key = `${value.amount.toPrecision(14)}:${value.maxUnit}:${value.score.toPrecision(14)}`;
+                if (!distinct.has(key)) distinct.set(key, value);
             }
-            const all = [...byAmount.values()];
+            const all = [...distinct.values()];
             if (all.length <= limit) return all;
             const chosen = new Set();
-            const take = (rows, count) => { for (const row of rows.slice(0, count)) chosen.add(row); };
-            take([...all].sort((a, b) => Math.abs(a.amount - desired) - Math.abs(b.amount - desired) || b.score - a.score), limit / 2);
-            take([...all].sort((a, b) => (b.score - goal * b.amount) - (a.score - goal * a.amount)), limit / 4);
-            take([...all].sort((a, b) => a.amount - b.amount), limit / 8);
-            take([...all].sort((a, b) => b.amount - a.amount), limit / 8);
+            const take = (rows, count) => { for (const row of rows.slice(0, count)) if (chosen.size < limit) chosen.add(row); };
+            const distance = value => Math.min(...rates.map(rate => Math.abs(value.score - rate * value.amount)));
+            const volume = (a, b) => Math.abs(a.amount - desired) - Math.abs(b.amount - desired);
+            take(all.filter(value => !value.amount), 1); // 后续较低品质仍可独自填满这一项。
+            const amountGroups = new Map();
+            for (const value of all) if (value.amount) {
+                const key = `${value.amount.toPrecision(14)}:${value.maxUnit}`;
+                if (!amountGroups.has(key)) amountGroups.set(key, []);
+                amountGroups.get(key).push(value);
+            }
+            // 向下/向上取整的份数都保留低分与达标边界，不能让离目标稍近的一档占满名额。
+            const nearest = [...amountGroups.values()].sort((a, b) => volume(a[0], b[0])).slice(0, Math.max(1, Math.floor(limit / 8)));
+            for (const group of nearest) {
+                take([...group].sort((a, b) => a.score - b.score), 1);
+                take([...group].sort((a, b) => b.score - a.score), 1);
+                for (const rate of rates) take([...group].sort((a, b) => Math.abs(a.score - rate * a.amount) -
+                    Math.abs(b.score - rate * b.amount) || a.score - b.score), 1);
+            }
+            take([...all].sort((a, b) => volume(a, b) || distance(a) - distance(b) || a.score - b.score), Math.floor(limit / 4));
+            take([...all].sort((a, b) => volume(a, b) || a.score - b.score), Math.floor(limit / 4));
+            take([...all].sort((a, b) => volume(a, b) || b.score - a.score), Math.floor(limit / 4));
+            take([...all].sort((a, b) => a.amount - b.amount || a.score - b.score), Math.floor(limit / 8));
+            take([...all].sort((a, b) => b.amount - a.amount || b.score - a.score), Math.floor(limit / 8));
+            take([...all].sort((a, b) => volume(a, b) || distance(a) - distance(b)), limit);
             return [...chosen];
         };
         const optionsFor = (item, total) => {
             const desired = total * item.ratio, upper = Math.min(room, item.stock, desired + item.maxUnit);
+            const other = items.filter(candidate => candidate !== item).map(candidate => scoreRange(candidate, total * candidate.ratio));
+            const required = requiredScore(total);
+            const rates = [...new Set([required / total,
+                (required - other.reduce((sum, range) => sum + range.low, 0)) / desired,
+                (required - other.reduce((sum, range) => sum + range.high, 0)) / desired].filter(Number.isFinite))];
             let values = [{ amount: 0, score: 0, maxUnit: 0, parts: [] }];
-            for (const row of item.rows) {
+            for (const [rowIndex, row] of item.rows.entries()) {
                 const next = [];
+                const later = item.rows.slice(rowIndex + 1), laterStock = later.reduce((sum, remaining) => sum + remaining.count * remaining.perItem, 0);
                 for (const value of values) {
                     const maximum = Math.min(row.count, Math.floor((upper - value.amount + epsilon) / row.perItem));
                     if (maximum < 0) continue;
                     const floor = Math.floor(Math.max(0, desired - value.amount) / row.perItem);
                     const counts = maximum <= 8 ? Array.from({ length: maximum + 1 }, (_, index) => index) :
                         [0, Math.min(maximum, Math.max(0, floor - 1)), Math.min(maximum, floor), Math.min(maximum, floor + 1), maximum];
+                    const addBoundary = count => {
+                        if (!Number.isFinite(count)) return;
+                        for (const offset of [-1, 0, 1, 2]) counts.push(Math.max(0, Math.min(maximum, Math.floor(count) + offset)));
+                    };
+                    if (maximum > 8) {
+                        addBoundary((desired - value.amount - laterStock) / row.perItem);
+                        // 用低品质替换高品质的达标交点；大库存也只检查交点附近的几个整数。
+                        for (const remaining of later) if (row.score !== remaining.score) for (const rate of rates) {
+                            addBoundary((rate * desired - value.score - (desired - value.amount) * remaining.score) /
+                                (row.perItem * (row.score - remaining.score)));
+                        }
+                    }
                     for (const count of new Set(counts)) {
                         if (!budget()) return [];
                         const amount = value.amount + count * row.perItem, score = value.score + count * row.perItem * row.score;
@@ -6366,15 +6567,15 @@
                             parts: count ? [...value.parts, { input: row.input, count }] : value.parts });
                     }
                 }
-                values = trim(next, 24, desired);
+                values = trim(next, 24, desired, rates);
             }
-            return trim(values.filter(value => value.amount > 0 && Math.abs(value.amount - desired) <= value.maxUnit + epsilon), 16, desired);
+            return trim(values.filter(value => value.amount > 0 && Math.abs(value.amount - desired) <= value.maxUnit + epsilon), 16, desired, rates);
         };
         let best = null;
         for (const total of totals) {
             if (exhausted) break;
             let combinations = [{ amount: 0, score: 0, lower: 0, upper: room, selected: [] }], processedRatio = 0;
-            for (const item of items) {
+            for (const [itemIndex, item] of items.entries()) {
                 processedRatio += item.ratio;
                 const options = optionsFor(item, total), next = [];
                 for (const previous of combinations) for (const option of options) {
@@ -6386,12 +6587,20 @@
                     next.push({ amount, score: previous.score + option.score, lower, upper, selected: [...previous.selected, option] });
                 }
                 // 同总量的分配也可能具有不同可接受比例区间，不能只按总量合并掉另一条路线。
-                next.sort((a, b) => Math.abs(a.amount - total * processedRatio) -
-                    Math.abs(b.amount - total * processedRatio) ||
-                    (b.score - goal * b.amount) - (a.score - goal * a.amount));
                 if (next.length > 128) {
-                    const quality = [...next].sort((a, b) => (b.score - goal * b.amount) - (a.score - goal * a.amount));
-                    combinations = [...new Set([...next.slice(0, 96), ...quality.slice(0, 32)])];
+                    const remaining = items.slice(itemIndex + 1).map(candidate => scoreRange(candidate, total * candidate.ratio));
+                    const required = requiredScore(total), targets = [required * processedRatio,
+                        required - remaining.reduce((sum, range) => sum + range.low, 0),
+                        required - remaining.reduce((sum, range) => sum + range.high, 0)];
+                    const distance = value => Math.min(...targets.map(score => Math.abs(value.score - score)));
+                    const volume = (a, b) => Math.abs(a.amount - total * processedRatio) - Math.abs(b.amount - total * processedRatio);
+                    // 品质上下沿给后续成分保留余地，达标边界候选用来节省高品质物品。
+                    combinations = [...new Set([
+                        ...[...next].sort((a, b) => volume(a, b) || distance(a) - distance(b) || a.score - b.score).slice(0, 48),
+                        ...[...next].sort((a, b) => volume(a, b) || a.score - b.score).slice(0, 32),
+                        ...[...next].sort((a, b) => volume(a, b) || b.score - a.score).slice(0, 32),
+                        ...[...next].sort((a, b) => (b.score - goal * b.amount) - (a.score - goal * a.amount)).slice(0, 16),
+                    ])];
                 } else combinations = next;
                 if (!combinations.length || exhausted) break;
             }
@@ -6405,10 +6614,13 @@
                 if (!best || (filled && !best.filled) || (filled === best.filled &&
                     ((filled ? value.amount < best.amount - epsilon : value.amount > best.amount + epsilon) ||
                     (Math.abs(value.amount - best.amount) <= epsilon && (deviation < best.deviation - 1e-12 ||
-                        (Math.abs(deviation - best.deviation) <= 1e-12 && quality > best.quality)))))) {
+                        (Math.abs(deviation - best.deviation) <= 1e-12 && quality < best.quality)))))) {
                     best = { ...value, filled, quality, deviation };
                 }
             }
+            // 水位、比例和品质都精确命中时已达到三项下界，无需继续搜索更大的候选。
+            if (best?.filled && Math.abs(best.amount - wanted) <= epsilon &&
+                best.deviation <= 1e-12 && Math.abs(best.quality - goal) <= 1e-9) break;
         }
         if (!best) {
             result.reason = exhausted ? '混合饲料组合过多，暂未找到同时符合比例和品质的方案' :
@@ -6472,11 +6684,16 @@
     function feedPurchaseAdvice(state, selection, plan, target, allowance, build) {
         let candidate = null, reason = '';
         const slot = state.aquatic.feed_slot;
+        const saveHighScore = feedSmartPurchaseOpportunity(selection, plan);
         const products = selection.items.map(feed => ({ feed, product: feedQualityProduct(state, feed, build) }));
         for (const { feed, product } of products) {
             const price = Number(feed.entry?.price);
             if (!feed.confirmed || !feed.entry || !Number.isFinite(price) || price < 0 || price > allowance) continue;
-            if (!product) return { feed, count: 1, price };
+            // 仅为节省高分库存而购买时，只对均衡饲料做一次识别，不轮番试买未知高分商品。
+            if (!product) {
+                if (!saveHighScore || sameId(feed.entry.id, balancedFeedEntry(state)?.id)) return { feed, count: 1, price };
+                continue;
+            }
             if (product.quality == null || !(Number(product.units) > 0) || feedUnitScore(product) == null) reason = '已购买识别商品，等待游戏确认品质与份数，不会重复购买';
         }
         const known = products.filter(({ feed, product }) => feed.confirmed && feed.entry && product?.quality != null &&
@@ -6573,14 +6790,22 @@
                 return feedPlan(draft.state, target);
             };
             const full = evaluate(maximum);
-            if (!full.feasible || (plan.feasible && full.missing >= plan.missing)) continue;
+            const improves = value => value.feasible && value.deposits.length > 0 && (!plan.feasible ||
+                value.missing < plan.missing - 1e-7 || (saveHighScore && value.missing <= plan.missing + 1e-7 && value.quality < plan.quality - 1e-7));
+            if (!improves(full)) continue;
             let low = 1, high = maximum;
             while (low < high) {
                 const mid = Math.floor((low + high) / 2), value = evaluate(mid);
-                if (value.feasible && value.missing <= full.missing) high = mid; else low = mid + 1;
+                if (value.feasible && value.missing <= full.missing + 1e-7 &&
+                    (!saveHighScore || value.quality <= full.quality + 1e-7)) high = mid; else low = mid + 1;
             }
             const count = Math.min(low, CONFIG.feed.batchBuy ? 99 : 1);
-            if (!candidate || full.missing < candidate.missing || (full.missing === candidate.missing && count * price < candidate.count * candidate.price)) candidate = { feed, count, price, missing: full.missing };
+            if (!improves(evaluate(low))) continue;
+            if (!candidate || full.missing < candidate.missing - 1e-7 || (Math.abs(full.missing - candidate.missing) <= 1e-7 &&
+                ((saveHighScore && full.quality < candidate.quality - 1e-7) ||
+                ((!saveHighScore || Math.abs(full.quality - candidate.quality) <= 1e-7) && count * price < candidate.count * candidate.price)))) {
+                candidate = { feed, count, price, missing: full.missing, quality: full.quality };
+            }
         }
         return candidate || { reason: reason || '已确认商品无法改善品质目标，等待其他饲料库存' };
     }
@@ -6635,7 +6860,7 @@
             if (!qualityLow && Number(slot.units) > bounds.low && getOverride(FEED_FILL_KEY) !== '1') return;
             localStorage.setItem(FEED_FILL_KEY, '1');
             const plan = feedPlan(state, bounds.target);
-            if ((!plan.feasible || plan.missing > 0) && cfg.autoBuy && attempt < 11 && plan.room > 0) {
+            if ((!plan.feasible || plan.missing > 0 || feedSmartPurchaseOpportunity(selection, plan)) && cfg.autoBuy && attempt < 11 && Number(slot.capacity) > Number(slot.units)) {
                 const allowance = cfg.maxSpendPerTick > 0 ? Math.max(0, Math.min(playerCoins(state) - cfg.coinReserve, cfg.maxSpendPerTick - spent)) : 0;
                 const advice = allowance > 0 ? feedPurchaseAdvice(state, selection, plan, bounds.target, allowance, build) : { reason: '本轮预算或金币保底不足' };
                 if (advice.count > 0) {
@@ -6683,9 +6908,24 @@
         const card = uiElement('div', 'rlt-feed-preview'); card.dataset.feedPreview = 'true';
         card.appendChild(uiElement('strong', '', selection.mode === 'mix' ? '已应用组合 · 库存补料预览' : '库存补料预览'));
         const deposits = plan?.feasible ? plan.deposits || [] : [], hasDeposit = deposits.length > 0;
-        card.appendChild(uiElement('p', 'rlt-note', `品质分 ${format(current)}${hasDeposit ? ` → ${format(plan.quality)}` : ''} · 目标 ≥ ${format(feedGoal())}`));
+        card.appendChild(uiElement('p', 'rlt-note', `品质分 ${format(current)}${hasDeposit ? ` → ${format(plan.quality)}` : ''} · 目标 ≥ ${format(feedGoal())}${selection.mode === 'smart' ? '（下限，尽量贴近）' : '（按指定投料方案）'}`));
         card.appendChild(uiElement('p', 'rlt-note', `槽内 ${format(Number(slot.units))}${hasDeposit ? ` → ${format(plan.units)}` : ''} / ${format(Number(slot.capacity))} 份`));
         card.appendChild(uiElement('p', 'rlt-note', `续航 ${endurance(Number(slot.units))}${hasDeposit ? ` → ${endurance(plan.units)}` : ''}`));
+        const batch = feedBatch(), qualityLow = Number(slot.units) === 0 || current != null && current + 1e-9 < feedGoal();
+        const triggered = qualityLow || Number(slot.units) <= bounds.low || getOverride(FEED_FILL_KEY) === '1' || !!batch;
+        card.appendChild(uiElement('p', 'rlt-note', batch && batch.phase !== 'ready' ? '上次投料结果待核对，暂停继续投料。' :
+            !CONFIG.feed.enabled ? '自动补料已关闭；以下仅为库存预览。' :
+            !triggered || Number(slot.units) >= bounds.target && !qualityLow && !batch ? '等待水位降至底限；预览不代表现在会投料。' :
+                batch ? '正在处理已保存的投料批次，优先完成其剩余成分。' : '已满足补料条件，将按最新库存与预算执行。'));
+        if (current != null && current > feedGoal() + 1) {
+            card.appendChild(uiElement('p', 'rlt-note', '现槽品质已高于目标。已有存量参与加权平均，消耗只减少份数；只有后续投入低于现槽均分的饲料才会逐轮降分，不能直接把现槽改为目标分。'));
+        }
+        if (hasDeposit && plan.quality > feedGoal() + 1) {
+            card.appendChild(uiElement('p', 'rlt-note', selection.mode === 'smart'
+                ? '当前库存方案仍高于目标：受现槽存量、可用饲料与整件投料限制；优先节省高分饲料，不保证精确等于目标。'
+                : '按所选物品或配比投料后仍高于目标；品质目标是下限，不会擅自替换物品或改变已设配比。'));
+        }
+        if (plan?.note) card.appendChild(uiElement('p', 'rlt-note', plan.note));
         if (hasDeposit) {
             const grouped = new Map();
             for (const { input, count } of deposits) {
@@ -6694,17 +6934,18 @@
                 row.count += count; row.units += count * Number(input.units); grouped.set(id, row);
             }
             const total = [...grouped.values()].reduce((sum, row) => sum + row.units, 0);
-            card.appendChild(uiElement('small', '', '本轮新增份数（按整件投喂，实际比例可能略有偏差）'));
+            const points = deposits.reduce((sum, row) => sum + row.count * Number(row.input.units) * feedUnitScore(row.input), 0);
+            card.appendChild(uiElement('small', '', `本轮新增份数 · 新增均分 ${format(points / total)}（按整件投喂）`));
             for (const row of grouped.values()) card.appendChild(uiElement('p', 'rlt-feed-mix-note',
                 `${row.name} × ${format(row.count)} 件 · ${format(row.units)} 份 · 占 ${format(total > 0 ? row.units / total * 100 : 0)}%`));
         }
         const reason = !bounds.valid ? '上下限无效，请调整触发底限和填充目标' : plan?.reason;
         if (reason) card.appendChild(uiElement('p', 'rlt-warning', reason));
         else if (plan?.feasible && !hasDeposit) card.appendChild(uiElement('p', 'rlt-note', '当前无需投入库存'));
-        if (plan && (!plan.feasible || plan.missing > 0)) {
+        if (plan && (!plan.feasible || plan.missing > 0 || feedSmartPurchaseOpportunity(selection, plan))) {
             let purchase;
-            if (!CONFIG.feed.autoBuy) purchase = '自动购买已关闭，等待可用库存';
-            else if (!(CONFIG.feed.maxSpendPerTick > 0)) purchase = '每轮购买预算为 0，等待可用库存';
+            if (!CONFIG.feed.autoBuy) purchase = plan.feasible ? '自动购买已关闭，将使用当前库存方案；补充低分饲料可改善配料。' : '自动购买已关闭，等待可用库存';
+            else if (!(CONFIG.feed.maxSpendPerTick > 0)) purchase = plan.feasible ? '每轮购买预算为 0，将使用当前库存方案。' : '每轮购买预算为 0，等待可用库存';
             else {
                 const buyable = selection.items.filter(item => item.entry).map(item => item.name);
                 purchase = buyable.length ? `可检查购买：${buyable.join('、')}；仍须符合预算、品质和配比，预览不含购买量`
@@ -6713,7 +6954,6 @@
             card.appendChild(uiElement('p', 'rlt-note', purchase));
         }
         body.appendChild(card);
-        const batch = feedBatch();
         if (!batch) return;
         if (batch.phase === 'submitting' || batch.phase === 'uncertain') {
             body.appendChild(uiElement('p', 'rlt-warning', '上次投料结果待核对，已暂停本批继续投入。请先在游戏中确认库存与饲料槽。'));
