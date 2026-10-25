@@ -29,6 +29,7 @@
 !tests/red-leaf-town-v450-audit.test.cjs
 !tests/red-leaf-town-lifecycle-audit.test.cjs
 !tests/red-leaf-town-partner-audit.test.cjs
+!tests/red-leaf-town-event-partners.test.cjs
 !tests/red-leaf-town-aquatic-audit.test.cjs
 !tests/red-leaf-town-multi-pond.test.cjs
 !tests/red-leaf-town-pond-fry.test.cjs

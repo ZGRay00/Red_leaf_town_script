@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         红叶镇物语 · 自动农场助手
 // @namespace    http://tampermonkey.net/
-// @version      5.2.6
+// @version      5.2.7
 // @description  红叶镇物语自动生产、双倍田、递归加工与循环精制房、设施材料预留、饲料组合保质和管理面板
 // @author       -
 // @match        https://chiyuki.diving-fish.com/red-leaf-town/*
@@ -19,7 +19,7 @@
     const PAGE_WINDOW = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
     const INSTANCE_KEY = '__redLeafTownAutoHelperV2__';
     if (PAGE_WINDOW[INSTANCE_KEY]) return; // 防止同一页面重复注入两套面板和循环
-    const SCRIPT_VERSION = '5.2.6';
+    const SCRIPT_VERSION = '5.2.7';
     const SCRIPT_IDENTITY = {
         name: '红叶镇物语 · 自动农场助手',
         namespace: 'http://tampermonkey.net/',
@@ -978,8 +978,8 @@
     const collectSite = (industry, siteId) => mutate(`${siteUrl(industry, siteId)}/collect`, {
         cue: `action:collect_${industry}`,
     });
-    const assignSitePartner = (industry, siteId, partnerId) =>
-        mutate(`${siteUrl(industry, siteId)}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' } });
+    const assignSitePartner = (industry, siteId, partnerId, beforeWrite) =>
+        mutate(`${siteUrl(industry, siteId)}/partner`, { method: 'PUT', payload: { partner_id: partnerId ?? '' }, beforeWrite });
     const assignPlotPartner = (slot, partnerId, beforeWrite) =>
         mutate(`/plots/${slot}/partners`, { method: 'PUT', payload: { partner_id: partnerId ?? '' }, beforeWrite });
     const submitCommission = () => mutate('/commissions/submit', { cue: 'action:submit_commission' });
@@ -4336,12 +4336,13 @@
                     label: plotLabel(plot), node: plot, mandatory: false,
                     difficulty: Math.max(0, ...(state.crops || [])
                         .map(c => Number(c.time_difficulty || 0)).filter(Number.isFinite)),
-                    assign: pid => assignPlotPartner(plot.slot, pid, () => {
+                    assign: (pid, beforeWrite) => assignPlotPartner(plot.slot, pid, () => {
                         const fresh = (runtime.state.plots || []).find(candidate => sameId(candidate.slot, plot.slot));
                         if (!CONFIG.farming.enabled || !CONFIG.farming.autoAssignPartner || !plotAutoManaged(plot.slot) ||
                             !fresh?.empty || fresh.assignment_locked || plotSize(fresh) !== plotSize(plot)) {
                             throw new ApiError('农田派驻条件已变化，下一轮重新核对', { code: 'aborted' });
                         }
+                        beforeWrite?.();
                     }),
                 });
             }
@@ -4361,12 +4362,13 @@
                 const override = nodeJobOverride(industry, id);
                 // “关闭（保留伙伴）”完全退出换人规划：现有伙伴成为固定占用，空岗也不会自动补人。
                 if (override === NODE_JOB_OFF_KEEP) continue;
-                const disabled = override === NODE_JOB_OFF_RELEASE;
+                // 关闭的限时点只回收空闲伙伴；仍纳入可调整岗位，才能释放其编制并转派。
+                const disabled = override === NODE_JOB_OFF_RELEASE || (industry === 'gathering' && node.event_closed === true);
                 slots.push({
                     key: `${industry}:${id}`, industry, id,
                     label: `${INDUSTRY_NAMES[industry] || industry}点 ${id}`, node,
                     mandatory: adapter.requiresPartner, disabled, difficulty: nodeDifficulty(industry, node),
-                    assign: pid => assignSitePartner(industry, id, pid),
+                    assign: (pid, beforeWrite) => assignSitePartner(industry, id, pid, beforeWrite),
                 });
             }
         }
@@ -4482,6 +4484,32 @@
         const planRevision = settingsRevision;
         const allSlots = managedPartnerSlots(state);
         if (!allSlots.length) return;
+        const assign = (slot, partnerId) => {
+            const plannedState = runtime.state;
+            return slot.assign(partnerId, () => {
+                const fresh = slot.industry === 'farming'
+                    ? (runtime.state.plots || []).find(plot => sameId(plot.slot, slot.id))
+                    : nodeById(runtime.state, slot.industry, slot.id);
+                const cfg = slot.industry === 'farming' ? CONFIG.farming : INDUSTRY_ADAPTERS[slot.industry].config();
+                const override = slot.industry === 'farming' ? null : nodeJobOverride(slot.industry, slot.id);
+                // mutate 可能先 GET 同步；旧计划不得跨过状态或设置变化，也不动任何未领取任务。
+                if (settingsRevision !== planRevision || runtime.state !== plannedState || !cfg.enabled || !cfg.autoAssignPartner ||
+                    !fresh?.empty || fresh.task_snapshot || fresh.assignment_locked || override === NODE_JOB_OFF_KEEP) {
+                    throw new ApiError('伙伴派驻条件已变化，下一轮重新规划', { code: 'aborted' });
+                }
+                if (partnerId == null && !sameId(currentPartnerId(fresh), currentPartnerId(slot.node))) {
+                    throw new ApiError('原岗位伙伴已变化，下一轮重新规划', { code: 'aborted' });
+                }
+                if (partnerId != null) {
+                    const partner = (runtime.state.partners || []).find(p => sameId(partnerRecordId(p), partnerId));
+                    if (override === NODE_JOB_OFF_RELEASE || (slot.industry === 'gathering' && fresh.event_closed === true) ||
+                        currentPartnerId(fresh) != null || !partner || !isPartnerIdle(partner, runtime.state) ||
+                        !hasTendency(partner, slot.industry) || assignedCount(runtime.state, slot.industry) >= industryCapacity(runtime.state, slot.industry)) {
+                        throw new ApiError('目标岗位或伙伴已不可派驻，下一轮重新规划', { code: 'aborted' });
+                    }
+                }
+            });
+        };
         const mutableCurrentIds = new Set(allSlots.map(s => currentPartnerId(s.node)).filter(x => x != null).map(String));
         const selectedSlots = [];
         for (const industry of ['gathering', 'mining', 'crafting', 'farming']) {
@@ -4529,7 +4557,7 @@
             const target = desired.get(slot.key) ?? null;
             if (current == null || sameId(current, target)) continue;
             try {
-                await slot.assign(null);
+                await assign(slot, null);
                 clearSkip(`fail:unassign:${slot.key}`);
             } catch (e) {
                 if (shouldAbortTick(e)) throw e;
@@ -4550,7 +4578,7 @@
                 : nodeById(runtime.state, slot.industry, slot.id);
             if (!currentNode || sameId(currentPartnerId(currentNode), target)) continue;
             try {
-                await slot.assign(target);
+                await assign(slot, target);
                 clearSkip(`fail:assign:${slot.key}`);
                 clearSkip(`nopartner:${slot.key}`);
                 const partner = (runtime.state.partners || []).find(p => sameId(p.partner_id ?? p.id, target));
@@ -5281,6 +5309,7 @@
                 if (!industryEnabled(industry) || !adapter.config().autoStart) continue;
                 for (const node of industryNodes(state, industry)) {
                     if (!node.empty || node.task_snapshot) continue;
+                    if (industry === 'gathering' && node.event_closed === true) continue;
                     const id = adapter.id(node);
                     if (id == null) {
                         logSkip(`schema:start-id:${industry}`, `${industry} 节点缺少 id，已禁止请求 undefined`);
@@ -5308,7 +5337,15 @@
                     if (!await startCraftPlan(plan)) failedNodes.add(`crafting:${plan.id}`);
                     continue;
                 }
-                await startSite(plan.industry, plan.id, plan.adapter.payloadKey, jobId(plan.job), plan.taskItemId ?? '');
+                const revision = settingsRevision;
+                await startSite(plan.industry, plan.id, plan.adapter.payloadKey, jobId(plan.job), plan.taskItemId ?? '', 1,
+                    plan.industry === 'gathering' ? () => {
+                        const fresh = nodeById(runtime.state, 'gathering', plan.id);
+                        if (settingsRevision !== revision || runtime.state !== state || !CONFIG.gathering.enabled || !CONFIG.gathering.autoStart ||
+                            !fresh?.empty || fresh.task_snapshot || fresh.event_closed === true || nodeJobClosed('gathering', plan.id) || !siteHasPartner(fresh)) {
+                            throw new ApiError('采集开工条件已变化，下一轮重新规划', { code: 'aborted' });
+                        }
+                    } : undefined);
                 clearSkip(`fail:start:${plan.industry}:${plan.id}`);
                 const itemText = plan.taskItem
                     ? `，使用 ${plan.taskItem.name || '任务道具#' + plan.taskItemId}` : '';
